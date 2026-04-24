@@ -19,6 +19,7 @@ pub mod history;
 pub mod listview;
 pub mod model;
 pub mod options;
+pub mod perf;
 pub mod plugins;
 pub mod preflight;
 pub mod progress;

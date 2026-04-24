@@ -164,6 +164,10 @@ pub fn create(state: Arc<AppState>) -> windows::core::Result<Window> {
         return Err(windows::core::Error::from_thread());
     }
     let data = unsafe { &*(data_ptr as *const WindowData) };
+    crate::perf::disable_animations(hwnd);
+    crate::perf::disable_animations(data.listview.hwnd);
+    crate::perf::disable_animations(data.address);
+    crate::perf::disable_animations(data.status);
     Ok(Window {
         hwnd,
         listview: data.listview,
@@ -699,15 +703,19 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         // Shift+F10 / Applications key / right-click → shell context menu.
         0x007B /* WM_CONTEXTMENU */ => unsafe {
             let Some(data) = window_data(hwnd) else { return DefWindowProcW(hwnd, msg, wp, lp) };
+            // WM_CONTEXTMENU lparam is (-1,-1) for keyboard (Shift+F10 / VK_APPS).
+            let lo = sign_extend_16((lp.0 as i32) & 0xFFFF);
+            let hi = sign_extend_16(((lp.0 as i32) >> 16) & 0xFFFF);
+            let from_keyboard = lo == -1 && hi == -1;
             let pt = compute_context_point(data, lp);
             let paths = data.state.model.selected_paths();
             if !paths.is_empty() {
-                crate::context_menu::show(hwnd, pt, &paths);
+                crate::context_menu::show(hwnd, pt, &paths, from_keyboard);
             } else {
                 let sel = data.state.model.selection_snapshot();
                 if let (Some(idx), Some(cwd)) = (sel.focus(), data.state.model.cwd()) {
                     if let Some(e) = data.state.model.get(idx) {
-                        crate::context_menu::show(hwnd, pt, &[cwd.join(&e.name)]);
+                        crate::context_menu::show(hwnd, pt, &[cwd.join(&e.name)], from_keyboard);
                     }
                 }
             }

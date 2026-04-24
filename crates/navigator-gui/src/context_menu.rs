@@ -84,11 +84,16 @@ fn ensure_com() {
 /// Show the shell context menu at screen coordinates `pt` for the given
 /// selection. `paths` must be non-empty and all share the same parent
 /// directory (the GUI only ever selects inside one folder, so this holds).
-pub fn show(hwnd: HWND, pt: POINT, paths: &[NavPath]) {
+///
+/// `from_keyboard` should be true when the menu was triggered by Shift+F10
+/// or VK_APPS — in that case we pre-select the first item so screen readers
+/// announce something. Right-click should leave selection alone (Explorer
+/// parity).
+pub fn show(hwnd: HWND, pt: POINT, paths: &[NavPath], from_keyboard: bool) {
     if paths.is_empty() { return; }
     ensure_com();
 
-    match unsafe { show_inner(hwnd, pt, paths) } {
+    match unsafe { show_inner(hwnd, pt, paths, from_keyboard) } {
         Ok(()) => {},
         Err(e) => {
             tracing::warn!("context menu failed: {e:?}");
@@ -96,7 +101,7 @@ pub fn show(hwnd: HWND, pt: POINT, paths: &[NavPath]) {
     }
 }
 
-unsafe fn show_inner(hwnd: HWND, pt: POINT, paths: &[NavPath]) -> windows::core::Result<()> {
+unsafe fn show_inner(hwnd: HWND, pt: POINT, paths: &[NavPath], from_keyboard: bool) -> windows::core::Result<()> {
     // Build absolute PIDLs for each path. PIDLs are returned owned — free
     // them via ILFree on scope exit.
     struct PidlGuard(Vec<*mut ITEMIDLIST>);
@@ -197,8 +202,19 @@ unsafe fn show_inner(hwnd: HWND, pt: POINT, paths: &[NavPath]) -> windows::core:
     // workaround is `SetForegroundWindow(hwnd)` before the call plus a
     // dummy `PostMessage(hwnd, WM_NULL, 0, 0)` after so the menu's idle
     // loop gets one more pump to exit cleanly.
-    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, SetForegroundWindow, WM_NULL};
+    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, SetForegroundWindow, WM_KEYDOWN, WM_NULL};
     unsafe { let _ = SetForegroundWindow(hwnd); }
+    // Keyboard invocation: post a synthetic VK_DOWN so the menu's modal
+    // pump highlights the first item on entry. Without this the popup
+    // appears with no selection, so MSAA/UIA emits no focus change and
+    // screen readers stay silent until the user arrows manually. Mouse
+    // right-click skips this for Explorer parity.
+    if from_keyboard {
+        const VK_DOWN: usize = 0x28;
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_KEYDOWN, WPARAM(VK_DOWN), LPARAM(0));
+        }
+    }
     let cmd = unsafe {
         TrackPopupMenuEx(
             hmenu,

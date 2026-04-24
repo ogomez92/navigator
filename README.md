@@ -35,16 +35,23 @@ Run:
 
 ## Key bindings
 
-| Key                | Action                                  |
-|--------------------|-----------------------------------------|
-| letter             | Jump to next entry starting with letter |
-| Shift + Up/Down    | Extend contiguous selection             |
-| Ctrl + Space       | Toggle selection of focused entry       |
-| Ctrl + A           | Select all                              |
-| Enter              | Open folder / launch file               |
-| Backspace          | Parent folder                           |
-| F5                 | Refresh                                 |
-| Ctrl + C / X / V   | Copy / cut / paste (via rclone)         |
-| Del                | Delete (via rclone purge)               |
-| F2                 | Rename                                  |
-| Alt + Up           | Parent folder                           |
+| Key                          | Action                                              |
+|------------------------------|-----------------------------------------------------|
+| letter                       | Type-ahead jump (>1s gap resets buffer)             |
+| Shift + Up/Down              | Extend contiguous selection                         |
+| Ctrl + Space                 | Toggle selection of focused entry                   |
+| Ctrl + A                     | Select all                                          |
+| Enter                        | Open folder / launch file                           |
+| Backspace / Alt + Up         | Parent folder                                       |
+| Alt + Left / Right           | History back / forward                              |
+| F5                           | Refresh                                             |
+| Ctrl + C / X / V             | Copy / cut / paste (via rclone)                     |
+| Ctrl + Alt + C / X           | Append to copy / cut clipboard                      |
+| Ctrl + Shift + C             | Copy full path(s) to OS clipboard                   |
+| Ctrl + Z                     | Undo last clipboard / paste / delete                |
+| Del                          | Delete to per-volume `.trash`                       |
+| F2                           | Rename                                              |
+| Ctrl + F                     | Find in folder                                      |
+| Ctrl + H / Ctrl + Shift + H  | Toggle hidden / system files                        |
+| Ctrl + 1..9, Ctrl + 0        | Jump to hotspot slot 1..10                          |
+| Ctrl+Shift+1..9, Ctrl+Shift+0| Save selection to hotspot slot 1..10                |

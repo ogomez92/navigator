@@ -14,9 +14,13 @@
 
 #![cfg(windows)]
 
-use windows::Win32::Foundation::{HWND, LPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::WindowsAndMessaging::{DLGPROC, DialogBoxIndirectParamW};
+use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CallNextHookEx, DLGPROC, DialogBoxIndirectParamW, SetWindowsHookExW, UnhookWindowsHookEx,
+    HCBT_CREATEWND, HHOOK, WH_CBT,
+};
 
 // DLGTEMPLATE style bits. The `windows` crate exposes most of these but
 // the DS_* constants live in scattered modules; defining them here keeps
@@ -46,6 +50,7 @@ pub fn run_modal(
 ) -> isize {
     let template = build_template(title, cx_dlu, cy_dlu);
     let hinstance = unsafe { GetModuleHandleW(None).unwrap() };
+    let _hook = AnimDisableHook::install();
     unsafe {
         DialogBoxIndirectParamW(
             Some(hinstance.into()),
@@ -55,6 +60,41 @@ pub fn run_modal(
             LPARAM(init_param),
         )
     }
+}
+
+/// Thread-scoped WH_CBT hook that calls `perf::disable_animations` on
+/// every window created on the current thread. Used to cover dialog +
+/// property-sheet child hwnds the OS creates on our behalf — we never
+/// see their `CreateWindowExW` to call the helper directly.
+pub(crate) struct AnimDisableHook(HHOOK);
+
+impl AnimDisableHook {
+    pub(crate) fn install() -> Option<Self> {
+        unsafe {
+            let tid = GetCurrentThreadId();
+            SetWindowsHookExW(WH_CBT, Some(cbt_proc), None, tid)
+                .ok()
+                .map(Self)
+        }
+    }
+}
+
+impl Drop for AnimDisableHook {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = UnhookWindowsHookEx(self.0);
+        }
+    }
+}
+
+unsafe extern "system" fn cbt_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code == HCBT_CREATEWND as i32 {
+        // wParam is the HWND of the new window. It exists at this point;
+        // animations are disabled before the first paint.
+        let hwnd = HWND(wp.0 as *mut _);
+        crate::perf::disable_animations(hwnd);
+    }
+    unsafe { CallNextHookEx(None, code, wp, lp) }
 }
 
 /// Build an in-memory `DLGTEMPLATE` with DS_SETFONT pointing at

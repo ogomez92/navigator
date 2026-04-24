@@ -105,6 +105,7 @@ pub fn open(parent: HWND, state: Arc<AppState>) -> windows::core::Result<()> {
         Anonymous5: PROPSHEETHEADERW_V2_4 { pszbmHeader: PCWSTR::null() },
     };
 
+    let _hook = crate::dialog::AnimDisableHook::install();
     unsafe { PropertySheetW(&mut header); }
     Ok(())
 }

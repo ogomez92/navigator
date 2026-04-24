@@ -17,6 +17,8 @@ cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
 
+Personal install: `./release.sh` builds `--release` and copies `target/release/navigator.exe` to `C:/Users/Nitropc/stuff/bin/x.exe`. Bash script (Git Bash / WSL); the old `scripts/release.ps1` was removed.
+
 Runtime env: `NAVIGATOR_LOG` sets the `tracing` `EnvFilter` (default `info`).
 
 ### Native dependencies
@@ -45,7 +47,7 @@ Thin binary, fat workspace. `crates/navigator/src/main.rs` only parses args + in
 
 ### Threading model
 
-One UI thread (the Win32 message loop) and several workers. All cross-thread comms go through `crossbeam-channel` or Win32 `PostMessageW`.
+One UI thread (the Win32 message loop) and several workers. All cross-thread comms go through `crossbeam-channel` or Win32 `PostMessageW`. Worker names below are thread names / modules inside `navigator-gui`, not separate crates.
 
 - **`navigator-scan`** — long-lived worker. Handles `ScanCmd::List` (directory scan) and `ScanCmd::Search` (recursive search). Posts results back as `WMAPP_DIR_LISTED` / `WMAPP_SEARCH_RESULTS`.
 - **`navigator-plugin-nav`** — bridges plugin nav requests into `AppState::navigate` via a weak `Arc` so it dies with the app.
@@ -128,4 +130,4 @@ Jump reuses `AppState.pending_focus` + the existing `refocus_after_up` post-list
 
 ## Key bindings
 
-See `README.md` for the user-facing table. User-bound actions live under `shortcuts` in `config.toml`; `navigator_config::shortcuts::default_actions()` is intentionally empty. The accel table is rebuilt on startup and on shortcut-editor save via `window::rebuild_accels`.
+See `README.md` for the user-facing table. User-bound actions live under `shortcuts` in `config.toml`; `navigator_config::shortcuts::default_actions()` returns the seeded defaults (Copy/Cut/Paste/Append/CopyPaths/SelectAll/Rename/Refresh/ToggleHidden/ToggleSystem/Search/NavigateUp/Hist Back+Forward/Undo + Hotspot1..10 + HotspotSet1..10). The accel table is rebuilt on startup and on shortcut-editor save via `window::rebuild_accels`.

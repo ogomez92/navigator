@@ -13,7 +13,7 @@ use windows::Win32::UI::Controls::{
     ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, LVCFMT_LEFT, LVCFMT_RIGHT,
     LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVM_INSERTCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE,
     LVM_SETITEMCOUNT, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES,
-    LVS_EX_HEADERDRAGDROP, LVS_EX_LABELTIP,
+    LVS_EX_HEADERDRAGDROP,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -105,12 +105,11 @@ impl ListView {
             )?
         };
 
-        // Quality-of-life: full row select, double buffering, tooltips for
-        // truncated labels, header drag/drop, light gridlines. All of these
-        // are screen-reader neutral.
+        // Full row select + double buffering + header drag/drop + light
+        // gridlines. LABELTIP omitted: it's a hover-tooltip for truncated
+        // labels — invisible to screen-reader-only use, costs paint time.
         let ex_style = LVS_EX_FULLROWSELECT
             | LVS_EX_DOUBLEBUFFER
-            | LVS_EX_LABELTIP
             | LVS_EX_GRIDLINES
             | LVS_EX_HEADERDRAGDROP;
         unsafe {
