@@ -1,0 +1,27 @@
+[package]
+name = "navigator-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+navigator-config      = { workspace = true }
+navigator-core        = { workspace = true }
+navigator-fs          = { workspace = true }
+navigator-prism       = { workspace = true }
+navigator-rclone      = { workspace = true }
+navigator-plugin-api  = { workspace = true }
+libloading            = { workspace = true }
+thiserror             = { workspace = true }
+tracing               = { workspace = true }
+parking_lot           = { workspace = true }
+once_cell             = { workspace = true }
+crossbeam-channel     = { workspace = true }
+notify                = "8"
+serde                 = { workspace = true }
+serde_json            = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows     = { workspace = true }
+windows-sys = { workspace = true }

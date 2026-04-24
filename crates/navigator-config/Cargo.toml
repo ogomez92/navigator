@@ -1,0 +1,17 @@
+[package]
+name = "navigator-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde      = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+toml       = "0.9"
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+toml       = "0.9"
+tempfile   = "3"

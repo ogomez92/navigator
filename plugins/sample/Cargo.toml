@@ -1,0 +1,15 @@
+[package]
+name    = "navigator-sample-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name       = "navigator_sample_plugin"
+crate-type = ["cdylib"]
+
+[dependencies]
+navigator-plugin-api = { workspace = true }
+navigator-core       = { workspace = true }
+tracing              = { workspace = true }

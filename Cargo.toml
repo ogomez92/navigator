@@ -1,0 +1,84 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/navigator",
+    "crates/navigator-config",
+    "crates/navigator-core",
+    "crates/navigator-plugin-api",
+    "crates/navigator-prism",
+    "crates/navigator-rclone",
+    "crates/navigator-fs",
+    "crates/navigator-gui",
+    "plugins/sample",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/you/navigator"
+
+[workspace.dependencies]
+navigator-config      = { path = "crates/navigator-config" }
+navigator-core        = { path = "crates/navigator-core" }
+navigator-plugin-api  = { path = "crates/navigator-plugin-api" }
+navigator-prism       = { path = "crates/navigator-prism" }
+navigator-rclone      = { path = "crates/navigator-rclone" }
+navigator-fs          = { path = "crates/navigator-fs" }
+navigator-gui         = { path = "crates/navigator-gui" }
+
+windows       = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+] }
+windows-sys   = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_NetworkManagement_NetManagement",
+] }
+
+libloading    = "0.8"
+thiserror     = "2"
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+tracing       = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+parking_lot   = "0.12"
+crossbeam-channel = "0.5"
+once_cell     = "1"
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"
+opt-level     = 3
+
+[profile.dev]
+opt-level     = 1

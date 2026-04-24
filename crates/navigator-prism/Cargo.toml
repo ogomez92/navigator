@@ -1,0 +1,17 @@
+[package]
+name    = "navigator-prism"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build   = "build.rs"
+links   = "prism"
+
+[dependencies]
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+
+[features]
+default = []
+# Link the prism static lib instead of the DLL import lib.
+static = []

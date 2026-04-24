@@ -1,0 +1,24 @@
+[package]
+name = "navigator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+default-run = "navigator"
+build = "build.rs"
+
+[build-dependencies]
+embed-manifest = "1.5"
+
+[[bin]]
+name = "navigator"
+path = "src/main.rs"
+
+[dependencies]
+navigator-core        = { workspace = true }
+navigator-gui         = { workspace = true }
+navigator-prism       = { workspace = true }
+navigator-plugin-api  = { workspace = true }
+tracing               = { workspace = true }
+tracing-subscriber    = { workspace = true }
+thiserror             = { workspace = true }
