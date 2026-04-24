@@ -28,8 +28,52 @@ fn defaults_have_flags_off() {
     let c = Config::default();
     assert!(!c.general.show_hidden);
     assert!(!c.general.show_system);
-    assert!(!c.general.progress_window);
+    assert!(!c.rclone.progress_window);
     assert_eq!(c.general.announce_interval_secs, 0);
+}
+
+#[test]
+fn default_rclone_transfers_is_eight() {
+    // Matches the navigator-rclone DEFAULT_TRANSFERS constant so a fresh
+    // install spawns ops with --transfers 8 out of the box.
+    let c = Config::default();
+    assert_eq!(c.rclone.transfers, 8);
+    assert_eq!(c.rclone.transfers_clamped(), 8);
+}
+
+#[test]
+fn rclone_transfers_clamps_absurd_values() {
+    // A hand-edited config with 0 or a huge value must not be handed
+    // straight to rclone — clamp to the 1..=64 band before use.
+    let mut c = Config::default();
+    c.rclone.transfers = 0;
+    assert_eq!(c.rclone.transfers_clamped(), 1);
+    c.rclone.transfers = 1000;
+    assert_eq!(c.rclone.transfers_clamped(), 64);
+}
+
+#[test]
+fn rclone_section_roundtrips_through_toml() {
+    let mut c = Config::default();
+    c.rclone.progress_window = true;
+    c.rclone.transfers = 12;
+    let text = toml::to_string_pretty(&c).expect("serialize");
+    let back: Config = toml::from_str(&text).expect("parse");
+    assert!(back.rclone.progress_window);
+    assert_eq!(back.rclone.transfers, 12);
+}
+
+#[test]
+fn rclone_section_is_optional_in_toml() {
+    // Configs written before the rclone section existed must still load
+    // with sensible defaults rather than erroring out.
+    let text = r#"
+        [general]
+        show_hidden = true
+    "#;
+    let c: Config = toml::from_str(text).expect("parse");
+    assert_eq!(c.rclone.transfers, 8);
+    assert!(!c.rclone.progress_window);
 }
 
 #[test]
@@ -66,17 +110,19 @@ fn toml_roundtrip_preserves_shortcuts() {
 
 #[test]
 fn partial_config_loads_missing_sections() {
-    // Only [general] set — plugins, shortcuts, recent_paths must default.
+    // Only [general] + [rclone] set — plugins, shortcuts, recent_paths must default.
     let text = r#"
         [general]
         show_hidden = true
         show_system = false
-        progress_window = true
         announce_interval_secs = 30
+
+        [rclone]
+        progress_window = true
     "#;
     let c: Config = toml::from_str(text).expect("partial parse");
     assert!(c.general.show_hidden);
-    assert!(c.general.progress_window);
+    assert!(c.rclone.progress_window);
     assert_eq!(c.general.announce_interval_secs, 30);
     // Shortcuts default is populated by default_actions(), not empty —
     // serde_default uses Config::default() for the field.

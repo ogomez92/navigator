@@ -46,8 +46,9 @@ const ID_CHECK_RELATIVE: u16   = 100;
 const ID_CHECK_NEW_BOTTOM: u16 = 101;
 const ID_CHECK_HIDDEN: u16     = 200;
 const ID_CHECK_SYSTEM: u16     = 201;
-const ID_CHECK_PROG: u16       = 202;
 const ID_EDIT_INTERVAL: u16    = 300;
+const ID_CHECK_PROG: u16       = 700;
+const ID_EDIT_TRANSFERS: u16   = 701;
 const ID_LIST_PLUGINS: u16     = 400;
 const ID_BTN_RELOAD: u16       = 401;
 const ID_LIST_HOTSPOTS: u16    = 500;
@@ -69,6 +70,7 @@ pub fn open(parent: HWND, state: Arc<AppState>) -> windows::core::Result<()> {
     let title_view:     Vec<u16> = "View\0".encode_utf16().collect();
     let title_columns:  Vec<u16> = "Columns\0".encode_utf16().collect();
     let title_speech:   Vec<u16> = "Speech\0".encode_utf16().collect();
+    let title_rclone:   Vec<u16> = "Rclone\0".encode_utf16().collect();
     let title_plugins:  Vec<u16> = "Plugins\0".encode_utf16().collect();
     let title_hotspots: Vec<u16> = "Hotspots\0".encode_utf16().collect();
 
@@ -85,6 +87,7 @@ pub fn open(parent: HWND, state: Arc<AppState>) -> windows::core::Result<()> {
         make_page(&page_template, &title_view,     hinstance, Some(page_view_proc),     make_lparam()),
         make_page(&page_template, &title_columns,  hinstance, Some(page_columns_proc),  make_lparam()),
         make_page(&page_template, &title_speech,   hinstance, Some(page_speech_proc),   make_lparam()),
+        make_page(&page_template, &title_rclone,   hinstance, Some(page_rclone_proc),   make_lparam()),
         make_page(&page_template, &title_plugins,  hinstance, Some(page_plugins_proc),  make_lparam()),
         make_page(&page_template, &title_hotspots, hinstance, Some(page_hotspots_proc), make_lparam()),
     ];
@@ -228,7 +231,6 @@ struct ViewData {
     state: Arc<AppState>,
     check_hidden: HWND,
     check_system: HWND,
-    check_prog: HWND,
 }
 
 unsafe extern "system" fn page_view_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) -> isize {
@@ -238,19 +240,15 @@ unsafe extern "system" fn page_view_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp: 
 
             let check_hidden = create_checkbox(hwnd, "Show &hidden files", 12, 16, ID_CHECK_HIDDEN);
             let check_system = create_checkbox(hwnd, "Show &system files", 12, 44, ID_CHECK_SYSTEM);
-            let check_prog = create_checkbox(hwnd, "Show &progress window during operations",
-                                             12, 72, ID_CHECK_PROG);
             apply_font_to(check_hidden);
             apply_font_to(check_system);
-            apply_font_to(check_prog);
 
             let g = state.config.read();
             set_check(check_hidden, g.general.show_hidden);
             set_check(check_system, g.general.show_system);
-            set_check(check_prog, g.general.progress_window);
             drop(g);
 
-            let data = Box::new(ViewData { state, check_hidden, check_system, check_prog });
+            let data = Box::new(ViewData { state, check_hidden, check_system });
             SetWindowLongPtrW(hwnd, DWLP_USER, Box::into_raw(data) as isize);
             1
         },
@@ -262,11 +260,9 @@ unsafe extern "system" fn page_view_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp: 
                     let d = &mut *(raw as *mut ViewData);
                     let hidden = get_check(d.check_hidden);
                     let system = get_check(d.check_system);
-                    let prog = get_check(d.check_prog);
                     d.state.config.with_mut(|c| {
                         c.general.show_hidden = hidden;
                         c.general.show_system = system;
-                        c.general.progress_window = prog;
                     });
                     let _ = d.state.config.save();
                     let filter = crate::model::Filter { show_hidden: hidden, show_system: system };
@@ -411,6 +407,75 @@ unsafe extern "system" fn page_speech_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp
             let raw = GetWindowLongPtrW(hwnd, DWLP_USER);
             if raw != 0 {
                 let _ = Box::from_raw(raw as *mut SpeechData);
+                SetWindowLongPtrW(hwnd, DWLP_USER, 0);
+            }
+            0
+        },
+        _ => 0,
+    }
+}
+
+// --- Rclone page ----------------------------------------------------------
+
+struct RcloneData {
+    state: Arc<AppState>,
+    check_prog: HWND,
+    edit_transfers: HWND,
+}
+
+unsafe extern "system" fn page_rclone_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => unsafe {
+            let state = take_state_from_init(lp);
+
+            let check_prog = create_checkbox(hwnd, "Show &progress window during operations",
+                                             12, 16, ID_CHECK_PROG);
+            let lbl = create_label(hwnd, "&Simultaneous transfers (--transfers, 1–64):",
+                                   12, 54, 320);
+            let edit_transfers = create_edit(hwnd, 12, 78, 80, ID_EDIT_TRANSFERS);
+            apply_font_to(check_prog);
+            apply_font_to(lbl);
+            apply_font_to(edit_transfers);
+
+            let r = state.config.read().rclone.clone();
+            set_check(check_prog, r.progress_window);
+            set_text(edit_transfers, &r.transfers_clamped().to_string());
+
+            let data = Box::new(RcloneData { state, check_prog, edit_transfers });
+            SetWindowLongPtrW(hwnd, DWLP_USER, Box::into_raw(data) as isize);
+            1
+        },
+        WM_NOTIFY => unsafe {
+            let hdr = &*(lp.0 as *const NMHDR);
+            if hdr.code == PSN_APPLY {
+                let raw = GetWindowLongPtrW(hwnd, DWLP_USER);
+                if raw != 0 {
+                    let d = &mut *(raw as *mut RcloneData);
+                    let prog = get_check(d.check_prog);
+                    // Fall back to the current configured value if the
+                    // edit is empty or unparseable so a stray keystroke
+                    // can't silently reset the setting to 1.
+                    let current = d.state.config.read().rclone.transfers_clamped();
+                    let entered: u32 = get_text(d.edit_transfers)
+                        .parse()
+                        .ok()
+                        .filter(|n: &u32| *n >= 1 && *n <= 64)
+                        .unwrap_or(current);
+                    d.state.config.with_mut(|c| {
+                        c.rclone.progress_window = prog;
+                        c.rclone.transfers = entered;
+                    });
+                    let _ = d.state.config.save();
+                }
+                set_apply_ok(hwnd);
+                return 1;
+            }
+            0
+        },
+        0x0002 => unsafe {
+            let raw = GetWindowLongPtrW(hwnd, DWLP_USER);
+            if raw != 0 {
+                let _ = Box::from_raw(raw as *mut RcloneData);
                 SetWindowLongPtrW(hwnd, DWLP_USER, 0);
             }
             0

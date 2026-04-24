@@ -56,6 +56,11 @@ pub const WMAPP_REDRAW_ROW: u32 = WM_APP + 5;
 pub const WMAPP_DIR_ERROR: u32 = WM_APP + 6;
 /// Rebuild the ListView's columns from current config. No payload.
 pub const WMAPP_RECONFIGURE_COLUMNS: u32 = WM_APP + 7;
+/// Show the text viewer with a given title + body. Payload is
+/// `Box<(String, String)>` — `(title, body)`. Posted from the worker
+/// threads that compute properties / tree dumps so the viewer window
+/// is always created on the UI thread.
+pub const WMAPP_VIEWER_SHOW: u32 = WM_APP + 8;
 
 const IDC_LISTVIEW: u16 = 1001;
 const IDC_ADDRESS: u16 = 1002;
@@ -109,9 +114,6 @@ pub struct WindowData {
     /// Current accelerator table. Rebuilt live when the user edits
     /// shortcut actions (see `rebuild_accels`).
     pub accel: parking_lot::Mutex<windows::Win32::UI::WindowsAndMessaging::HACCEL>,
-    /// File → Recent operations submenu. Contents are rebuilt on
-    /// WM_INITMENUPOPUP by reading `clipboard::load_history`.
-    pub recent_ops_menu: HMENU,
 }
 
 static WM_CREATE_PARAMS: OnceCell<Mutex<Option<Arc<AppState>>>> = OnceCell::new();
@@ -325,36 +327,29 @@ pub enum Commands {
     // Tools menu
     Options = 140,
     Shortcuts = 141,
+    RecentOpsWindow = 142,
     // Help menu
     About = 160,
     // Shortcut/Action dynamic range
     ActionBase = 0x4000,
-    // File → Recent operations submenu entries (20 slots).
-    RecentOpsBase = 0x5000,
 }
 
 // Chord → accelerator translation lives in `crate::accel` so it can be
 // unit-tested without the window proc.
 use crate::accel::chord_to_accel;
 
-/// Build the main menu. Returns `(menu, recent_ops_submenu)` — the
-/// caller stores the submenu handle in `WindowData` so
-/// `WM_INITMENUPOPUP` can repopulate it from the on-disk history.
-fn build_menu() -> (HMENU, HMENU) {
+/// Build the main menu. Returns `menu` only — the old recent-ops
+/// submenu has been replaced by a single menu entry that opens the
+/// `ops_window` modeless viewer, so no HMENU needs to be stashed.
+fn build_menu() -> HMENU {
     unsafe {
-        let recent_ops = CreatePopupMenu().unwrap();
-        // Empty placeholder so Windows draws the submenu arrow; contents
-        // are injected on WM_INITMENUPOPUP.
-        let _ = AppendMenuW(recent_ops, MF_STRING, 0, w!("(no recent operations)"));
-
         let file = CreatePopupMenu().unwrap();
         let _ = AppendMenuW(file, MF_STRING, Commands::HistBack as usize,        w!("&Back\tAlt+Left"));
         let _ = AppendMenuW(file, MF_STRING, Commands::HistForward as usize,     w!("&Forward\tAlt+Right"));
         let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(file, MF_STRING, Commands::Refresh as usize,         w!("&Refresh\tF5"));
         let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(file, windows::Win32::UI::WindowsAndMessaging::MF_POPUP,
-                            recent_ops.0 as usize, w!("Recent &operations"));
+        let _ = AppendMenuW(file, MF_STRING, Commands::RecentOpsWindow as usize, w!("Recent &operations…"));
         let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(file, MF_STRING, Commands::ToggleHidden as usize,    w!("Show &hidden files\tCtrl+H"));
         let _ = AppendMenuW(file, MF_STRING, Commands::ToggleSystem as usize,    w!("Show &system files\tCtrl+Shift+H"));
@@ -409,7 +404,7 @@ fn build_menu() -> (HMENU, HMENU) {
         let _ = AppendMenuW(bar, MF_POPUP, view.0 as usize,  w!("&View"));
         let _ = AppendMenuW(bar, MF_POPUP, tools.0 as usize, w!("&Tools"));
         let _ = AppendMenuW(bar, MF_POPUP, help.0 as usize,  w!("&Help"));
-        (bar, recent_ops)
+        bar
     }
 }
 
@@ -452,6 +447,43 @@ pub fn install_tab_nav(hwnd: HWND) {
     }
 }
 
+/// Subclass that posts `WM_CLOSE` to `hwnd`'s parent when the user hits
+/// Escape. Use it on any child control that should trigger window-close
+/// on Esc — regular (non-dialog) windows don't route Esc through
+/// IsDialogMessageW, so without this a multiline EDIT eats the key and
+/// the user is stuck with Alt+F4.
+pub fn install_esc_close(hwnd: HWND) {
+    unsafe {
+        let _ = windows::Win32::UI::Shell::SetWindowSubclass(
+            hwnd, Some(esc_close_subclass_proc), 0xB340, 0,
+        );
+    }
+}
+
+unsafe extern "system" fn esc_close_subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    if msg == WM_KEYDOWN && wp.0 as u32 == 0x1B /* VK_ESCAPE */ {
+        unsafe {
+            if let Ok(parent) = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd) {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(parent),
+                    WM_CLOSE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+                return LRESULT(0);
+            }
+        }
+    }
+    unsafe { windows::Win32::UI::Shell::DefSubclassProc(hwnd, msg, wp, lp) }
+}
+
 /// Explicit Tab/Shift+Tab focus traversal for controls where the dialog
 /// manager doesn't reliably do it (single-line edits that inherit input
 /// focus from a listview Tab, for example). Generic — can subclass any
@@ -488,7 +520,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 .and_then(|m| m.lock().take())
                 .expect("WM_CREATE_PARAMS not populated");
 
-            let (menu, recent_ops_menu) = build_menu();
+            let menu = build_menu();
             SetMenu(hwnd, Some(menu)).ok();
 
             let address = match create_address_bar(hwnd) {
@@ -512,7 +544,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 accel: parking_lot::Mutex::new(
                     windows::Win32::UI::WindowsAndMessaging::HACCEL::default(),
                 ),
-                recent_ops_menu,
             });
             let raw = Box::into_raw(data);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw as isize);
@@ -673,6 +704,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             LRESULT(0)
         },
 
+        WMAPP_VIEWER_SHOW => unsafe {
+            let payload: Box<(String, String)> = Box::from_raw(lp.0 as *mut _);
+            let (title, body) = *payload;
+            crate::viewer::show(hwnd, &title, &body);
+            LRESULT(0)
+        },
+
         WM_KEYDOWN => unsafe {
             // Enter on the listview opens the focused entry (handled globally
             // because we don't own the ListView's own key handling).
@@ -723,20 +761,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         },
 
         // Submenu messages forwarded to IContextMenu2/3 so Send To, New,
-        // and other owner-drawn shell submenus render. We also rebuild
-        // our own "Recent operations" submenu on WM_INITMENUPOPUP.
+        // and other owner-drawn shell submenus render. (Recent
+        // operations is now its own window; no menu rebuild to do here.)
         0x0117 /* WM_INITMENUPOPUP */
         | 0x002B /* WM_DRAWITEM */
         | 0x002C /* WM_MEASUREITEM */
         | 0x0120 /* WM_MENUCHAR */ => unsafe {
-            if msg == 0x0117 {
-                if let Some(data) = window_data(hwnd) {
-                    let popped = HMENU(wp.0 as *mut std::ffi::c_void);
-                    if popped.0 == data.recent_ops_menu.0 {
-                        rebuild_recent_ops_menu(data.recent_ops_menu);
-                    }
-                }
-            }
             if let Some(r) = crate::context_menu::forward_menu_msg(msg, wp, lp) {
                 return r;
             }
@@ -978,32 +1008,6 @@ fn sign_extend_16(v: i32) -> i32 {
     if v & 0x8000 != 0 { v | !0xFFFF } else { v }
 }
 
-/// Rebuild the "Recent operations" submenu from the on-disk history
-/// file. Called right before the submenu is shown, so other navigator
-/// instances' writes land in the list immediately.
-fn rebuild_recent_ops_menu(menu: HMENU) {
-    use windows::Win32::UI::WindowsAndMessaging::{DeleteMenu, GetMenuItemCount, MF_BYPOSITION};
-    unsafe {
-        // Clear existing items.
-        loop {
-            let n = GetMenuItemCount(Some(menu));
-            if n <= 0 { break; }
-            let _ = DeleteMenu(menu, 0, MF_BYPOSITION);
-        }
-        let entries = crate::clipboard::load_history();
-        if entries.is_empty() {
-            let _ = AppendMenuW(menu, MF_STRING, 0, w!("(no recent operations)"));
-            return;
-        }
-        for (i, e) in entries.iter().take(crate::clipboard::MAX_HISTORY).enumerate() {
-            let label = crate::clipboard::entry_label(e);
-            let w: Vec<u16> = label.encode_utf16().chain([0]).collect();
-            let id = Commands::RecentOpsBase as usize + i;
-            let _ = AppendMenuW(menu, MF_STRING, id, PCWSTR(w.as_ptr()));
-        }
-    }
-}
-
 fn open_focused(data: &WindowData) {
     let sel = data.state.model.selection_snapshot();
     let Some(idx) = sel.focus() else { return; };
@@ -1062,11 +1066,8 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
                 );
             }
         }
-        x if x >= Commands::RecentOpsBase as u16
-            && (x as u32) < (Commands::RecentOpsBase as u32)
-                + crate::clipboard::MAX_HISTORY as u32 => {
-            let idx = (x - Commands::RecentOpsBase as u16) as usize;
-            data.state.op_restore_from_history(idx);
+        x if x == Commands::RecentOpsWindow as u16 => {
+            crate::ops_window::open(hwnd, data.state.clone());
         }
         x if (x >= Commands::ActionBase as u16) => {
             // Shortcut action. ID = ActionBase + index into `state.actions()`.
@@ -1279,6 +1280,8 @@ fn dispatch_internal(hwnd: HWND, data: &WindowData, ic: navigator_config::Intern
         IC::HistBack     => state.go_back(),
         IC::HistForward  => state.go_forward(),
         IC::Undo         => state.op_undo(),
+        IC::ShowProperties => state.op_show_properties(),
+        IC::DumpTree     => state.op_dump_tree(),
         other => {
             if let Some(slot) = other.hotspot_goto_slot() {
                 state.hotspot_goto(slot);

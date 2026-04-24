@@ -78,12 +78,38 @@ impl OpHandle {
 #[derive(Debug, Clone)]
 pub struct RcloneDriver {
     exe: PathBuf,
+    /// Concurrent file transfers within one op. Passed as `--transfers N`
+    /// on every spawn. `1..=64`; zero is silently promoted to 1 so an
+    /// accidental config value cannot produce `--transfers 0` which rclone
+    /// rejects. Default 8.
+    transfers: u32,
 }
+
+/// Default concurrent-transfers count when no config overrides it. Chosen
+/// higher than rclone's own default (4) because a typical SSD saturates
+/// closer to 8 parallel streams; config can override for slow disks.
+pub const DEFAULT_TRANSFERS: u32 = 8;
 
 impl RcloneDriver {
     /// Look up `rclone` on PATH. Caller can override by passing a custom path.
-    pub fn from_path() -> Self { Self { exe: PathBuf::from("rclone") } }
-    pub fn with_exe(exe: impl Into<PathBuf>) -> Self { Self { exe: exe.into() } }
+    pub fn from_path() -> Self {
+        Self { exe: PathBuf::from("rclone"), transfers: DEFAULT_TRANSFERS }
+    }
+    pub fn with_exe(exe: impl Into<PathBuf>) -> Self {
+        Self { exe: exe.into(), transfers: DEFAULT_TRANSFERS }
+    }
+
+    /// Override the `--transfers N` value used for every spawned op.
+    /// Values below `1` are clamped up; callers typically read from
+    /// config via `Rclone::transfers_clamped`.
+    pub fn with_transfers(mut self, n: u32) -> Self {
+        self.transfers = n.max(1);
+        self
+    }
+
+    /// Current `--transfers` value. Exposed so tests + UI can round-trip
+    /// the value without reaching into private state.
+    pub fn transfers(&self) -> u32 { self.transfers }
 
     /// Run the operation under `--dry-run` and collect destinations that
     /// would be overwritten. Blocks until rclone finishes.
@@ -181,13 +207,7 @@ impl RcloneDriver {
 
     fn base_command(&self) -> Command {
         let mut cmd = Command::new(&self.exe);
-        cmd.args([
-            "--use-json-log",
-            "--log-level", "INFO",
-            "--stats", "1s",
-            "--stats-log-level", "NOTICE",
-            "--stats-one-line",
-        ]);
+        cmd.args(self.base_args());
         // Hide the console that Windows would otherwise allocate for a
         // console-subsystem child (rclone) launched from a GUI parent.
         // Without CREATE_NO_WINDOW, every copy/cut/delete pops a cmd
@@ -199,6 +219,21 @@ impl RcloneDriver {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
         cmd
+    }
+
+    /// Arg list that every `rclone` invocation gets, before the
+    /// operation-specific verb + paths. Exposed (as plain `Vec<String>`)
+    /// so tests can assert that `--transfers N` survives the driver
+    /// plumbing without having to spawn a real process.
+    pub fn base_args(&self) -> Vec<String> {
+        vec![
+            "--use-json-log".into(),
+            "--log-level".into(), "INFO".into(),
+            "--stats".into(), "1s".into(),
+            "--stats-log-level".into(), "NOTICE".into(),
+            "--stats-one-line".into(),
+            "--transfers".into(), self.transfers.to_string(),
+        ]
     }
 }
 

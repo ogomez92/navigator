@@ -218,6 +218,59 @@ fn preflight_on_missing_source_reports_error() {
 }
 
 #[test]
+fn default_transfers_value_matches_constant() {
+    // Fresh drivers carry the library default. Tied to the constant so
+    // a bump here + the config default stay in sync.
+    let driver = RcloneDriver::from_path();
+    assert_eq!(driver.transfers(), navigator_rclone::op::DEFAULT_TRANSFERS);
+    assert_eq!(driver.transfers(), 8);
+}
+
+#[test]
+fn base_args_include_transfers_flag() {
+    // Every spawned rclone process must carry the configured
+    // --transfers value. Asserting through base_args() bypasses the
+    // need for a real rclone binary on PATH.
+    let driver = RcloneDriver::from_path().with_transfers(12);
+    let args = driver.base_args();
+    let pos = args.iter().position(|a| a == "--transfers")
+        .expect("--transfers missing from base args");
+    assert_eq!(args.get(pos + 1).map(String::as_str), Some("12"));
+}
+
+#[test]
+fn with_transfers_clamps_zero_up_to_one() {
+    // rclone rejects --transfers 0; driver silently promotes so a bad
+    // config can't bomb every op.
+    let driver = RcloneDriver::from_path().with_transfers(0);
+    assert_eq!(driver.transfers(), 1);
+    let args = driver.base_args();
+    let pos = args.iter().position(|a| a == "--transfers").unwrap();
+    assert_eq!(args.get(pos + 1).map(String::as_str), Some("1"));
+}
+
+#[test]
+fn transfers_overrides_propagate_to_running_ops() {
+    // End-to-end: set --transfers, spawn a real copy, assert it still
+    // succeeds. Proves the flag doesn't break rclone parsing. Skipped
+    // when no rclone binary is on PATH.
+    if !rclone_available() { return; }
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    fs::write(src_dir.path().join("x.bin"), b"hello").unwrap();
+
+    let driver = RcloneDriver::from_path().with_transfers(2);
+    assert_eq!(driver.transfers(), 2);
+    let (ok, _) = run_to_completion(&driver, Operation::Copy {
+        sources: vec![nav(&src_dir.path().join("x.bin"))],
+        dest_dir: nav(dst_dir.path()),
+        policy: OverwritePolicy::Always,
+    });
+    assert!(ok, "copy with custom --transfers should succeed");
+    assert!(dst_dir.path().join("x.bin").exists());
+}
+
+#[test]
 fn nested_directory_copy_preserves_tree() {
     if !rclone_available() { return; }
     let src_dir = tempfile::tempdir().unwrap();

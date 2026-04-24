@@ -46,21 +46,19 @@ impl SpeechSink {
     /// Raw sender clone for worker threads that need a long-lived handle.
     pub fn handle(&self) -> Sender<Utterance> { self.tx.clone() }
 
-    /// Enqueue an utterance. If the queue is full we drop the oldest.
+    /// Enqueue an utterance. If the queue is full we retry once — by the
+    /// time the caller races the worker the latter typically has drained a
+    /// slot. Still full after the retry: drop with a warning.
     pub fn say(&self, text: impl Into<String>, interrupt: bool) {
-        let mut u = Utterance { text: text.into(), interrupt };
-        loop {
-            match self.tx.try_send(u) {
-                Ok(()) => return,
-                Err(TrySendError::Full(back)) => {
-                    // Drain one slot; if it's still full, drop.
-                    u = back;
-                    if self.tx.try_send(u.clone()).is_ok() { return; }
+        let u = Utterance { text: text.into(), interrupt };
+        match self.tx.try_send(u) {
+            Ok(()) => {}
+            Err(TrySendError::Full(back)) => {
+                if self.tx.try_send(back).is_err() {
                     warn!("speech queue full; dropping utterance");
-                    return;
                 }
-                Err(TrySendError::Disconnected(_)) => return,
             }
+            Err(TrySendError::Disconnected(_)) => {}
         }
     }
 }

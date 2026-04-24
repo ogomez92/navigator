@@ -97,6 +97,86 @@ pub fn push_history(entry: HistoryEntry) {
     }
 }
 
+/// Multi-line detail view of a history entry. Shown in the ops history
+/// window's bottom pane when the user highlights a row. Kind-specific:
+/// paste shows from → to + counts; copy/cut echo the action + sources;
+/// delete shows the doomed paths. Large selections get a head-only
+/// listing with a count tail so the pane doesn't turn into a dump of
+/// ten thousand lines for a big batch.
+pub fn entry_details(e: &HistoryEntry) -> String {
+    const HEAD: usize = 50;
+    let n = e.sources.len();
+    let verb = match e.kind.as_str() {
+        "copy"        => "Copy",
+        "cut"         => "Cut",
+        "append-copy" => "Append to copy clipboard",
+        "append-cut"  => "Append to cut clipboard",
+        "paste"       => "Paste",
+        "delete"      => "Delete",
+        other         => other,
+    };
+
+    let mut s = String::new();
+    s.push_str(&format!("Operation: {}\n", verb));
+    s.push_str(&format!("When:      {}\n", format_ts(e.ts)));
+    s.push_str(&format!("Items:     {}\n", n));
+    if e.kind == "paste" {
+        if let Some(dst) = e.dest.as_deref() {
+            s.push_str(&format!("Dest:      {}\n", dst));
+        }
+    }
+    // Source roots — one line summarising which directories the op
+    // touched. Dedup so a batch of 50 files from one folder still shows
+    // one entry, and heterogeneous drives both show up without
+    // pretending they share a root.
+    let roots = distinct_parents(&e.sources);
+    if !roots.is_empty() {
+        s.push_str(&format!("From:      {}\n", roots.join(", ")));
+    }
+
+    let header = match e.kind.as_str() {
+        "paste"  => "\nSources:\n",
+        "delete" => "\nDeleted:\n",
+        _        => "\nPaths:\n",
+    };
+    s.push_str(header);
+    for p in e.sources.iter().take(HEAD) {
+        s.push_str("  ");
+        s.push_str(p);
+        s.push('\n');
+    }
+    if n > HEAD {
+        s.push_str(&format!("  … {} more not shown\n", n - HEAD));
+    }
+    s
+}
+
+/// Distinct parent directories across `paths`, preserving first-seen
+/// order. Empty parents (bare filenames) are dropped — the user can
+/// read those straight off the per-path list below.
+fn distinct_parents(paths: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in paths {
+        let parent = std::path::Path::new(p).parent()
+            .map(|x| x.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if parent.is_empty() { continue; }
+        if !out.iter().any(|x| x == &parent) {
+            out.push(parent);
+        }
+    }
+    out
+}
+
+fn format_ts(ts: u64) -> String {
+    // Convert Unix seconds → FILETIME (100-ns since 1601) so we reuse
+    // the existing formatter without pulling in chrono.
+    if ts == 0 { return "—".to_string(); }
+    let ticks = ts.saturating_mul(10_000_000).saturating_add(116_444_736_000_000_000);
+    let out = crate::listview::format_filetime(ticks);
+    if out.is_empty() { ts.to_string() } else { out }
+}
+
 /// Short human-readable label for an entry. Used to populate menu items.
 pub fn entry_label(e: &HistoryEntry) -> String {
     let n = e.sources.len();
@@ -124,5 +204,106 @@ pub fn entry_label(e: &HistoryEntry) -> String {
             };
             format!("{} {}{}", verb, first, suffix)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sources(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!(r"C:\proj\file{i}.txt")).collect()
+    }
+
+    #[test]
+    fn copy_details_show_paths_and_count() {
+        let e = HistoryEntry {
+            kind: "copy".into(),
+            sources: sources(3),
+            dest: None,
+            ts: 0,
+        };
+        let s = entry_details(&e);
+        assert!(s.contains("Operation: Copy"));
+        assert!(s.contains("Items:     3"));
+        assert!(s.contains(r"C:\proj\file0.txt"));
+        assert!(s.contains("From:      C:\\proj"), "common parent missing:\n{s}");
+        assert!(!s.contains("Dest:"));
+    }
+
+    #[test]
+    fn paste_details_show_dest() {
+        let e = HistoryEntry {
+            kind: "paste".into(),
+            sources: sources(2),
+            dest: Some(r"D:\backup".into()),
+            ts: 0,
+        };
+        let s = entry_details(&e);
+        assert!(s.contains("Operation: Paste"));
+        assert!(s.contains(r"Dest:      D:\backup"));
+        assert!(s.contains("Sources:"));
+    }
+
+    #[test]
+    fn delete_details_use_deleted_header() {
+        let e = HistoryEntry {
+            kind: "delete".into(),
+            sources: sources(1),
+            dest: None,
+            ts: 0,
+        };
+        let s = entry_details(&e);
+        assert!(s.contains("Operation: Delete"));
+        assert!(s.contains("Deleted:"));
+    }
+
+    #[test]
+    fn large_batch_truncates_after_head() {
+        let e = HistoryEntry {
+            kind: "copy".into(),
+            sources: sources(120),
+            dest: None,
+            ts: 0,
+        };
+        let s = entry_details(&e);
+        assert!(s.contains("Items:     120"));
+        assert!(s.contains("… 70 more not shown"), "truncation tail missing:\n{s}");
+        // First few listed, last few elided.
+        assert!(s.contains(r"C:\proj\file0.txt"));
+        assert!(!s.contains(r"C:\proj\file119.txt"));
+    }
+
+    #[test]
+    fn heterogeneous_parents_list_all_distinct_roots() {
+        let e = HistoryEntry {
+            kind: "copy".into(),
+            sources: vec![r"C:\a\1.txt".into(), r"D:\b\2.txt".into()],
+            dest: None,
+            ts: 0,
+        };
+        let s = entry_details(&e);
+        assert!(s.contains(r"From:      C:\a, D:\b"),
+            "expected both roots comma-separated, got:\n{s}");
+    }
+
+    #[test]
+    fn repeated_parents_deduped_in_from_line() {
+        // Batch of 3 files from same folder → `From:` shows it once.
+        let e = HistoryEntry {
+            kind: "copy".into(),
+            sources: vec![
+                r"C:\proj\a.rs".into(),
+                r"C:\proj\b.rs".into(),
+                r"C:\proj\c.rs".into(),
+            ],
+            dest: None,
+            ts: 0,
+        };
+        let s = entry_details(&e);
+        // Count occurrences of the path — should be 1 on the From line.
+        let from_lines: Vec<&str> = s.lines().filter(|l| l.starts_with("From:")).collect();
+        assert_eq!(from_lines.len(), 1);
+        assert_eq!(from_lines[0], r"From:      C:\proj");
     }
 }

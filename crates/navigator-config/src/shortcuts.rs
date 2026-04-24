@@ -89,6 +89,14 @@ pub enum InternalCommand {
     HotspotSet8,
     HotspotSet9,
     HotspotSet10,
+    /// Show a read-only properties window for the focused entry. Files
+    /// show metadata (size, dates, attrs, extension info); folders also
+    /// recursively compute total size, counts and an extension histogram.
+    ShowProperties,
+    /// Recursively enumerate the focused folder (or current folder if a
+    /// file is focused) and dump the tree as TOML in a copy-friendly
+    /// viewer window.
+    DumpTree,
 }
 
 impl InternalCommand {
@@ -208,5 +216,57 @@ pub fn default_actions() -> Vec<ShortcutAction> {
         internal("Set hotspot 8",  HotspotSet8,  chord(true, true, false, "8")),
         internal("Set hotspot 9",  HotspotSet9,  chord(true, true, false, "9")),
         internal("Set hotspot 10", HotspotSet10, chord(true, true, false, "0")),
+        // Read-only info viewers. Alt+Enter matches Explorer's Properties
+        // chord; Alt+L dumps the tree as TOML in the same viewer shell.
+        internal("Show properties", ShowProperties, chord(false, false, true, "Return")),
+        internal("Dump tree",       DumpTree,       chord(false, false, true, "L")),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Find the seeded default for a given internal command, if any.
+    fn default_chord(ic: InternalCommand) -> Option<ShortcutChord> {
+        default_actions()
+            .into_iter()
+            .find(|a| a.internal == Some(ic))
+            .map(|a| a.chord)
+    }
+
+    #[test]
+    fn show_properties_default_is_alt_enter() {
+        let c = default_chord(InternalCommand::ShowProperties).expect("seeded");
+        assert!(c.alt && !c.ctrl && !c.shift);
+        assert!(
+            c.key.eq_ignore_ascii_case("return") || c.key.eq_ignore_ascii_case("enter"),
+            "unexpected key: {:?}", c.key,
+        );
+    }
+
+    #[test]
+    fn dump_tree_default_is_alt_l() {
+        let c = default_chord(InternalCommand::DumpTree).expect("seeded");
+        assert!(c.alt && !c.ctrl && !c.shift);
+        assert!(c.key.eq_ignore_ascii_case("l"), "unexpected key: {:?}", c.key);
+    }
+
+    #[test]
+    fn no_two_defaults_share_a_chord() {
+        // Defence against a new action silently shadowing an existing one.
+        let actions = default_actions();
+        for (i, a) in actions.iter().enumerate() {
+            for b in &actions[i + 1..] {
+                if a.chord.ctrl  == b.chord.ctrl
+                    && a.chord.shift == b.chord.shift
+                    && a.chord.alt   == b.chord.alt
+                    && a.chord.key.eq_ignore_ascii_case(&b.chord.key)
+                {
+                    panic!("duplicate default chord {:?} on {:?} and {:?}",
+                           a.chord, a.name, b.name);
+                }
+            }
+        }
+    }
 }

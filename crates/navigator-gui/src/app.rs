@@ -161,11 +161,16 @@ impl AppState {
             });
         }
 
+        // Wire the rclone driver with the configured `--transfers` value
+        // up-front. Changing the setting later rebuilds the driver via
+        // `AppState::set_rclone_transfers`, so all ops — including the
+        // ones already queued in a worker — pick up the new value.
+        let transfers = cfg.config.read().rclone.transfers_clamped();
         let me = Arc::new(Self {
             initial_path: cfg.initial_path.clone(),
             model,
             speech: SpeechSink::start(),
-            rclone: RcloneDriver::from_path(),
+            rclone: RcloneDriver::from_path().with_transfers(transfers),
             config: cfg.config.clone(),
             plugin_reg: OnceCell::new(),
             hwnd: Mutex::new(None),
@@ -965,15 +970,18 @@ impl AppState {
     /// of the closure so we don't leak `Arc<Self>` into threads that only
     /// need to speak + spawn rclone.
     fn clone_for_worker(&self) -> WorkerCtx {
-        let (progress_on, announce_interval_secs) = {
+        let (progress_on, announce_interval_secs, transfers) = {
             let g = self.config.read();
-            (g.general.progress_window, g.general.announce_interval_secs)
+            (g.rclone.progress_window, g.general.announce_interval_secs, g.rclone.transfers_clamped())
         };
         let progress = if progress_on {
             self.hwnd().and_then(|h| crate::progress::open(h.0).ok())
         } else { None };
+        // Rebuild the driver each spawn with the current `--transfers`
+        // so a config change inside Options takes effect on the next op
+        // without needing to restart the app.
         WorkerCtx {
-            rclone: self.rclone.clone(),
+            rclone: self.rclone.clone().with_transfers(transfers),
             speech: self.speech.handle(),
             scan_tx: self.scan_tx.clone(),
             refresh_target: self.model.cwd(),
@@ -1022,6 +1030,71 @@ impl AppState {
         }
     }
 
+    /// Show the read-only properties viewer for the focused entry. For
+    /// directories the recursive size / counts / extension histogram
+    /// come from a worker thread so a giant tree doesn't freeze the UI;
+    /// the viewer only opens once the scan finishes.
+    pub fn op_show_properties(&self) {
+        let Some(cwd) = self.model.cwd() else { return; };
+        let sel = self.model.selection_snapshot();
+        let Some(idx) = sel.focus() else {
+            self.say("no item focused", false);
+            return;
+        };
+        let Some(entry) = self.model.get(idx) else { return; };
+        let path = cwd.join(&entry.name);
+        let Some(hwnd) = self.hwnd() else { return; };
+
+        let is_dir = entry.is_dir();
+        let title = format!("Properties — {}", entry.name);
+        if is_dir {
+            self.say(&format!("scanning {}…", entry.name), false);
+        }
+        std::thread::Builder::new()
+            .name("navigator-properties".into())
+            .spawn(move || {
+                let stats = if is_dir {
+                    Some(crate::props::compute_folder_stats(&path))
+                } else {
+                    None
+                };
+                let body = crate::props::format_properties(&entry, &path, stats.as_ref());
+                post_viewer(hwnd, title, body);
+            })
+            .expect("spawn properties worker");
+    }
+
+    /// Recursively enumerate the focused folder (or the current folder
+    /// if a file is focused) and show the TOML tree dump in the viewer.
+    /// Runs on a worker thread for the same reason as properties.
+    pub fn op_dump_tree(&self) {
+        let Some(cwd) = self.model.cwd() else { return; };
+        let sel = self.model.selection_snapshot();
+        // Prefer the focused entry if it's a directory; otherwise dump
+        // the current folder itself.
+        let target = sel
+            .focus()
+            .and_then(|i| self.model.get(i))
+            .filter(|e| e.is_dir())
+            .map(|e| cwd.join(&e.name))
+            .unwrap_or(cwd);
+        if target.is_this_pc() {
+            self.say("can't dump This PC", true);
+            return;
+        }
+        let Some(hwnd) = self.hwnd() else { return; };
+        let label = target.file_name().to_string();
+        let title = format!("Tree — {}", if label.is_empty() { target.to_string() } else { label });
+        self.say("dumping tree…", false);
+        std::thread::Builder::new()
+            .name("navigator-dump-tree".into())
+            .spawn(move || {
+                let body = crate::props::dump_tree_toml(&target);
+                post_viewer(hwnd, title, body);
+            })
+            .expect("spawn dump-tree worker");
+    }
+
     /// Rename `old_name` → `new_name` within the current directory.
     pub fn op_rename(&self, old_name: &str, new_name: &str) {
         let Some(cwd) = self.model.cwd() else { return; };
@@ -1038,6 +1111,20 @@ impl AppState {
             .name("navigator-rclone-op".into())
             .spawn(move || ctx.run_single(op))
             .expect("spawn rclone op thread");
+    }
+}
+
+/// Post a `(title, body)` payload to the main window so the viewer opens
+/// on the UI thread. Heap-leaks a `Box` that the window proc reclaims.
+fn post_viewer(hwnd: HwndSend, title: String, body: String) {
+    let payload = Box::into_raw(Box::new((title, body)));
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(hwnd.0),
+            crate::window::WMAPP_VIEWER_SHOW,
+            WPARAM(0),
+            LPARAM(payload as isize),
+        );
     }
 }
 
@@ -1085,6 +1172,10 @@ impl WorkerCtx {
         let mut failed = 0u32;
         let mut skipped = 0u32;
         let mut renamed = 0u32;
+        // First path that was actually produced in `dest_dir` — used to
+        // land focus on it after the refresh so the user sees where the
+        // paste ended up. Rename-on-conflict stores the fresh sibling.
+        let mut first_created: Option<NavPath> = None;
 
         // Sticky decision after the user ticks "apply to all". `None` means
         // we still ask per-conflict.
@@ -1167,7 +1258,15 @@ impl WorkerCtx {
             self.say(format!("{} of {}: {}", i + 1, total, effective_name), false);
             if !self.run_one(op) {
                 failed += 1;
+            } else if first_created.is_none() {
+                first_created = Some(dest_dir.join(&effective_name));
             }
+        }
+        // Arm pending_focus before the refresh so refocus_after_up can
+        // land the caret on the newly pasted row by filename. Matches the
+        // behaviour of undo-delete for a consistent "where did it go" UX.
+        if let (Some(state), Some(target)) = (self.state.upgrade(), first_created) {
+            state.set_pending_focus(target);
         }
         let msg = match (failed, skipped, renamed) {
             (0, 0, 0) => format!("done — {} items", total),

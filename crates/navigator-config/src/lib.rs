@@ -34,6 +34,7 @@ pub type Result<T> = std::result::Result<T, ConfigError>;
 pub struct Config {
     pub general: General,
     pub plugins: Plugins,
+    pub rclone: Rclone,
     pub recent_paths: Vec<String>,
     #[serde(default = "shortcuts::default_actions")]
     pub shortcuts: Vec<ShortcutAction>,
@@ -56,6 +57,7 @@ impl Default for Config {
         Self {
             general: General::default(),
             plugins: Plugins::default(),
+            rclone: Rclone::default(),
             recent_paths: Vec::new(),
             shortcuts: shortcuts::default_actions(),
             hotspots: default_hotspots(),
@@ -68,9 +70,6 @@ impl Default for Config {
 pub struct General {
     pub show_hidden: bool,
     pub show_system: bool,
-    /// `true` = show a progress window while ops run. Errors always force
-    /// a window regardless of this value.
-    pub progress_window: bool,
     /// Seconds between periodic progress announcements through prism.
     /// `0` = only announce on completion.
     pub announce_interval_secs: u32,
@@ -96,7 +95,6 @@ impl Default for General {
         Self {
             show_hidden: false,
             show_system: false,
-            progress_window: false,
             announce_interval_secs: 0,
             show_relative_dates: false,
             new_items_at_bottom: true,
@@ -104,6 +102,41 @@ impl Default for General {
             sort_descending: false,
             columns: Columns::default(),
         }
+    }
+}
+
+/// rclone-specific knobs. Kept in their own section because they drive
+/// the external `rclone` binary's flags rather than GUI behaviour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rclone {
+    /// `true` = show the progress window while a copy/move/delete runs.
+    /// Errors still surface as a dialog regardless. Moved here from
+    /// `general` because its audience is the rclone pipeline.
+    pub progress_window: bool,
+    /// Maps to rclone's `--transfers N`. Caps concurrent file transfers
+    /// within one op; higher values speed up many-small-files copies over
+    /// fast links but can saturate slow disks or network shares. rclone's
+    /// native default is 4; ours is 8 based on typical SSD throughput.
+    /// Clamped to `1..=64` at load time so a junk value cannot brick ops.
+    pub transfers: u32,
+}
+
+impl Default for Rclone {
+    fn default() -> Self {
+        Self {
+            progress_window: false,
+            transfers: 8,
+        }
+    }
+}
+
+impl Rclone {
+    /// Clamped transfers value suitable for handing straight to the
+    /// driver. Zero / absurd values get normalised to the default so a
+    /// hand-edited config can't wedge the pipeline.
+    pub fn transfers_clamped(&self) -> u32 {
+        self.transfers.clamp(1, 64)
     }
 }
 

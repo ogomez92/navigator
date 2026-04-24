@@ -40,7 +40,7 @@ Thin binary, fat workspace. `crates/navigator/src/main.rs` only parses args + in
 - **`navigator-config`** — TOML config at `<exe_dir>/config.toml` (never `%APPDATA%`). `ConfigHandle` is an `Arc<RwLock<Config>>` clone-able handle. Also defines shortcut actions.
 - **`navigator-plugin-api`** — stable C ABI for plugins. Plugins are `cdylib` crates exporting `navigator_plugin_entry`. Strings crossing the boundary are `*const u8 + len` (UTF-8), everything `#[repr(C)]`. Loaded with `libloading`.
 - **`navigator-prism`** — safe FFI wrapper around the prism C library. `Prism` is a process-wide singleton guarded by an `AtomicBool`; `Speaker` handles are `Send` but not `Sync`.
-- **`navigator-rclone`** — rclone driver. Spawns `rclone` with `--use-json-log --stats=1s`, parses each stdout line as a structured log record. Emits `OpEvent::{Progress, Log, Done}` on a crossbeam channel. Pre-flight `--dry-run` detects overwrites before the real op starts.
+- **`navigator-rclone`** — rclone driver. Spawns `rclone` with `--use-json-log --stats=1s --transfers N`, parses each stdout line as a structured log record. Emits `OpEvent::{Progress, Log, Done}` on a crossbeam channel. Pre-flight `--dry-run` detects overwrites before the real op starts. `RcloneDriver::with_transfers(n)` sets `--transfers`; `AppState::clone_for_worker` re-reads `config.rclone.transfers_clamped()` on every spawn so a config save applies to the next op without a restart. `base_args()` is exposed for tests.
 - **`navigator-fs`** — directory scanning via raw `FindFirstFileExW` with `FindExInfoBasic` + `FIND_FIRST_EX_LARGE_FETCH`. Exposes `read_dir`, `list_drives` (for the virtual "This PC" view), and `search_recursive`.
 - **`navigator-core`** — shared value types (`NavPath`, `Entry`, `Selection`, `Event`, `Error`). No GUI / OS code; safe to use from plugins.
 - **`plugins/sample`** — example plugin.
@@ -88,8 +88,15 @@ The preflight TaskDialog offers three choices plus Cancel: `Overwrite`, `Skip`, 
 - **Clipboard is file-backed**, not the Windows clipboard. `<exe_dir>/clipboard.json` holds `{sources, cut, ts}`; written by copy/cut/append, read by paste. Two running navigator instances share it automatically. The OS clipboard is untouched except by `op_copy_paths` (CF_UNICODETEXT on purpose).
 - **Operation history** lives in `<exe_dir>/clipboard_history.json`, capped at `MAX_HISTORY` (20) rolling entries. Feeds File → Recent operations; `WM_INITMENUPOPUP` rebuilds the submenu each time from disk so peer instances' writes show up. Command IDs `Commands::RecentOpsBase..+20` route clicks to `op_restore_from_history`.
 - **Undo stack is in-memory only** (`AppState.undo_stack: Mutex<Vec<UndoAction>>`, capped at 50). Variants: `ClipChange { prev }` (reverse copy/cut/append/restore) and `Paste { created, originals, cut_mode }` (copy-undo deletes `created`, cut-undo moves each back to its `originals[i]`) and `Delete { pairs: Vec<(trash, original)> }`. Push happens *before* spawning the worker so Ctrl+Z can reach even in-flight operations.
+- **Paste arms `pending_focus`.** `run_batch` captures the first successfully created destination and calls `AppState::set_pending_focus` before `refresh()`, so `refocus_after_up` lands the caret on the pasted row by filename. Same pattern as undo-delete; relies on the weak `Arc<AppState>` in `WorkerCtx.state`.
 - **Delete → trash, not purge.** `op_delete` renames each target to `<volume_root>/.trash/<unix_ts>_<counter>/<basename>` on the *same* drive (derived via `volume_root_of`) so the move is atomic — no cross-drive copy. The worker is `run_trash_batch`; undo is `run_revert_delete`, which skips targets whose original path is now re-occupied rather than clobbering. On successful undo the worker arms `AppState::set_pending_focus` with the first restored path, so the subsequent refresh lands the caret back on the recovered row — the worker reaches into `AppState` via the `Weak<AppState>` stored on `WorkerCtx.state` (set up in `AppState::new` via `self_weak: OnceCell<Weak<Self>>` so methods on `&self` can still hand workers a route back). Trash is never auto-purged; closing the app orphans the undo handle but the staged files remain.
 - **Clipboard path validity is checked at paste/restore, not at copy.** `op_paste` filters sources via `NavPath::new`; `op_restore_from_history` partitions by `Path::exists()` and announces missing-count without touching the clip file if *all* paths are gone.
+
+### Text viewer (Alt+Enter / Alt+L)
+
+`viewer.rs` is a singleton top-level window with a readonly multiline EDIT + Close button. Used for any "here is a block of text, copy what you need" screen — currently `op_show_properties` (Alt+Enter) and `op_dump_tree` (Alt+L). Workers compute the text off the UI thread and post `WMAPP_VIEWER_SHOW` with a `Box<(title, body)>` payload; the window proc reclaims the box and calls `viewer::show`. On open the edit takes focus and gets `EM_SETSEL(0, -1)` so Ctrl+C copies immediately.
+
+Pure computation (folder stats, extension histogram, TOML tree dump) lives in `props.rs`, kept free of HWND / speech so the logic is unit-testable without a live window. Recursion is iterative — explicit stack, no risk of blowing the process stack on deep trees. Symlinks are counted but not followed.
 
 ### Real Win32 dialogs
 
@@ -108,7 +115,8 @@ The preflight TaskDialog offers three choices plus Cancel: `Overwrite`, `Skip`, 
 
 - `ConfigHandle::load_or_default()` is infallible — a corrupt `config.toml` logs a warning and returns defaults.
 - `config.toml`, `plugins/`, `clipboard.json`, `clipboard_history.json`, and `.trash/` all live next to the exe (or in the case of `.trash`, at each volume root). `navigator_config::exe_dir()` is the source of truth; don't hardcode.
-- Sort mode, filters (show hidden/system), progress-window preference, shortcut bindings, hotspot slots, and per-column visibility (`general.columns`) all persist here.
+- Sort mode, filters (show hidden/system), shortcut bindings, hotspot slots, and per-column visibility (`general.columns`) all persist here.
+- **`[rclone]` section** holds `progress_window` (moved out of `[general]`) and `transfers` (default 8, clamped 1..=64 via `Rclone::transfers_clamped`). Options → Rclone tab writes both. `transfers` feeds rclone's `--transfers N`.
 - `Columns` defaults to all-on (Size/Type/Modified shown) so pre-existing configs keep the historical four-column view after upgrade. `SortMode::Type` was added alongside — sort works regardless of column visibility, so `type_key()` in `model.rs` is the source of truth and not the Type column label.
 - **TOML can't hold `None` in arrays.** `hotspots` is stored as `Vec<String>` (empty string = unset), not `Vec<Option<String>>` — the latter serializes `None` and fails with `UnsupportedNone`. Hotspot slots must be exactly `HOTSPOT_COUNT` long; the code trusts the file to have the right length (no runtime padding), so a hand-edited short vec can panic — delete `config.toml` if it does.
 
@@ -130,4 +138,6 @@ Jump reuses `AppState.pending_focus` + the existing `refocus_after_up` post-list
 
 ## Key bindings
 
-See `README.md` for the user-facing table. User-bound actions live under `shortcuts` in `config.toml`; `navigator_config::shortcuts::default_actions()` returns the seeded defaults (Copy/Cut/Paste/Append/CopyPaths/SelectAll/Rename/Refresh/ToggleHidden/ToggleSystem/Search/NavigateUp/Hist Back+Forward/Undo + Hotspot1..10 + HotspotSet1..10). The accel table is rebuilt on startup and on shortcut-editor save via `window::rebuild_accels`.
+See `README.md` for the user-facing table. User-bound actions live under `shortcuts` in `config.toml`; `navigator_config::shortcuts::default_actions()` returns the seeded defaults (Copy/Cut/Paste/Append/CopyPaths/SelectAll/Rename/Refresh/ToggleHidden/ToggleSystem/Search/NavigateUp/Hist Back+Forward/Undo + Hotspot1..10 + HotspotSet1..10 + ShowProperties[Alt+Enter] + DumpTree[Alt+L]). The accel table is rebuilt on startup and on shortcut-editor save via `window::rebuild_accels`.
+
+Adding a new `InternalCommand` variant touches three places: enum in `shortcuts.rs`, seed line in `default_actions()`, and a `dispatch_internal` arm in `window.rs`. Accel matches modifiers strictly, so `Alt+Enter` does **not** collide with the listview's plain-Enter handler (those are distinct ACCEL entries only when modifiers match).
