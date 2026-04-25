@@ -171,6 +171,29 @@ fn move_single_file_removes_source() {
 }
 
 #[test]
+fn move_directory_removes_empty_source_dir() {
+    if !rclone_available() { return; }
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    let tree = src_dir.path().join("tree");
+    fs::create_dir_all(tree.join("sub")).unwrap();
+    fs::write(tree.join("root.txt"), b"r").unwrap();
+    fs::write(tree.join("sub").join("leaf.txt"), b"l").unwrap();
+
+    let driver = RcloneDriver::from_path();
+    let (ok, _) = run_to_completion(&driver, Operation::Move {
+        sources: vec![nav(&tree)],
+        dest_dir: nav(dst_dir.path()),
+        policy: OverwritePolicy::Always,
+    });
+    assert!(ok, "move should succeed");
+    assert!(dst_dir.path().join("tree").join("root.txt").exists());
+    assert!(dst_dir.path().join("tree").join("sub").join("leaf.txt").exists());
+    assert!(!tree.exists(),
+        "source tree must be removed (--delete-empty-src-dirs)");
+}
+
+#[test]
 fn delete_purges_path() {
     if !rclone_available() { return; }
     let dir = tempfile::tempdir().unwrap();

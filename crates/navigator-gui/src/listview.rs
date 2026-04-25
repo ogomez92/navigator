@@ -300,6 +300,47 @@ unsafe extern "system" fn listview_subclass_proc(
             }
             return windows::Win32::Foundation::LRESULT(0);
         }
+
+        // Boundary arrow swallow. Default `SysListView32` in multi-select
+        // mode (no `LVS_SINGLESEL`) implements VK_UP/DOWN/HOME/END/PgUp/PgDn
+        // as "deselect current, move focus, select new focus". When focus
+        // can't move (single-item folder, or already at the top/bottom),
+        // step 3 never runs and the row stays visually deselected — which
+        // is what lets `openFocused` (Enter) no-op afterwards. Swallow the
+        // key when it can't navigate, but only for plain presses; Shift
+        // (range extend) and Ctrl (focus-only move) keep their normal
+        // listview behavior.
+        if data != 0 {
+            const VK_PRIOR: u32 = 0x21;
+            const VK_NEXT:  u32 = 0x22;
+            const VK_END:   u32 = 0x23;
+            const VK_HOME:  u32 = 0x24;
+            const VK_UP:    u32 = 0x26;
+            const VK_DOWN:  u32 = 0x28;
+            let nav_up   = matches!(vk, VK_UP | VK_HOME | VK_PRIOR);
+            let nav_down = matches!(vk, VK_DOWN | VK_END | VK_NEXT);
+            if nav_up || nav_down {
+                let shift = unsafe { (GetKeyState(0x10) as i32) < 0 };
+                let ctrl  = unsafe { (GetKeyState(0x11) as i32) < 0 };
+                if !shift && !ctrl {
+                    let state = unsafe { &*(data as *const crate::app::AppState) };
+                    let total = state.model.len();
+                    let focus = state.model.selection_snapshot().focus();
+                    let swallow = if total <= 1 {
+                        true
+                    } else {
+                        match focus {
+                            Some(0) if nav_up => true,
+                            Some(i) if nav_down && i + 1 == total => true,
+                            _ => false,
+                        }
+                    };
+                    if swallow {
+                        return windows::Win32::Foundation::LRESULT(0);
+                    }
+                }
+            }
+        }
     }
     // Tab / Shift+Tab: explicitly traverse tabstops. IsDialogMessageW in
     // the main message loop *should* handle this, but SysListView32 with

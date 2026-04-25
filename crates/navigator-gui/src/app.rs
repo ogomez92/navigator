@@ -14,9 +14,10 @@ use navigator_config::ConfigHandle;
 use navigator_core::NavPath;
 use navigator_fs::read_dir;
 use navigator_plugin_api::host::HostCallbacks;
-use navigator_rclone::{Operation, OverwritePolicy, RcloneDriver};
+use navigator_rclone::{op::OpEvent, Operation, OverwritePolicy, RcloneDriver};
 
 use crate::plugins::{Host as PluginHost, PluginRegistry};
+use crate::remote_cache::RemoteCache;
 
 use crate::history::History;
 use crate::model::{Filter, Model};
@@ -87,6 +88,9 @@ pub struct AppState {
     /// `pending_focus` after a revert-delete) without us having to
     /// change every method signature to take `self: &Arc<Self>`.
     self_weak: OnceCell<Weak<AppState>>,
+    /// Process-wide cache for files downloaded from rclone remotes so
+    /// they can be opened in local apps. See `remote_cache.rs`.
+    pub remote_cache: Arc<RemoteCache>,
 }
 
 const UNDO_STACK_MAX: usize = 50;
@@ -141,9 +145,14 @@ fn make_trash_dir_on_volume_of(path: &NavPath) -> Option<NavPath> {
 impl AppState {
     pub fn new(cfg: &AppConfig) -> Arc<Self> {
         let (tx, rx) = unbounded::<ScanCmd>();
+        // Clone the driver into the scan worker so it can run
+        // `rclone lsjson` / `listremotes` for remote browsing. Transfer
+        // concurrency is irrelevant for those one-shot commands, so we
+        // don't re-read config here.
+        let scan_rclone = RcloneDriver::from_path();
         thread::Builder::new()
             .name("navigator-scan".into())
-            .spawn(move || scan_worker(rx))
+            .spawn(move || scan_worker(rx, scan_rclone))
             .expect("spawn scan worker");
 
         let model = Model::new();
@@ -182,6 +191,7 @@ impl AppState {
             type_ahead: Mutex::new((String::new(), std::time::Instant::now())),
             undo_stack: Mutex::new(Vec::new()),
             self_weak: OnceCell::new(),
+            remote_cache: Arc::new(RemoteCache::new()),
         });
         let _ = me.self_weak.set(Arc::downgrade(&me));
         me
@@ -242,7 +252,10 @@ impl AppState {
     /// window when a directory listing finishes. ThisPC is a virtual view
     /// — no real directory to watch, so we just drop any old watcher.
     pub fn watch_cwd(&self, path: &NavPath) {
-        if path.is_this_pc() {
+        // Virtual views (This PC, Remotes root) have no real directory
+        // to watch; remote sub-paths live behind an rclone remote and
+        // likewise can't be locally watched.
+        if path.is_this_pc() || path.is_remotes_root() || path.is_remote() {
             *self.watcher.lock() = None;
             return;
         }
@@ -612,22 +625,80 @@ impl AppState {
     }
 
     pub fn open_file(&self, path: NavPath) {
-        use windows::core::{w, PCWSTR};
-        use windows::Win32::UI::Shell::ShellExecuteW;
-        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-        use std::os::windows::ffi::OsStrExt;
-
-        let path_w: Vec<u16> = path.as_path().as_os_str().encode_wide().chain([0]).collect();
-        unsafe {
-            let _ = ShellExecuteW(
-                None,
-                w!("open"),
-                PCWSTR(path_w.as_ptr()),
-                PCWSTR::null(),
-                PCWSTR::null(),
-                SW_SHOWNORMAL,
-            );
+        if path.is_remote() {
+            self.open_remote_file(path);
+            return;
         }
+        shell_open(path.as_path());
+    }
+
+    /// Download a remote file into the staging cache, then hand it to
+    /// ShellExecute. Returns immediately — the download runs on a worker
+    /// thread so the UI stays responsive. Once the staged file is live,
+    /// `RemoteCache` arms its watcher so post-open edits can prompt an
+    /// upload back.
+    fn open_remote_file(&self, remote: NavPath) {
+        let Some((name, sub)) = remote.remote_parts() else { return; };
+        if sub.is_empty() {
+            self.say("can't open a remote root as a file", true);
+            return;
+        }
+        let Some(hwnd) = self.hwnd() else { return; };
+
+        let staged = self.remote_cache.stage_path_for(&name, &sub);
+        let Ok(staged_nav) = NavPath::new(staged.clone()) else {
+            self.say("remote cache path invalid", true);
+            return;
+        };
+
+        let speech = self.speech.handle();
+        let rclone = self.rclone.clone();
+        let cache = Arc::clone(&self.remote_cache);
+        let remote_for_thread = remote.clone();
+
+        let _ = speech.send(crate::speech::Utterance {
+            text: format!("downloading {}", remote.file_name()),
+            interrupt: false,
+        });
+
+        std::thread::Builder::new()
+            .name("navigator-remote-open".into())
+            .spawn(move || {
+                let op = Operation::CopyTo { src: remote_for_thread.clone(), dst: staged_nav };
+                let handle = match rclone.spawn(op) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = speech.send(crate::speech::Utterance {
+                            text: format!("download failed: {}", e),
+                            interrupt: true,
+                        });
+                        return;
+                    }
+                };
+                let mut success = false;
+                for ev in handle.events.iter() {
+                    if let OpEvent::Done { success: ok, stderr_tail } = ev {
+                        success = ok;
+                        if !ok {
+                            let tail = stderr_tail.lines().next_back().unwrap_or("").to_string();
+                            let _ = speech.send(crate::speech::Utterance {
+                                text: format!("download failed: {}", if tail.is_empty() { "see log".into() } else { tail }),
+                                interrupt: true,
+                            });
+                        }
+                        break;
+                    }
+                }
+                if !success { return; }
+
+                cache.register(staged.clone(), remote_for_thread.clone(), hwnd);
+                let _ = speech.send(crate::speech::Utterance {
+                    text: format!("opening {}", remote_for_thread.file_name()),
+                    interrupt: false,
+                });
+                shell_open(&staged);
+            })
+            .expect("spawn remote-open worker");
     }
 
     fn push_undo(&self, a: UndoAction) {
@@ -860,13 +931,32 @@ impl AppState {
             *self.pending_focus.lock() = Some(target);
         }
 
-        // Move each target to `<volume_root>/.trash/<ts>_<n>/<basename>`
-        // on the same drive as the source. Same-volume keeps the rename
-        // atomic and avoids stranding trash on an unrelated volume.
-        // Multiple targets on the same drive each get their own dir so
-        // identical basenames across different selections don't clobber.
-        let mut pairs: Vec<(NavPath, NavPath)> = Vec::with_capacity(paths.len());
-        for p in &paths {
+        // Split by endpoint. Remote paths can't go to a local `.trash`
+        // dir — rclone would have to cross the boundary — and rclone's
+        // own purge is irreversible, so we confirm + skip the undo
+        // stack. Local paths still route through the trash flow.
+        let (remote_targets, local): (Vec<NavPath>, Vec<NavPath>) =
+            paths.iter().cloned().partition(|p| p.is_remote());
+
+        if !remote_targets.is_empty() {
+            if !confirm_remote_delete(self.main_hwnd(), &remote_targets) {
+                // User cancelled. Don't touch local either — avoids a
+                // half-delete where they confirmed one endpoint and not
+                // the other. Clear pending_focus since no op will fire.
+                self.pending_focus.lock().take();
+                return;
+            }
+            self.spawn_remote_purge(remote_targets);
+        }
+
+        if local.is_empty() {
+            return;
+        }
+
+        // Move each local target to `<volume_root>/.trash/<ts>_<n>/<basename>`
+        // on the same drive. Same-volume keeps the rename atomic.
+        let mut pairs: Vec<(NavPath, NavPath)> = Vec::with_capacity(local.len());
+        for p in &local {
             let Some(trash_dir) = make_trash_dir_on_volume_of(p) else {
                 self.say(&format!("failed to create trash dir for {}", p.file_name()), true);
                 continue;
@@ -885,6 +975,63 @@ impl AppState {
             .name("navigator-batch-delete".into())
             .spawn(move || state.run_trash_batch(pairs))
             .expect("spawn delete batch");
+    }
+
+    /// Fire `rclone purge` once per remote target on a background
+    /// thread. No undo — rclone purge is destructive, and most backends
+    /// (S3 without versioning, SFTP, WebDAV) have no recovery path. UI
+    /// refreshes when the last target finishes.
+    fn spawn_remote_purge(&self, targets: Vec<NavPath>) {
+        let rclone = self.rclone.clone();
+        let speech = self.speech.handle();
+        let state_weak = self.self_weak.get().cloned().unwrap_or_else(Weak::new);
+        let parent_hint = targets.first().and_then(|p| p.parent());
+
+        let _ = speech.send(crate::speech::Utterance {
+            text: format!("deleting {} remote item(s)", targets.len()),
+            interrupt: false,
+        });
+
+        std::thread::Builder::new()
+            .name("navigator-remote-purge".into())
+            .spawn(move || {
+                let mut ok_count = 0usize;
+                let mut fail_count = 0usize;
+                for t in &targets {
+                    let op = Operation::Delete { targets: vec![t.clone()] };
+                    let handle = match rclone.spawn(op) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            fail_count += 1;
+                            let _ = speech.send(crate::speech::Utterance {
+                                text: format!("delete failed: {}", e),
+                                interrupt: true,
+                            });
+                            continue;
+                        }
+                    };
+                    for ev in handle.events.iter() {
+                        if let OpEvent::Done { success, .. } = ev {
+                            if success { ok_count += 1; } else { fail_count += 1; }
+                            break;
+                        }
+                    }
+                }
+                let _ = speech.send(crate::speech::Utterance {
+                    text: if fail_count == 0 {
+                        format!("deleted {} remote item(s)", ok_count)
+                    } else {
+                        format!("deleted {}, {} failed", ok_count, fail_count)
+                    },
+                    interrupt: fail_count > 0,
+                });
+                if let Some(state) = state_weak.upgrade() {
+                    if let (Some(cwd), Some(parent)) = (state.model.cwd(), parent_hint) {
+                        if cwd == parent { state.refresh(); }
+                    }
+                }
+            })
+            .expect("spawn remote-purge worker");
     }
 
     /// Compute the `pending_focus` target the listing hook should land on
@@ -1030,6 +1177,40 @@ impl AppState {
         }
     }
 
+    /// Copy the current selection to the *real* Windows clipboard as
+    /// `CF_HDROP` (file-handle list) plus a `Preferred DropEffect = COPY`
+    /// hint, so a subsequent paste in Explorer / dialogs / other apps
+    /// reproduces the files. Distinct from `op_copy`, which only writes
+    /// our private file-backed clipboard. Remote (rclone) paths are
+    /// rejected — Explorer can't resolve `\\?\NavigatorRemote\...`.
+    pub fn op_copy_to_clipboard(&self) {
+        let paths = self.model.selected_paths();
+        if paths.is_empty() {
+            self.say("nothing selected", false);
+            return;
+        }
+        if paths.iter().any(|p| p.is_remote()) {
+            self.say("can't copy remote paths to OS clipboard", true);
+            return;
+        }
+        let n = paths.len();
+        let os_paths: Vec<std::path::PathBuf> =
+            paths.iter().map(|p| p.as_path().to_path_buf()).collect();
+        match set_clipboard_hdrop(self.main_hwnd(), &os_paths) {
+            Ok(()) => {
+                let msg = if n == 1 {
+                    "1 item on OS clipboard".to_string()
+                } else {
+                    format!("{} items on OS clipboard", n)
+                };
+                self.say(&msg, false);
+            }
+            Err(e) => {
+                self.say(&format!("OS clipboard failed: {}", e), true);
+            }
+        }
+    }
+
     /// Show the read-only properties viewer for the focused entry. For
     /// directories the recursive size / counts / extension histogram
     /// come from a worker thread so a giant tree doesn't freeze the UI;
@@ -1095,12 +1276,44 @@ impl AppState {
             .expect("spawn dump-tree worker");
     }
 
-    /// Rename `old_name` → `new_name` within the current directory.
+    /// Rename `old_name` → `new_name` within the current directory. Arms
+    /// `pending_focus` so the caret lands on the renamed row after the
+    /// post-op refresh — without it the listing rebuild defaults to row 0.
     pub fn op_rename(&self, old_name: &str, new_name: &str) {
         let Some(cwd) = self.model.cwd() else { return; };
         let src = cwd.join(old_name);
         let dst = cwd.join(new_name);
+        self.set_pending_focus(dst.clone());
         self.spawn_op(Operation::Rename { src, dst });
+    }
+
+    /// Create an empty folder named `name` inside the current directory.
+    /// The caller is responsible for prompting the user for the name (see
+    /// `new_folder` dialog) — this method just validates the context and
+    /// fires the op. Pending focus is armed so the newly created row gets
+    /// the caret after the post-op refresh.
+    pub fn op_new_folder(&self, name: String) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            self.say("folder name empty", true);
+            return;
+        }
+        if name.contains(['\\', '/', ':']) || name == "." || name == ".." {
+            self.say("invalid folder name", true);
+            return;
+        }
+        let Some(cwd) = self.model.cwd() else { return; };
+        if cwd.is_this_pc() || cwd.is_remotes_root() {
+            self.say("cannot create folder here", true);
+            return;
+        }
+        let dst = cwd.join(&name);
+        if !dst.is_remote() && dst.as_path().exists() {
+            self.say(&format!("{} already exists", name), true);
+            return;
+        }
+        self.set_pending_focus(dst.clone());
+        self.spawn_op(Operation::Mkdir { dir: dst });
     }
 
     /// Kick off a single-shot op (rename / one-file). For multi-source
@@ -1111,6 +1324,152 @@ impl AppState {
             .name("navigator-rclone-op".into())
             .spawn(move || ctx.run_single(op))
             .expect("spawn rclone op thread");
+    }
+
+    /// Upload a staged remote file back to its origin. Runs on a worker
+    /// so the UI doesn't block, and updates the cache record on success
+    /// so the next save re-prompts instead of re-uploading silently.
+    pub fn op_remote_upload(&self, staged: PathBuf, remote: NavPath) {
+        let Ok(staged_nav) = NavPath::new(staged.clone()) else {
+            self.say("cache path invalid", true);
+            return;
+        };
+        let speech = self.speech.handle();
+        let rclone = self.rclone.clone();
+        let cache = Arc::clone(&self.remote_cache);
+        let remote_display = remote.rclone_arg().unwrap_or_else(|| remote.to_string());
+        let state_weak = self.self_weak.get().cloned().unwrap_or_else(Weak::new);
+
+        let _ = speech.send(crate::speech::Utterance {
+            text: format!("uploading to {}", remote_display),
+            interrupt: false,
+        });
+
+        std::thread::Builder::new()
+            .name("navigator-remote-upload".into())
+            .spawn(move || {
+                let op = Operation::CopyTo { src: staged_nav, dst: remote.clone() };
+                let handle = match rclone.spawn(op) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = speech.send(crate::speech::Utterance {
+                            text: format!("upload failed: {}", e),
+                            interrupt: true,
+                        });
+                        cache.finish_prompt(&staged, None);
+                        return;
+                    }
+                };
+                let mut success = false;
+                let mut tail = String::new();
+                for ev in handle.events.iter() {
+                    if let OpEvent::Done { success: ok, stderr_tail } = ev {
+                        success = ok;
+                        tail = stderr_tail;
+                        break;
+                    }
+                }
+                if success {
+                    let mtime = staged.metadata().ok().and_then(|m| m.modified().ok());
+                    cache.finish_prompt(&staged, mtime);
+                    let _ = speech.send(crate::speech::Utterance {
+                        text: format!("uploaded to {}", remote_display),
+                        interrupt: false,
+                    });
+                    // Refresh the current view so the listing picks up
+                    // the new mtime/size, and arm `pending_focus` with
+                    // the uploaded file so the caret lands on it after
+                    // the rescan instead of snapping to row 0. Only
+                    // refresh if cwd matches the remote's parent — the
+                    // user may have navigated away during upload.
+                    if let Some(state) = state_weak.upgrade() {
+                        if let Some(cwd) = state.model.cwd() {
+                            if let Some(parent) = remote.parent() {
+                                if cwd == parent {
+                                    state.set_pending_focus(remote.clone());
+                                    state.refresh();
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    cache.finish_prompt(&staged, None);
+                    let last = tail.lines().next_back().unwrap_or("").to_string();
+                    let _ = speech.send(crate::speech::Utterance {
+                        text: format!("upload failed: {}", if last.is_empty() { "see log".into() } else { last }),
+                        interrupt: true,
+                    });
+                }
+            })
+            .expect("spawn remote-upload worker");
+    }
+}
+
+/// Confirm a permanent remote delete. Remote paths can't go through the
+/// local `.trash/` flow (cross-endpoint rename doesn't exist) and
+/// rclone's `purge` is irreversible on most backends, so we warn +
+/// require explicit Yes. Defaults to No.
+fn confirm_remote_delete(parent: Option<HWND>, targets: &[NavPath]) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, MessageBoxW, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND,
+        MB_YESNO, IDYES,
+    };
+    use windows::core::PCWSTR;
+
+    let preview: Vec<String> = targets
+        .iter()
+        .take(10)
+        .map(|p| p.rclone_arg().unwrap_or_else(|| p.to_string()))
+        .collect();
+    let extra = if targets.len() > preview.len() {
+        format!("\n… and {} more", targets.len() - preview.len())
+    } else {
+        String::new()
+    };
+    let body = format!(
+        "Permanently delete {} item(s) from the remote?\n\
+         rclone purge cannot be undone.\n\n\
+         {}{}",
+        targets.len(),
+        preview.join("\n"),
+        extra,
+    );
+    let title_w: Vec<u16> = "Delete from remote?".encode_utf16().chain([0]).collect();
+    let body_w: Vec<u16> = body.encode_utf16().chain([0]).collect();
+    let is_foreground = parent
+        .map(|h| unsafe { GetForegroundWindow() } == h)
+        .unwrap_or(false);
+    let mut flags = MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2;
+    if is_foreground { flags |= MB_SETFOREGROUND; }
+    let rc = unsafe {
+        MessageBoxW(
+            parent,
+            PCWSTR(body_w.as_ptr()),
+            PCWSTR(title_w.as_ptr()),
+            flags,
+        ).0
+    };
+    rc == IDYES.0
+}
+
+/// Ask the Windows shell to open `path` with its default handler. Used
+/// for both local files and files downloaded out of rclone remotes.
+fn shell_open(path: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let path_w: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    unsafe {
+        let _ = ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(path_w.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
     }
 }
 
@@ -1387,6 +1746,7 @@ impl WorkerCtx {
     /// Errors are always surfaced via a modal dialog, regardless of the
     /// progress-window preference.
     fn run_one(&self, op: Operation) -> bool {
+        let op_for_retry = op.clone();
         let handle = match self.rclone.spawn(op) {
             Ok(h) => h,
             Err(e) => {
@@ -1453,23 +1813,106 @@ impl WorkerCtx {
                     }
                 }
                 navigator_rclone::op::OpEvent::Done { success, stderr_tail } => {
-                    if let Some(p) = progress.as_ref() { p.post_done(success); }
-                    if !success {
-                        let tail_lines: Vec<&str> = stderr_tail.lines().rev().take(10).collect();
-                        let tail = tail_lines.into_iter().rev().collect::<Vec<_>>().join("\n");
-                        error!("rclone: {tail}");
-                        crate::dialogs::show_error(
-                            self.hwnd,
-                            "File operation failed",
-                            if tail.is_empty() { "rclone reported an error" } else { &tail },
-                        );
+                    if success {
+                        if let Some(p) = progress.as_ref() { p.post_done(true); }
+                        return true;
                     }
-                    return success;
+                    // Failed. If the tail looks like a Windows ACL
+                    // denial (writes to C:\, Program Files, etc.), retry
+                    // under UAC. The UAC prompt itself is the user
+                    // confirmation — no extra dialog. Don't loop more
+                    // than once: if the elevated retry also fails, the
+                    // problem isn't permission.
+                    let tail_lines: Vec<&str> = stderr_tail.lines().rev().take(10).collect();
+                    let tail = tail_lines.into_iter().rev().collect::<Vec<_>>().join("\n");
+                    error!("rclone: {tail}");
+
+                    // Probe the op's local destination for write
+                    // permission rather than grepping rclone's tail —
+                    // rclone's error string is locale-translated and
+                    // lies on protected-root writes (says "file not
+                    // found" instead of "access denied"). Asking the OS
+                    // directly via a tiny test write gives an
+                    // unambiguous `PermissionDenied` errno when ACL is
+                    // the cause. Probe runs only on failure, so the
+                    // happy path doesn't write a probe per op.
+                    let needs_elevation = navigator_rclone::op::local_dest_dir(&op_for_retry)
+                        .map(|d| matches!(
+                            probe_write_access(&d).err().map(|e| e.kind()),
+                            Some(std::io::ErrorKind::PermissionDenied)
+                        ))
+                        .unwrap_or(false);
+                    if needs_elevation {
+                        let _ = self.speech.try_send(crate::speech::Utterance {
+                            text: "permission denied, retrying as administrator".into(),
+                            interrupt: false,
+                        });
+                        match crate::elevated::run(&self.rclone, &op_for_retry) {
+                            Ok(out) if out.success => {
+                                if let Some(p) = progress.as_ref() { p.post_done(true); }
+                                return true;
+                            }
+                            Ok(out) => {
+                                if let Some(p) = progress.as_ref() { p.post_done(false); }
+                                let elev_tail = out.log_tail.lines().rev().take(10)
+                                    .collect::<Vec<_>>().into_iter().rev()
+                                    .collect::<Vec<_>>().join("\n");
+                                let body = if elev_tail.is_empty() { tail.clone() } else { elev_tail };
+                                crate::dialogs::show_error(
+                                    self.hwnd,
+                                    "File operation failed (even as administrator)",
+                                    if body.is_empty() { "rclone reported an error" } else { &body },
+                                );
+                                return false;
+                            }
+                            Err(e) => {
+                                // ShellExecuteEx itself failed (UAC
+                                // declined, exe missing). Fall through
+                                // to the normal failure dialog with the
+                                // original tail.
+                                error!("elevated retry: {e}");
+                            }
+                        }
+                    }
+
+                    if let Some(p) = progress.as_ref() { p.post_done(false); }
+                    crate::dialogs::show_error(
+                        self.hwnd,
+                        "File operation failed",
+                        if tail.is_empty() { "rclone reported an error" } else { &tail },
+                    );
+                    return false;
                 }
             }
         }
         false
     }
+}
+
+/// Drop a zero-byte file in `dir` and immediately remove it. Returns
+/// the OS error verbatim — callers care about `ErrorKind::PermissionDenied`
+/// to distinguish ACL-protected dirs (Windows `C:\` root, `Program
+/// Files`, etc.) from missing parents and other write failures. PID +
+/// nanos in the name keep concurrent probes from peer instances /
+/// threads from colliding.
+fn probe_write_access(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let probe = dir.join(format!(
+        ".navigator-probe-{}-{}",
+        std::process::id(),
+        nanos,
+    ));
+    let f = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe)?;
+    drop(f);
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// Stat a single child by name and return its [`Entry`]. Used by the file
@@ -1533,11 +1976,124 @@ fn set_clipboard_text(hwnd: Option<windows::Win32::Foundation::HWND>, text: &str
     }
 }
 
+/// Place a `CF_HDROP` (Windows file-handle list) on the clipboard,
+/// plus a `Preferred DropEffect = COPY` hint. Pasting the result in
+/// Explorer / open-file dialogs / other apps reproduces the files via
+/// the shell's normal copy machinery.
+///
+/// Blob layout for the DROPFILES handle:
+///   * `DROPFILES` header (20 bytes, packed) — `pFiles = 20`, `fWide = 1`
+///   * UTF-16 paths concatenated, each NUL-terminated
+///   * one extra `0u16` so the list ends in a double-NUL
+///
+/// The "Preferred DropEffect" registered format carries a single
+/// `DWORD` (`DROPEFFECT_COPY = 1`), telling the receiver to treat the
+/// drop as a copy rather than guessing from same-vs-cross-volume rules.
+fn set_clipboard_hdrop(
+    hwnd: Option<windows::Win32::Foundation::HWND>,
+    paths: &[std::path::PathBuf],
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{GlobalFree, HANDLE};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW,
+        SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::System::Ole::CF_HDROP;
+    use windows::Win32::UI::Shell::DROPFILES;
+    use windows::core::PCWSTR;
+
+    // Build the wide string list: <path>\0<path>\0...\0
+    let mut wide_list: Vec<u16> = Vec::new();
+    for p in paths {
+        for unit in p.as_os_str().encode_wide() {
+            wide_list.push(unit);
+        }
+        wide_list.push(0);
+    }
+    wide_list.push(0); // double-NUL terminator
+
+    let header_size = std::mem::size_of::<DROPFILES>();
+    let payload_bytes = wide_list.len() * std::mem::size_of::<u16>();
+    let total = header_size + payload_bytes;
+
+    unsafe {
+        OpenClipboard(hwnd).map_err(io_err)?;
+        let result = (|| -> std::io::Result<()> {
+            EmptyClipboard().map_err(io_err)?;
+
+            // --- CF_HDROP block ---
+            let hmem = GlobalAlloc(GMEM_MOVEABLE, total).map_err(io_err)?;
+            if hmem.is_invalid() {
+                return Err(std::io::Error::other("GlobalAlloc returned null"));
+            }
+            let base = GlobalLock(hmem) as *mut u8;
+            if base.is_null() {
+                let _ = GlobalFree(Some(hmem));
+                return Err(std::io::Error::other("GlobalLock returned null"));
+            }
+            let header = DROPFILES {
+                pFiles: header_size as u32,
+                pt: windows::Win32::Foundation::POINT { x: 0, y: 0 },
+                fNC: false.into(),
+                fWide: true.into(),
+            };
+            std::ptr::copy_nonoverlapping(
+                (&header as *const DROPFILES) as *const u8,
+                base,
+                header_size,
+            );
+            std::ptr::copy_nonoverlapping(
+                wide_list.as_ptr(),
+                base.add(header_size) as *mut u16,
+                wide_list.len(),
+            );
+            let _ = GlobalUnlock(hmem);
+            if let Err(e) = SetClipboardData(u32::from(CF_HDROP.0), Some(HANDLE(hmem.0))) {
+                let _ = GlobalFree(Some(hmem));
+                return Err(io_err(e));
+            }
+
+            // --- Preferred DropEffect = DROPEFFECT_COPY (1) ---
+            // Failure here is non-fatal: paste targets fall back to
+            // their default behaviour (usually copy across drives,
+            // move within the same volume).
+            let fmt_name: Vec<u16> = "Preferred DropEffect"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let fmt = RegisterClipboardFormatW(PCWSTR(fmt_name.as_ptr()));
+            if fmt != 0 {
+                let dword_bytes = std::mem::size_of::<u32>();
+                if let Ok(hde) = GlobalAlloc(GMEM_MOVEABLE, dword_bytes)
+                    && !hde.is_invalid()
+                {
+                    let dst = GlobalLock(hde) as *mut u32;
+                    if !dst.is_null() {
+                        *dst = 1; // DROPEFFECT_COPY
+                        let _ = GlobalUnlock(hde);
+                        if SetClipboardData(fmt, Some(HANDLE(hde.0))).is_err() {
+                            let _ = GlobalFree(Some(hde));
+                        }
+                    } else {
+                        let _ = GlobalFree(Some(hde));
+                    }
+                }
+            }
+
+            Ok(())
+        })();
+        let _ = CloseClipboard();
+        result
+    }
+}
+
 fn io_err(e: windows::core::Error) -> std::io::Error {
     std::io::Error::other(format!("{}", e))
 }
 
-fn scan_worker(rx: crossbeam_channel::Receiver<ScanCmd>) {
+fn scan_worker(rx: crossbeam_channel::Receiver<ScanCmd>, rclone: RcloneDriver) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
             ScanCmd::Shutdown => break,
@@ -1547,6 +2103,57 @@ fn scan_worker(rx: crossbeam_channel::Receiver<ScanCmd>) {
                 // in the virtual listview just like regular files.
                 let entries = if path.is_this_pc() {
                     navigator_fs::list_drives()
+                } else if path.is_remotes_root() {
+                    match rclone.listremotes() {
+                        Ok(names) => names
+                            .into_iter()
+                            .map(|n| navigator_core::Entry {
+                                name: n,
+                                kind: navigator_core::EntryKind::Directory,
+                                size: 0,
+                                modified: navigator_core::FileTime::default(),
+                                created: navigator_core::FileTime::default(),
+                                attrs: 0,
+                                hidden: false,
+                                system: false,
+                            })
+                            .collect(),
+                        Err(e) => {
+                            error!("rclone listremotes: {}", e);
+                            let payload = Box::into_raw(
+                                Box::new((path.clone(), e.to_string())),
+                            ) as isize;
+                            unsafe {
+                                let _ = PostMessageW(
+                                    Some(hwnd.0),
+                                    WMAPP_DIR_ERROR,
+                                    WPARAM(0),
+                                    LPARAM(payload),
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                } else if path.is_remote() {
+                    let target = path.rclone_arg().unwrap_or_default();
+                    match rclone.lsjson(&target) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            error!("rclone lsjson {}: {}", target, e);
+                            let payload = Box::into_raw(
+                                Box::new((path.clone(), e.to_string())),
+                            ) as isize;
+                            unsafe {
+                                let _ = PostMessageW(
+                                    Some(hwnd.0),
+                                    WMAPP_DIR_ERROR,
+                                    WPARAM(0),
+                                    LPARAM(payload),
+                                );
+                            }
+                            continue;
+                        }
+                    }
                 } else if path.is_unc_host_only() {
                     // Host-only UNC (`\\host`) — `FindFirstFileW` rejects
                     // it with ERROR_BAD_NETPATH. Enumerate shares on the

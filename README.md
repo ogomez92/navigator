@@ -33,6 +33,53 @@ Run:
 
     cargo run --release
 
+## CLI
+
+    navigator [OPTIONS] [PATH]
+
+| Arg / flag              | Effect                                                           |
+|-------------------------|------------------------------------------------------------------|
+| `<PATH>`                | Local path (`C:\foo`) or rclone remote (`mac:downloads`)         |
+| `-r`, `--remote <SPEC>` | Open an rclone remote. `SPEC` is `name` or `name:sub/path`       |
+| `-h`, `--help`          | Print usage                                                      |
+
+Examples:
+
+    navigator
+    navigator C:\Users\me\Downloads
+    navigator -r mac:Downloads/incoming
+    navigator -r gdrive                    # bare name = remote root
+    navigator mac:Downloads/incoming       # same as -r, no flag needed
+
+## Remotes (rclone)
+
+navigator browses any rclone remote as if it were a local folder. Everything
+you configured in `%APPDATA%\rclone\rclone.conf` (S3, Google Drive, SFTP,
+WebDAV, etc.) is available from the **Tools → Connect to remote…** menu,
+which drops you into a virtual "Remotes" view listing each remote. Activating
+one opens its root; copy/cut/paste/delete/rename all flow through the
+existing rclone pipeline, so remote↔local and remote↔remote transfers work
+the same way local-only ops do.
+
+Remote paths display in rclone form (`remote:sub/path`) in the address bar.
+Typing one directly there — or passing it on the command line — jumps
+straight to that location without going through the menu.
+
+### Opening remote files
+
+Pressing Enter on a file inside a remote triggers a download-and-edit
+flow:
+
+1. The file is fetched into `<exe_dir>/.remote-cache/<remote>/<sub/path>/`.
+2. Once download finishes, the staged copy is handed to `ShellExecute` so
+   the OS opens it in whatever app the extension is associated with.
+3. navigator keeps a `notify` watcher on the cache directory. When you
+   save through your editor (mtime bumps), it pops a Yes/No prompt —
+   "Upload changes back to `remote:path`?". Yes spawns an rclone upload;
+   No leaves the staged copy alone.
+4. Staged files are never auto-purged. Same stance as `.trash/`: if you
+   want to free disk, delete `.remote-cache/` manually.
+
 ## Key bindings
 
 | Key                          | Action                                              |

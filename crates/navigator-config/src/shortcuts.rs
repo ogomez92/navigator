@@ -97,6 +97,19 @@ pub enum InternalCommand {
     /// file is focused) and dump the tree as TOML in a copy-friendly
     /// viewer window.
     DumpTree,
+    /// Prompt for a name and create a new empty folder in the current
+    /// directory. The folder is only created after the user commits the
+    /// name — unlike Explorer we don't create `New folder` up front.
+    NewFolder,
+    /// Move focus to the address bar and select its text. Default
+    /// chord is Alt+D — same as Explorer / browsers.
+    FocusAddress,
+    /// Copy the selected file/folder *handles* to the real Windows
+    /// clipboard as `CF_HDROP` (plus a `Preferred DropEffect = COPY`
+    /// hint), so pasting in Explorer / other apps reproduces the
+    /// files. Distinct from the app's own file-backed clipboard, which
+    /// only navigator instances see. Default chord: Alt+C.
+    CopyToClipboard,
 }
 
 impl InternalCommand {
@@ -220,6 +233,10 @@ pub fn default_actions() -> Vec<ShortcutAction> {
         // chord; Alt+L dumps the tree as TOML in the same viewer shell.
         internal("Show properties", ShowProperties, chord(false, false, true, "Return")),
         internal("Dump tree",       DumpTree,       chord(false, false, true, "L")),
+        internal("New folder",      NewFolder,      chord(true,  false, false, "N")),
+        internal("Focus address bar", FocusAddress, chord(false, false, true,  "D")),
+        // Real Windows clipboard (CF_HDROP) — paste into Explorer etc.
+        internal("Copy to OS clipboard", CopyToClipboard, chord(false, false, true, "C")),
     ]
 }
 

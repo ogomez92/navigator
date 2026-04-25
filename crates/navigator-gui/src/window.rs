@@ -61,6 +61,10 @@ pub const WMAPP_RECONFIGURE_COLUMNS: u32 = WM_APP + 7;
 /// threads that compute properties / tree dumps so the viewer window
 /// is always created on the UI thread.
 pub const WMAPP_VIEWER_SHOW: u32 = WM_APP + 8;
+/// A staged remote file was modified on disk. Payload is `Box<PathBuf>`
+/// (the staged local path). Handler prompts "upload back?" and, on yes,
+/// spawns an rclone worker. Posted from the remote-cache watcher thread.
+pub const WMAPP_REMOTE_EDIT: u32 = WM_APP + 9;
 
 const IDC_LISTVIEW: u16 = 1001;
 const IDC_ADDRESS: u16 = 1002;
@@ -312,10 +316,15 @@ pub enum Commands {
     /// intercepts VK_RETURN before the listview gets it.
     OpenFocused = 112,
     Undo = 113,
+    CopyToClipboard = 114,
+    AppendCopy = 115,
+    AppendCut = 116,
     // File menu
     ToggleHidden = 120,
     ToggleSystem = 121,
     Exit = 122,
+    NavigateUp = 123,
+    ShowProperties = 124,
     // View menu
     SortName = 130,
     SortSize = 131,
@@ -324,10 +333,14 @@ pub enum Commands {
     SortDescending = 134,
     Search = 135,
     SortType = 136,
+    FocusAddress = 137,
     // Tools menu
     Options = 140,
     Shortcuts = 141,
     RecentOpsWindow = 142,
+    ConnectRemote = 143,
+    NewFolder = 144,
+    DumpTree = 145,
     // Help menu
     About = 160,
     // Shortcut/Action dynamic range
@@ -344,10 +357,14 @@ use crate::accel::chord_to_accel;
 fn build_menu() -> HMENU {
     unsafe {
         let file = CreatePopupMenu().unwrap();
+        let _ = AppendMenuW(file, MF_STRING, Commands::NewFolder as usize,       w!("&New folder…\tCtrl+N"));
+        let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(file, MF_STRING, Commands::HistBack as usize,        w!("&Back\tAlt+Left"));
         let _ = AppendMenuW(file, MF_STRING, Commands::HistForward as usize,     w!("&Forward\tAlt+Right"));
+        let _ = AppendMenuW(file, MF_STRING, Commands::NavigateUp as usize,      w!("Navigate &up\tAlt+Up"));
         let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(file, MF_STRING, Commands::Refresh as usize,         w!("&Refresh\tF5"));
+        let _ = AppendMenuW(file, MF_STRING, Commands::ShowProperties as usize,  w!("P&roperties\tAlt+Enter"));
         let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(file, MF_STRING, Commands::RecentOpsWindow as usize, w!("Recent &operations…"));
         let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
@@ -359,14 +376,17 @@ fn build_menu() -> HMENU {
         let edit = CreatePopupMenu().unwrap();
         let _ = AppendMenuW(edit, MF_STRING, Commands::Undo as usize,      w!("&Undo\tCtrl+Z"));
         let _ = AppendMenuW(edit, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(edit, MF_STRING, Commands::Cut as usize,       w!("Cu&t\tCtrl+X"));
-        let _ = AppendMenuW(edit, MF_STRING, Commands::Copy as usize,      w!("&Copy\tCtrl+C"));
-        let _ = AppendMenuW(edit, MF_STRING, Commands::CopyPaths as usize, w!("Copy &paths\tCtrl+Shift+C"));
-        let _ = AppendMenuW(edit, MF_STRING, Commands::Paste as usize,     w!("&Paste\tCtrl+V"));
-        let _ = AppendMenuW(edit, MF_STRING, Commands::Delete as usize,    w!("&Delete\tDel"));
-        let _ = AppendMenuW(edit, MF_STRING, Commands::Rename as usize,    w!("Rena&me\tF2"));
+        let _ = AppendMenuW(edit, MF_STRING, Commands::Cut as usize,            w!("Cu&t\tCtrl+X"));
+        let _ = AppendMenuW(edit, MF_STRING, Commands::Copy as usize,           w!("&Copy\tCtrl+C"));
+        let _ = AppendMenuW(edit, MF_STRING, Commands::CopyToClipboard as usize, w!("Copy to &OS clipboard\tAlt+C"));
+        let _ = AppendMenuW(edit, MF_STRING, Commands::CopyPaths as usize,      w!("Copy &paths\tCtrl+Shift+C"));
+        let _ = AppendMenuW(edit, MF_STRING, Commands::AppendCopy as usize,     w!("Append to copy\tCtrl+Alt+C"));
+        let _ = AppendMenuW(edit, MF_STRING, Commands::AppendCut as usize,      w!("Append to cut\tCtrl+Alt+X"));
+        let _ = AppendMenuW(edit, MF_STRING, Commands::Paste as usize,          w!("&Paste\tCtrl+V"));
+        let _ = AppendMenuW(edit, MF_STRING, Commands::Delete as usize,         w!("&Delete\tDel"));
+        let _ = AppendMenuW(edit, MF_STRING, Commands::Rename as usize,         w!("Rena&me\tF2"));
         let _ = AppendMenuW(edit, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(edit, MF_STRING, Commands::SelectAll as usize, w!("Select &all\tCtrl+A"));
+        let _ = AppendMenuW(edit, MF_STRING, Commands::SelectAll as usize,      w!("Select &all\tCtrl+A"));
 
         // Sort key lives under its own submenu so each key is a distinct
         // menu item (easier to hit than a radio-group scattered inline).
@@ -385,9 +405,14 @@ fn build_menu() -> HMENU {
         let view = CreatePopupMenu().unwrap();
         let _ = AppendMenuW(view, MF_POPUP, sort.0 as usize, w!("&Sort by"));
         let _ = AppendMenuW(view, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(view, MF_STRING, Commands::Search as usize,       w!("&Find in folder…\tCtrl+F"));
+        let _ = AppendMenuW(view, MF_STRING, Commands::Search as usize,        w!("&Find in folder…\tCtrl+F"));
+        let _ = AppendMenuW(view, MF_STRING, Commands::FocusAddress as usize,  w!("Focus &address bar\tAlt+D"));
 
         let tools = CreatePopupMenu().unwrap();
+        let _ = AppendMenuW(tools, MF_STRING, Commands::ConnectRemote as usize, w!("&Connect to remote…"));
+        let _ = AppendMenuW(tools, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(tools, MF_STRING, Commands::DumpTree as usize,  w!("&Dump folder tree\tAlt+L"));
+        let _ = AppendMenuW(tools, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(tools, MF_STRING, Commands::Options as usize,   w!("&Options…"));
         let _ = AppendMenuW(tools, MF_STRING, Commands::Shortcuts as usize, w!("&Shortcuts and Actions…"));
 
@@ -409,9 +434,14 @@ fn build_menu() -> HMENU {
 }
 
 fn create_address_bar(parent: HWND) -> windows::core::Result<HWND> {
+    // ES_LEFT is 0x0000 — left alignment is the default. The previous
+    // 0x0004 here was actually ES_MULTILINE (mis-commented), which both
+    // wrapped the address bar visually and caused IsDialogMessageW to
+    // stop routing Enter → IDOK so the user couldn't commit a typed
+    // path. Single-line edit only: ES_AUTOHSCROLL keeps the caret
+    // visible while typing past the right edge.
     let style = WS_CHILD.0 | WS_VISIBLE.0 | WS_BORDER.0 | WS_TABSTOP.0
-        | 0x0080   // ES_AUTOHSCROLL
-        | 0x0004;  // ES_LEFT (default)
+        | 0x0080;  // ES_AUTOHSCROLL
     unsafe {
         let hinstance = GetModuleHandleW(None)?;
         let hwnd = CreateWindowExW(
@@ -611,7 +641,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let (path, entries) = *payload;
             let count = data.state.model.set_listing(path.clone(), entries);
             data.listview.set_item_count(count);
-            set_address_text(data.address, &path.to_string());
+            set_address_text(data.address, &address_display(&path));
             set_status_text(data.status, &format!("{} items", count));
             set_title_from_path(hwnd, &path);
             // Intentionally no prism announcement here — native screen
@@ -708,6 +738,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let payload: Box<(String, String)> = Box::from_raw(lp.0 as *mut _);
             let (title, body) = *payload;
             crate::viewer::show(hwnd, &title, &body);
+            LRESULT(0)
+        },
+
+        WMAPP_REMOTE_EDIT => unsafe {
+            let payload: Box<std::path::PathBuf> = Box::from_raw(lp.0 as *mut _);
+            let staged = *payload;
+            let Some(data) = window_data(hwnd) else { return LRESULT(0) };
+            prompt_remote_upload(hwnd, &data.state, staged);
             LRESULT(0)
         },
 
@@ -1008,6 +1046,52 @@ fn sign_extend_16(v: i32) -> i32 {
     if v & 0x8000 != 0 { v | !0xFFFF } else { v }
 }
 
+/// Ask the user whether to upload `staged` back to its origin remote.
+/// Called on the UI thread from the WMAPP_REMOTE_EDIT arm so the
+/// MessageBox gets a real parent hwnd and can be announced properly.
+fn prompt_remote_upload(hwnd: HWND, state: &Arc<crate::app::AppState>, staged: std::path::PathBuf) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, MessageBoxW, MB_DEFBUTTON1, MB_ICONQUESTION, MB_SETFOREGROUND, MB_YESNO, IDYES,
+    };
+    use windows::core::PCWSTR;
+
+    let Some(remote) = state.remote_cache.remote_for(&staged) else {
+        // Record gone — nothing to do.
+        return;
+    };
+    let remote_display = remote.rclone_arg().unwrap_or_else(|| remote.to_string());
+    let body = format!(
+        "The file you opened from {} was modified.\n\n\
+         Upload the changes back to the remote?",
+        remote_display,
+    );
+    let title_w: Vec<u16> = "Upload to remote?".encode_utf16().chain([0]).collect();
+    let body_w: Vec<u16> = body.encode_utf16().chain([0]).collect();
+    // If navigator already holds foreground, bring the dialog up front
+    // so the user can act on it immediately. If another app is active
+    // (e.g. the editor that triggered the save), stay passive — the
+    // prompt will surface once the user alt-tabs back. Never steal.
+    let is_foreground = unsafe { GetForegroundWindow() } == hwnd;
+    let mut flags = MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1;
+    if is_foreground { flags |= MB_SETFOREGROUND; }
+    let rc = unsafe {
+        MessageBoxW(
+            Some(hwnd),
+            PCWSTR(body_w.as_ptr()),
+            PCWSTR(title_w.as_ptr()),
+            flags,
+        ).0
+    };
+    if rc == IDYES.0 {
+        state.op_remote_upload(staged, remote);
+    } else {
+        // Re-baseline so we don't re-prompt immediately on the same save;
+        // next save bumps mtime and fires again as expected.
+        let mtime = staged.metadata().ok().and_then(|m| m.modified().ok());
+        state.remote_cache.finish_prompt(&staged, mtime);
+    }
+}
+
 fn open_focused(data: &WindowData) {
     let sel = data.state.model.selection_snapshot();
     let Some(idx) = sel.focus() else { return; };
@@ -1029,6 +1113,13 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
         x if x == Commands::Undo as u16 => data.state.op_undo(),
         x if x == Commands::OpenFocused as u16 => open_focused(data),
         x if x == Commands::Rename as u16 => begin_rename(data),
+        x if x == Commands::CopyToClipboard as u16 => data.state.op_copy_to_clipboard(),
+        x if x == Commands::AppendCopy as u16 => data.state.op_append_clipboard(false),
+        x if x == Commands::AppendCut as u16 => data.state.op_append_clipboard(true),
+        x if x == Commands::NavigateUp as u16 => data.state.navigate_up(),
+        x if x == Commands::ShowProperties as u16 => data.state.op_show_properties(),
+        x if x == Commands::DumpTree as u16 => data.state.op_dump_tree(),
+        x if x == Commands::FocusAddress as u16 => focus_address(data),
         x if x == Commands::ToggleHidden as u16 => {
             data.state.toggle_hidden();
             sync_menu_checks(hwnd, &data.state);
@@ -1069,6 +1160,16 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
         x if x == Commands::RecentOpsWindow as u16 => {
             crate::ops_window::open(hwnd, data.state.clone());
         }
+        x if x == Commands::ConnectRemote as u16 => {
+            // Drop the user into the Remotes virtual root. The scan
+            // worker calls `rclone listremotes` from there, and each
+            // entry opens as a remote root on activation — no extra
+            // dialog needed.
+            data.state.navigate(navigator_core::NavPath::remotes_root());
+        }
+        x if x == Commands::NewFolder as u16 => {
+            crate::new_folder::open(hwnd, data.state.clone());
+        }
         x if (x >= Commands::ActionBase as u16) => {
             // Shortcut action. ID = ActionBase + index into `state.actions()`.
             let idx = (x - Commands::ActionBase as u16) as usize;
@@ -1090,6 +1191,12 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
             // address → navigate. Without this the address bar handler
             // fired regardless of focus, so Enter on a listview row
             // re-navigated to whatever text was in the address bar.
+            //
+            // Edit-control change notifications (EN_CHANGE / EN_UPDATE)
+            // also arrive here as WM_COMMAND from `data.address`. We
+            // intentionally ignore them — navigation only happens on
+            // Enter so the user can type a path in peace without the
+            // listing thrashing on every keystroke.
             if cmd == 1 /* IDOK */ {
                 let focus = unsafe {
                     windows::Win32::UI::Input::KeyboardAndMouse::GetFocus()
@@ -1099,19 +1206,26 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
                 } else if focus == data.address {
                     navigate_from_address(data);
                 }
-            } else if ctrl == data.address {
-                navigate_from_address(data);
             }
+            let _ = ctrl;
         }
     }
 }
 
 fn navigate_from_address(data: &WindowData) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     let text = get_window_text(data.address);
     if text.is_empty() { return; }
     let pb = std::path::PathBuf::from(&text);
     match navigator_core::NavPath::new(pb) {
-        Ok(p) => data.state.navigate(p),
+        Ok(p) => {
+            data.state.navigate(p);
+            // Punt focus back to the listview so the user can keyboard-
+            // navigate the new listing immediately. The actual scan is
+            // async; if it errors, WMAPP_DIR_ERROR shows a dialog and
+            // focus is no worse than wherever the user landed before.
+            unsafe { let _ = SetFocus(Some(data.listview.hwnd)); }
+        }
         Err(_) => data.state.say("path is not absolute", true),
     }
 }
@@ -1128,6 +1242,19 @@ fn get_window_text(hwnd: HWND) -> String {
     }
 }
 
+/// User-facing string for the address bar. Real paths display as-is;
+/// remote paths display in rclone CLI form (`remote:sub/path`) rather
+/// than the internal `\\?\NavigatorRemote\...` encoding.
+fn address_display(path: &NavPath) -> String {
+    if path.is_remotes_root() {
+        "Remotes".to_string()
+    } else if path.is_remote() {
+        path.rclone_arg().unwrap_or_else(|| path.to_string())
+    } else {
+        path.to_string()
+    }
+}
+
 fn set_address_text(hwnd: HWND, s: &str) {
     let w: Vec<u16> = s.encode_utf16().chain([0]).collect();
     unsafe { let _ = SetWindowTextW(hwnd, PCWSTR(w.as_ptr())); }
@@ -1139,6 +1266,12 @@ fn set_address_text(hwnd: HWND, s: &str) {
 fn set_title_from_path(hwnd: HWND, path: &NavPath) {
     let label = if path.is_this_pc() {
         "This PC".to_string()
+    } else if path.is_remotes_root() {
+        "Remotes".to_string()
+    } else if path.is_remote() {
+        // Show `remote:sub/path` in the title so the user always sees
+        // where they are even when the file name is empty (remote root).
+        path.rclone_arg().unwrap_or_else(|| path.to_string())
     } else {
         let name = path.file_name();
         if name.is_empty() { path.to_string() } else { name.to_string() }
@@ -1269,6 +1402,7 @@ fn dispatch_internal(hwnd: HWND, data: &WindowData, ic: navigator_config::Intern
         IC::AppendCut    => state.op_append_clipboard(true),
         IC::Paste        => state.op_paste(),
         IC::CopyPaths    => state.op_copy_paths(),
+        IC::CopyToClipboard => state.op_copy_to_clipboard(),
         IC::Delete       => state.op_delete(),
         IC::Rename       => begin_rename(data),
         IC::SelectAll    => select_all(data),
@@ -1282,6 +1416,8 @@ fn dispatch_internal(hwnd: HWND, data: &WindowData, ic: navigator_config::Intern
         IC::Undo         => state.op_undo(),
         IC::ShowProperties => state.op_show_properties(),
         IC::DumpTree     => state.op_dump_tree(),
+        IC::NewFolder    => { crate::new_folder::open(hwnd, state.clone()); }
+        IC::FocusAddress => focus_address(data),
         other => {
             if let Some(slot) = other.hotspot_goto_slot() {
                 state.hotspot_goto(slot);
@@ -1291,6 +1427,25 @@ fn dispatch_internal(hwnd: HWND, data: &WindowData, ic: navigator_config::Intern
                 tracing::warn!("dispatch_internal: unhandled InternalCommand {:?}", other);
             }
         }
+    }
+}
+
+/// Move focus to the address bar and select all of its current text so
+/// the user can immediately overtype. Mirrors Alt+D in Explorer / browsers.
+fn focus_address(data: &WindowData) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    // EM_SETSEL = 0x00B1, wParam = start, lParam = end. (-1, -1) selects
+    // all in some contexts; (0, -1) is the documented "select everything"
+    // form for edit controls.
+    const EM_SETSEL: u32 = 0x00B1;
+    unsafe {
+        let _ = SetFocus(Some(data.address));
+        SendMessageW(
+            data.address,
+            EM_SETSEL,
+            Some(WPARAM(0)),
+            Some(LPARAM(-1)),
+        );
     }
 }
 
