@@ -396,6 +396,12 @@ impl AppState {
     /// Explorer-style cadence (so typing "a" … pause … "b" starts fresh
     /// instead of searching "ab"). Returns the row index of the match,
     /// or `None` if nothing matches.
+    ///
+    /// Same-letter fallback: when the buffer is a run of one character
+    /// (e.g. "aa", "aaa") and no entry starts with the run, cycle through
+    /// entries starting with that single letter from the current focus.
+    /// Buffer collapses to a single char on a successful fallback so
+    /// subsequent same-letter presses keep cycling.
     pub fn type_ahead_step(&self, ch: char) -> Option<usize> {
         const TIMEOUT_MS: u128 = 1000;
         let now = std::time::Instant::now();
@@ -407,7 +413,24 @@ impl AppState {
         g.1 = now;
         let prefix = g.0.clone();
         drop(g);
-        self.model.find_prefix(&prefix, None)
+        if let Some(idx) = self.model.find_prefix(&prefix, None) {
+            return Some(idx);
+        }
+        let ch_lc = ch.to_ascii_lowercase();
+        let prefix_len = prefix.chars().count();
+        let all_same = prefix.chars().all(|c| c.to_ascii_lowercase() == ch_lc);
+        if all_same && prefix_len > 1 {
+            let from = self.model.selection_snapshot().focus();
+            let single = ch.to_string();
+            if let Some(idx) = self.model.find_prefix(&single, from) {
+                let mut g = self.type_ahead.lock();
+                g.0.clear();
+                g.0.push(ch);
+                g.1 = std::time::Instant::now();
+                return Some(idx);
+            }
+        }
+        None
     }
 
     /// Navigate to the previous history entry. Silently no-ops at the start
