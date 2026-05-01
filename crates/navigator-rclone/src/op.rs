@@ -1,5 +1,6 @@
 //! rclone operations and process driver.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -10,6 +11,7 @@ use std::thread;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use parking_lot::Mutex;
 use serde::Deserialize;
+use serde_json::Value;
 
 use navigator_core::{Entry, EntryKind, FileTime, NavPath};
 
@@ -323,6 +325,150 @@ impl RcloneDriver {
             })
             .collect())
     }
+
+    /// Stat a single remote path via `rclone lsjson --stat -M --no-modtime=false <target>`.
+    /// Returns `None` if the target doesn't exist. Metadata is whatever the
+    /// backend exposes (sftp/local return mode/uid/gid; cloud backends often
+    /// return little-to-nothing — see [`RemoteStat::metadata`]).
+    pub fn stat(&self, target: &str) -> std::io::Result<Option<RemoteStat>> {
+        let out = self
+            .plain_command()
+            .arg("lsjson")
+            .arg("--stat")
+            .arg("-M")
+            .arg(target)
+            .output()?;
+        if !out.status.success() {
+            return Err(std::io::Error::other(format!(
+                "rclone lsjson --stat {} failed: {}",
+                target,
+                String::from_utf8_lossy(&out.stderr).trim(),
+            )));
+        }
+        // `--stat` emits a single JSON object; some rclone versions still
+        // wrap it in an array. Tolerate both.
+        let trimmed = out.stdout.iter().take_while(|b| **b != 0).copied().collect::<Vec<u8>>();
+        let v: Value = match serde_json::from_slice(&trimmed) {
+            Ok(v) => v,
+            Err(e) => return Err(std::io::Error::other(format!("stat parse: {}", e))),
+        };
+        let obj = match v {
+            Value::Array(arr) => arr.into_iter().next(),
+            Value::Object(_) => Some(v),
+            _ => None,
+        };
+        let Some(item) = obj else { return Ok(None); };
+        let item: LsItemFull = serde_json::from_value(item)
+            .map_err(|e| std::io::Error::other(format!("stat parse: {}", e)))?;
+        Ok(Some(RemoteStat::from_full(item)))
+    }
+
+    /// Recursive count + byte total via `rclone size --json <target>`.
+    /// `count` is the number of files (not directories); `bytes` is the
+    /// recursive total. `sizeless` is the number of objects whose size
+    /// rclone couldn't determine (some cloud backends).
+    pub fn size(&self, target: &str) -> std::io::Result<RemoteSize> {
+        let out = self
+            .plain_command()
+            .arg("size")
+            .arg("--json")
+            .arg(target)
+            .output()?;
+        if !out.status.success() {
+            return Err(std::io::Error::other(format!(
+                "rclone size {} failed: {}",
+                target,
+                String::from_utf8_lossy(&out.stderr).trim(),
+            )));
+        }
+        let s: RemoteSize = serde_json::from_slice(&out.stdout)
+            .map_err(|e| std::io::Error::other(format!("size parse: {}", e)))?;
+        Ok(s)
+    }
+}
+
+/// Subset of `rclone lsjson --stat -M` output. Metadata is only populated
+/// for backends that expose it (sftp, local, smb partial, ...). Empty
+/// metadata is the common case for cloud backends like Drive / S3.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteStat {
+    pub name: String,
+    pub size: i64,
+    pub is_dir: bool,
+    pub mod_time: Option<String>,
+    pub mime_type: Option<String>,
+    /// Raw key/value pairs as rclone reports them. Common keys: `mode`,
+    /// `uid`, `gid`, `mtime`, `atime`, `btime`, `link-target`. Values are
+    /// kept as strings to avoid lossy parsing for unknown keys.
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl RemoteStat {
+    fn from_full(i: LsItemFull) -> Self {
+        let metadata = i
+            .metadata
+            .map(|m| {
+                m.into_iter()
+                    .map(|(k, v)| {
+                        let v = match v {
+                            Value::String(s) => s,
+                            other => other.to_string(),
+                        };
+                        (k, v)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            name: i.name,
+            size: i.size,
+            is_dir: i.is_dir,
+            mod_time: i.mod_time,
+            mime_type: i.mime_type,
+            metadata,
+        }
+    }
+
+    /// Best-effort UNIX mode lookup. rclone's `mode` is a decimal string
+    /// of the full `st_mode` (file-type bits + permission bits). Returns
+    /// the decoded `u32` or `None` if the metadata is missing / unparsable.
+    pub fn unix_mode(&self) -> Option<u32> {
+        let raw = self.metadata.get("mode")?;
+        // rclone emits decimal; some backends emit octal with a leading 0.
+        if let Some(stripped) = raw.strip_prefix('0').filter(|s| !s.is_empty()) {
+            if let Ok(v) = u32::from_str_radix(stripped, 8) {
+                return Some(v);
+            }
+        }
+        raw.parse::<u32>().ok()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RemoteSize {
+    #[serde(default)]
+    pub count: i64,
+    #[serde(default)]
+    pub bytes: i64,
+    #[serde(default)]
+    pub sizeless: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(non_snake_case)]
+struct LsItemFull {
+    #[serde(rename = "Name", default)]
+    name: String,
+    #[serde(rename = "Size", default)]
+    size: i64,
+    #[serde(rename = "IsDir", default)]
+    is_dir: bool,
+    #[serde(rename = "ModTime", default)]
+    mod_time: Option<String>,
+    #[serde(rename = "MimeType", default)]
+    mime_type: Option<String>,
+    #[serde(rename = "Metadata", default)]
+    metadata: Option<serde_json::Map<String, Value>>,
 }
 
 #[derive(Debug, Deserialize)]

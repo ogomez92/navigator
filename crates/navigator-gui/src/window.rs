@@ -341,6 +341,7 @@ pub enum Commands {
     ConnectRemote = 143,
     NewFolder = 144,
     DumpTree = 145,
+    Extract = 146,
     // Help menu
     About = 160,
     // Shortcut/Action dynamic range
@@ -412,6 +413,7 @@ fn build_menu() -> HMENU {
         let _ = AppendMenuW(tools, MF_STRING, Commands::ConnectRemote as usize, w!("&Connect to remote…"));
         let _ = AppendMenuW(tools, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(tools, MF_STRING, Commands::DumpTree as usize,  w!("&Dump folder tree\tAlt+L"));
+        let _ = AppendMenuW(tools, MF_STRING, Commands::Extract as usize,   w!("&Extract archive(s)\tCtrl+E"));
         let _ = AppendMenuW(tools, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(tools, MF_STRING, Commands::Options as usize,   w!("&Options…"));
         let _ = AppendMenuW(tools, MF_STRING, Commands::Shortcuts as usize, w!("&Shortcuts and Actions…"));
@@ -883,6 +885,36 @@ unsafe fn handle_listview_notify(
             LRESULT(0)
         }
         LVN_BEGINLABELEDITW => {
+            // Default ListView label-edit selects the entire filename, so
+            // typing immediately wipes the extension. For files, narrow the
+            // initial selection to the stem (everything before the final
+            // dot) — Explorer parity, and what users expect when F2-renaming
+            // `report.txt` to keep `.txt`. Folders keep the full selection.
+            let disp = unsafe { &*(lp.0 as *const NMLVDISPINFOW) };
+            let idx = disp.item.iItem as usize;
+            if let Some(entry) = data.state.model.get(idx) {
+                if let Some(end) = rename_stem_select_end(&entry.name, entry.is_dir()) {
+                    const LVM_GETEDITCONTROL: u32 = 0x1000 + 24;
+                    const EM_SETSEL: u32 = 0x00B1;
+                    unsafe {
+                        let edit = SendMessageW(
+                            data.listview.hwnd,
+                            LVM_GETEDITCONTROL,
+                            Some(WPARAM(0)),
+                            Some(LPARAM(0)),
+                        );
+                        let edit_hwnd = HWND(edit.0 as *mut _);
+                        if !edit_hwnd.0.is_null() {
+                            SendMessageW(
+                                edit_hwnd,
+                                EM_SETSEL,
+                                Some(WPARAM(0)),
+                                Some(LPARAM(end as isize)),
+                            );
+                        }
+                    }
+                }
+            }
             // Return 0 to allow the edit; anything non-zero cancels.
             LRESULT(0)
         }
@@ -896,6 +928,18 @@ unsafe fn handle_listview_notify(
         }
         _ => unsafe { DefWindowProcW(hwnd, WM_NOTIFY, WPARAM(0), lp) },
     }
+}
+
+/// When F2 begins inline-rename, decide where the selection should end so
+/// the file extension is left out. Returns the UTF-16 code-unit count of
+/// the stem (the prefix to keep selected) or `None` to fall back to
+/// "select all" — used for directories, names with no extension, and
+/// dotfiles like `.gitignore` where the whole name is the meaningful part.
+fn rename_stem_select_end(name: &str, is_dir: bool) -> Option<i32> {
+    if is_dir { return None; }
+    let pos = name.rfind('.')?;
+    if pos == 0 { return None; }
+    Some(name[..pos].encode_utf16().count() as i32)
 }
 
 fn on_end_label_edit(state: &Arc<AppState>, disp: &NMLVDISPINFOW) {
@@ -1119,6 +1163,7 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
         x if x == Commands::NavigateUp as u16 => data.state.navigate_up(),
         x if x == Commands::ShowProperties as u16 => data.state.op_show_properties(),
         x if x == Commands::DumpTree as u16 => data.state.op_dump_tree(),
+        x if x == Commands::Extract as u16 => data.state.op_extract(),
         x if x == Commands::FocusAddress as u16 => focus_address(data),
         x if x == Commands::ToggleHidden as u16 => {
             data.state.toggle_hidden();
@@ -1416,6 +1461,7 @@ fn dispatch_internal(hwnd: HWND, data: &WindowData, ic: navigator_config::Intern
         IC::Undo         => state.op_undo(),
         IC::ShowProperties => state.op_show_properties(),
         IC::DumpTree     => state.op_dump_tree(),
+        IC::Extract      => state.op_extract(),
         IC::NewFolder    => { crate::new_folder::open(hwnd, state.clone()); }
         IC::FocusAddress => focus_address(data),
         other => {
@@ -1555,5 +1601,48 @@ fn select_all(data: &WindowData) {
             Some(WPARAM(usize::MAX)),
             Some(LPARAM(&raw const item as isize)),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rename_stem_select_end;
+
+    #[test]
+    fn file_with_extension_selects_stem() {
+        assert_eq!(rename_stem_select_end("report.txt", false), Some(6));
+    }
+
+    #[test]
+    fn file_with_multi_extension_selects_through_last_dot() {
+        // Explorer parity: `archive.tar.gz` keeps `.gz`, selects `archive.tar`.
+        assert_eq!(rename_stem_select_end("archive.tar.gz", false), Some(11));
+    }
+
+    #[test]
+    fn file_without_extension_selects_all() {
+        assert_eq!(rename_stem_select_end("Makefile", false), None);
+    }
+
+    #[test]
+    fn dotfile_selects_all() {
+        assert_eq!(rename_stem_select_end(".gitignore", false), None);
+    }
+
+    #[test]
+    fn directory_selects_all_even_with_dot() {
+        assert_eq!(rename_stem_select_end("repo.git", true), None);
+    }
+
+    #[test]
+    fn non_ascii_uses_utf16_units() {
+        // "α.txt" — α is one UTF-16 unit; stem length should be 1.
+        assert_eq!(rename_stem_select_end("α.txt", false), Some(1));
+    }
+
+    #[test]
+    fn non_bmp_char_counts_as_two_utf16_units() {
+        // 🦀 (U+1F980) is a surrogate pair — 2 UTF-16 units.
+        assert_eq!(rename_stem_select_end("🦀.png", false), Some(2));
     }
 }

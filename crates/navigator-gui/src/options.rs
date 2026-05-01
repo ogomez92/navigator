@@ -49,6 +49,8 @@ const ID_CHECK_SYSTEM: u16     = 201;
 const ID_EDIT_INTERVAL: u16    = 300;
 const ID_CHECK_PROG: u16       = 700;
 const ID_EDIT_TRANSFERS: u16   = 701;
+const ID_CHECK_EXTRACT_DELETE: u16 = 800;
+const ID_CHECK_EXTRACT_FOLDER: u16 = 801;
 const ID_LIST_PLUGINS: u16     = 400;
 const ID_BTN_RELOAD: u16       = 401;
 const ID_LIST_HOTSPOTS: u16    = 500;
@@ -71,6 +73,7 @@ pub fn open(parent: HWND, state: Arc<AppState>) -> windows::core::Result<()> {
     let title_columns:  Vec<u16> = "Columns\0".encode_utf16().collect();
     let title_speech:   Vec<u16> = "Speech\0".encode_utf16().collect();
     let title_rclone:   Vec<u16> = "Rclone\0".encode_utf16().collect();
+    let title_extract:  Vec<u16> = "Extraction\0".encode_utf16().collect();
     let title_plugins:  Vec<u16> = "Plugins\0".encode_utf16().collect();
     let title_hotspots: Vec<u16> = "Hotspots\0".encode_utf16().collect();
 
@@ -88,6 +91,7 @@ pub fn open(parent: HWND, state: Arc<AppState>) -> windows::core::Result<()> {
         make_page(&page_template, &title_columns,  hinstance, Some(page_columns_proc),  make_lparam()),
         make_page(&page_template, &title_speech,   hinstance, Some(page_speech_proc),   make_lparam()),
         make_page(&page_template, &title_rclone,   hinstance, Some(page_rclone_proc),   make_lparam()),
+        make_page(&page_template, &title_extract,  hinstance, Some(page_extract_proc),  make_lparam()),
         make_page(&page_template, &title_plugins,  hinstance, Some(page_plugins_proc),  make_lparam()),
         make_page(&page_template, &title_hotspots, hinstance, Some(page_hotspots_proc), make_lparam()),
     ];
@@ -476,6 +480,71 @@ unsafe extern "system" fn page_rclone_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp
             let raw = GetWindowLongPtrW(hwnd, DWLP_USER);
             if raw != 0 {
                 let _ = Box::from_raw(raw as *mut RcloneData);
+                SetWindowLongPtrW(hwnd, DWLP_USER, 0);
+            }
+            0
+        },
+        _ => 0,
+    }
+}
+
+// --- Extraction page ------------------------------------------------------
+
+struct ExtractData {
+    state: Arc<AppState>,
+    check_delete: HWND,
+    check_folder: HWND,
+}
+
+unsafe extern "system" fn page_extract_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => unsafe {
+            let state = take_state_from_init(lp);
+
+            let lbl = create_label(hwnd,
+                "Ctrl+E extracts the selected archives via 7z on PATH.",
+                12, 12, 440);
+            let check_delete = create_checkbox(hwnd,
+                "&Delete archive after successful extraction",
+                12, 40, ID_CHECK_EXTRACT_DELETE);
+            let check_folder = create_checkbox(hwnd,
+                "Wrap extracted files in a &folder when the archive has\r\nmore than one top-level entry",
+                12, 70, ID_CHECK_EXTRACT_FOLDER);
+            apply_font_to(lbl);
+            apply_font_to(check_delete);
+            apply_font_to(check_folder);
+
+            let e = state.config.read().extraction;
+            set_check(check_delete, e.delete_when_extracted);
+            set_check(check_folder, e.create_folder);
+
+            let data = Box::new(ExtractData { state, check_delete, check_folder });
+            SetWindowLongPtrW(hwnd, DWLP_USER, Box::into_raw(data) as isize);
+            1
+        },
+        WM_NOTIFY => unsafe {
+            let hdr = &*(lp.0 as *const NMHDR);
+            if hdr.code == PSN_APPLY {
+                let raw = GetWindowLongPtrW(hwnd, DWLP_USER);
+                if raw != 0 {
+                    let d = &mut *(raw as *mut ExtractData);
+                    let delete = get_check(d.check_delete);
+                    let folder = get_check(d.check_folder);
+                    d.state.config.with_mut(|c| {
+                        c.extraction.delete_when_extracted = delete;
+                        c.extraction.create_folder = folder;
+                    });
+                    let _ = d.state.config.save();
+                }
+                set_apply_ok(hwnd);
+                return 1;
+            }
+            0
+        },
+        0x0002 => unsafe {
+            let raw = GetWindowLongPtrW(hwnd, DWLP_USER);
+            if raw != 0 {
+                let _ = Box::from_raw(raw as *mut ExtractData);
                 SetWindowLongPtrW(hwnd, DWLP_USER, 0);
             }
             0

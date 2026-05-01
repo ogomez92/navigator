@@ -231,3 +231,44 @@ pub fn type_key(e: &Entry) -> String {
         .unwrap_or("")
         .to_ascii_lowercase()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use navigator_core::{EntryKind, FileTime};
+
+    fn file(name: &str) -> Entry {
+        Entry {
+            name: name.into(),
+            kind: EntryKind::File,
+            size: 0,
+            modified: FileTime::default(),
+            created: FileTime::default(),
+            attrs: 0,
+            hidden: false,
+            system: false,
+        }
+    }
+
+    /// `append_entries` is the path the Extract worker relies on (via the
+    /// directory watcher) to surface freshly-extracted files without a
+    /// re-sort. The new entries must land at the bottom; the previous
+    /// listing's order must not be perturbed.
+    #[test]
+    fn append_entries_preserves_existing_order_and_appends_at_end() {
+        let m = Model::new();
+        let cwd = NavPath::new(std::path::PathBuf::from(if cfg!(windows) { r"C:\tmp\nav" } else { "/tmp/nav" })).unwrap();
+        m.set_listing(cwd, vec![file("alpha"), file("bravo"), file("charlie")]);
+        // Existing order is the sorted view.
+        let before: Vec<String> = (0..m.len()).map(|i| m.get(i).unwrap().name).collect();
+        assert_eq!(before, vec!["alpha", "bravo", "charlie"]);
+
+        // Simulate two new files showing up after the user extracted an
+        // archive: `aaaa` (would sort first) and `zeta`. With append-mode
+        // the watcher hands these straight to `append_entries`, and they
+        // should both land at the bottom regardless of their sort order.
+        m.append_entries(vec![file("aaaa"), file("zeta")]);
+        let after: Vec<String> = (0..m.len()).map(|i| m.get(i).unwrap().name).collect();
+        assert_eq!(after, vec!["alpha", "bravo", "charlie", "aaaa", "zeta"]);
+    }
+}

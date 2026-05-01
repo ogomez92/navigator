@@ -16,4 +16,6 @@ pub mod log;
 pub mod op;
 
 pub use log::{LogEvent, LogLevel, Stats};
-pub use op::{OpHandle, Operation, OverwritePolicy, PreflightReport, RcloneDriver};
+pub use op::{
+    OpHandle, Operation, OverwritePolicy, PreflightReport, RcloneDriver, RemoteSize, RemoteStat,
+};

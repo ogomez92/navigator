@@ -35,6 +35,7 @@ pub struct Config {
     pub general: General,
     pub plugins: Plugins,
     pub rclone: Rclone,
+    pub extraction: Extraction,
     pub recent_paths: Vec<String>,
     #[serde(default = "shortcuts::default_actions")]
     pub shortcuts: Vec<ShortcutAction>,
@@ -58,6 +59,7 @@ impl Default for Config {
             general: General::default(),
             plugins: Plugins::default(),
             rclone: Rclone::default(),
+            extraction: Extraction::default(),
             recent_paths: Vec::new(),
             shortcuts: shortcuts::default_actions(),
             hotspots: default_hotspots(),
@@ -137,6 +139,27 @@ impl Rclone {
     /// hand-edited config can't wedge the pipeline.
     pub fn transfers_clamped(&self) -> u32 {
         self.transfers.clamp(1, 64)
+    }
+}
+
+/// Knobs for the Extract action (Ctrl+E by default). Drives 7z.exe via
+/// the `extract` module in `navigator-gui`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Extraction {
+    /// Delete each archive after a successful extraction. Failures never
+    /// trigger a delete.
+    pub delete_when_extracted: bool,
+    /// Wrap the extracted contents in a folder named after the archive
+    /// when the archive has more than one top-level entry. Archives that
+    /// already contain a single top-level folder are extracted as-is to
+    /// avoid the `name/name/...` double-folder pattern.
+    pub create_folder: bool,
+}
+
+impl Default for Extraction {
+    fn default() -> Self {
+        Self { delete_when_extracted: true, create_folder: true }
     }
 }
 

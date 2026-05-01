@@ -10,6 +10,7 @@ use std::path::Path;
 
 use navigator_core::{Entry, EntryKind, NavPath};
 use navigator_fs::read_dir;
+use navigator_rclone::{RemoteSize, RemoteStat};
 
 /// Recursive tally across every file below `root`. Unreadable sub-trees
 /// are counted in `errors` and skipped; we never bail on a partial scan
@@ -169,6 +170,131 @@ pub fn format_properties(entry: &Entry, path: &NavPath, stats: Option<&FolderSta
         }
     }
     s
+}
+
+/// Build the properties text for a remote `entry` at `path`. `stat` is the
+/// `rclone lsjson --stat -M` result for the path itself; `size` is
+/// `rclone size --json` for directories. Either may be `None` when the
+/// rclone call failed — we still emit the header from the cached `Entry`.
+pub fn format_remote_properties(
+    entry: &Entry,
+    path: &NavPath,
+    stat: Option<&RemoteStat>,
+    size: Option<&RemoteSize>,
+) -> String {
+    let mut s = String::new();
+    let kind = if entry.is_dir() { "Directory (remote)" } else { "File (remote)" };
+    s.push_str(&format!("Name:      {}\n", entry.name));
+    s.push_str(&format!("Path:      {}\n", path));
+    s.push_str(&format!("Type:      {}\n", kind));
+    if !entry.is_dir() {
+        let ext = ext_of(&entry.name);
+        if !ext.is_empty() {
+            s.push_str(&format!("Extension: .{}\n", ext));
+        }
+    }
+    let header_size: u64 = if entry.is_dir() {
+        size.map(|sz| sz.bytes.max(0) as u64).unwrap_or(0)
+    } else {
+        stat.map(|st| st.size.max(0) as u64).unwrap_or(entry.size)
+    };
+    s.push_str(&format!("Size:      {}\n", format_size_with_bytes(header_size)));
+    let mod_str = stat
+        .and_then(|st| st.mod_time.as_deref())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| fmt_time_or_dash(entry.modified.0));
+    s.push_str(&format!("Modified:  {}\n", mod_str));
+    if let Some(st) = stat {
+        if let Some(mime) = st.mime_type.as_deref().filter(|m| !m.is_empty()) {
+            s.push_str(&format!("MIME:      {}\n", mime));
+        }
+    }
+
+    if let Some(st) = stat {
+        let mode = st.unix_mode();
+        if mode.is_some() || !st.metadata.is_empty() {
+            s.push('\n');
+            s.push_str("--- Unix metadata ---\n");
+            if let Some(m) = mode {
+                s.push_str(&format!(
+                    "Mode:      {} ({})\n",
+                    format_unix_mode(m),
+                    format!("0o{:o}", m & 0o7777)
+                ));
+            }
+            for key in ["uid", "gid", "mtime", "atime", "btime", "link-target", "owner", "group"] {
+                if let Some(v) = st.metadata.get(key) {
+                    s.push_str(&format!("{:<10} {}\n", format!("{}:", key), v));
+                }
+            }
+            // Dump remaining metadata keys we didn't render above so nothing
+            // useful is hidden — sorted for stable output.
+            let known: &[&str] = &[
+                "mode", "uid", "gid", "mtime", "atime", "btime", "link-target", "owner", "group",
+            ];
+            let mut extras: Vec<(&String, &String)> = st
+                .metadata
+                .iter()
+                .filter(|(k, _)| !known.contains(&k.as_str()))
+                .collect();
+            extras.sort_by(|a, b| a.0.cmp(b.0));
+            for (k, v) in extras {
+                s.push_str(&format!("{:<10} {}\n", format!("{}:", k), v));
+            }
+        }
+    }
+
+    if let Some(sz) = size {
+        s.push('\n');
+        s.push_str("--- Folder contents (recursive) ---\n");
+        s.push_str(&format!("Files:     {}\n", sz.count.max(0)));
+        s.push_str(&format!("Total:     {}\n", format_size_with_bytes(sz.bytes.max(0) as u64)));
+        if sz.sizeless > 0 {
+            s.push_str(&format!("Sizeless objects: {}\n", sz.sizeless));
+        }
+    }
+
+    if stat.is_none() {
+        s.push('\n');
+        s.push_str("(rclone stat failed — header values reflect the cached listing only)\n");
+    }
+    s
+}
+
+/// Render a UNIX `st_mode` value the way `ls -l` does, e.g. `-rwxr-xr-x`.
+/// Honors the file-type bits if present (file/dir/symlink/etc) and the
+/// suid/sgid/sticky bits.
+pub fn format_unix_mode(mode: u32) -> String {
+    let kind = match mode & 0o170000 {
+        0o040000 => 'd',
+        0o120000 => 'l',
+        0o060000 => 'b',
+        0o020000 => 'c',
+        0o010000 => 'p',
+        0o140000 => 's',
+        0o100000 => '-',
+        _ => '?',
+    };
+    let perm = |bits: u32, suid: bool, sticky: bool, exec_letter: char| {
+        let r = if bits & 0o4 != 0 { 'r' } else { '-' };
+        let w = if bits & 0o2 != 0 { 'w' } else { '-' };
+        let x = bits & 0o1 != 0;
+        let last = match (suid, sticky, x) {
+            (true, _, true)   => exec_letter,
+            (true, _, false)  => exec_letter.to_ascii_uppercase(),
+            (_, true, true)   => 't',
+            (_, true, false)  => 'T',
+            (_, _, true)      => 'x',
+            (_, _, false)     => '-',
+        };
+        format!("{r}{w}{last}")
+    };
+    let mut out = String::with_capacity(10);
+    out.push(kind);
+    out.push_str(&perm((mode >> 6) & 0o7, mode & 0o4000 != 0, false, 's'));
+    out.push_str(&perm((mode >> 3) & 0o7, mode & 0o2000 != 0, false, 's'));
+    out.push_str(&perm(mode & 0o7, false, mode & 0o1000 != 0, 'x'));
+    out
 }
 
 /// Recursive enumeration → TOML. Dirs and files come out as two separate

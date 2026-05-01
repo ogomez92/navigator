@@ -15,6 +15,7 @@ pub mod clipboard;
 pub mod context_menu;
 pub mod dialog;
 pub mod elevated;
+pub mod extract;
 pub mod dialogs;
 pub mod history;
 pub mod listview;

@@ -28,6 +28,7 @@ Runtime env: `NAVIGATOR_LOG` sets the `tracing` `EnvFilter` (default `info`).
   - Expects `<base>/dynamic/<profile>/lib/prism.lib` + `<base>/dynamic/<profile>/bin/prism.dll`. Build copies `prism.dll` next to the output binary. `--features static` switches to `static/<profile>/lib`.
   - `<profile>` is `debug` for dev builds, `release` otherwise.
 - **rclone** must be on `PATH` at runtime — all file operations shell out to it.
+- **7z** must be on `PATH` for the Extract action (Ctrl+E). Missing binary surfaces as a prism announcement, not a dialog. See `[extraction]` config + `extract.rs`.
 
 ## Architecture
 
@@ -76,6 +77,20 @@ The Win32 input pipeline has two stages in the message pump and several interact
 - **Default shortcuts are populated on first run only.** `default_actions()` seeds Copy / Cut / Paste / F2 / F5 / Hotspots etc. when no `config.toml` exists. There is intentionally **no migration chain** — this is a single-user tool, and if a stale config ever drifts from current defaults we delete `config.toml` and regenerate. Don't add a migration helper; just ship a breaking default change and expect the user to re-run.
 - **Listview needs `LVS_EDITLABELS` for F2.** `LVM_EDITLABELW` is a silent no-op without that style. `LVN_BEGINLABELEDITW` / `LVN_ENDLABELEDITW` route the result to `op_rename`.
 - **We drive type-ahead, not `SysListView32`.** The control's private prefix buffer is not clearable externally — a letter typed after navigating into a new folder would resume the old buffer. `AppState.type_ahead: Mutex<(String, Instant)>` is our own buffer; the listview subclass consumes `WM_CHAR` (returns `LRESULT(0)`) so the control never accumulates, and `AppState::reset_type_ahead()` runs at the top of every `navigate`. `type_ahead_step(ch)` appends + searches via `model.find_prefix`, auto-resetting after a >1s gap for Explorer-cadence.
+
+### Archive extraction (Ctrl+E)
+
+`extract.rs` shells out to `7z.exe` on `PATH`. Pure helpers (`is_extractable`, `parse_top_level_count`, `archive_stem`, `decide_dest`, `unique_dest`) are kept separate from `run_extract` so the wrap-folder decision and extension classification are unit-testable without spawning a process. `EXTRACTABLE_EXTENSIONS` is the source of truth — extend it, don't pre-filter elsewhere.
+
+`AppState::op_extract` filters the selection to extractable + local (remote rclone paths are skipped — 7z can't read `\\?\NavigatorRemote\...`), then validates `find_7z()` before spawning the worker. Two error paths announce via prism: "no extractable archives selected" and "7z not found on PATH".
+
+Wrap-folder rule (`decide_dest`): if `[extraction] create_folder = false` OR the archive already has ≤1 top-level entry → extract straight into the parent (no `name/name/...` double); otherwise wrap in `parent/<archive_stem>` deduped by `unique_dest`. `archive_stem` strips layered extensions so `foo.tar.gz` → `foo`.
+
+**Both 7z calls (`l` and `x`) MUST set `CREATE_NO_WINDOW`** via the local `no_console` helper. Without it 7z pops a console that steals focus from the listview every archive — same flag the rclone driver uses.
+
+The Extract worker deliberately does NOT call `state.refresh()`. The notify watcher already folds new files into the listing via `Model::append_entries`, which keeps existing sort order and lands fresh entries at the bottom — provided `general.new_items_at_bottom` is true (the default; guarded by `new_items_at_bottom_default_is_on`). Don't add a refresh; it would re-sort and lose the user's anchor.
+
+`opts.delete_when_extracted` only deletes on `7z x` exit-success. Failures keep the archive.
 
 ### File operations invariant
 
@@ -129,6 +144,7 @@ Pure computation (folder stats, extension histogram, TOML tree dump) lives in `p
 - `config.toml`, `plugins/`, `clipboard.json`, `clipboard_history.json`, and `.trash/` all live next to the exe (or in the case of `.trash`, at each volume root). `navigator_config::exe_dir()` is the source of truth; don't hardcode.
 - Sort mode, filters (show hidden/system), shortcut bindings, hotspot slots, and per-column visibility (`general.columns`) all persist here.
 - **`[rclone]` section** holds `progress_window` (moved out of `[general]`) and `transfers` (default 8, clamped 1..=64 via `Rclone::transfers_clamped`). Options → Rclone tab writes both. `transfers` feeds rclone's `--transfers N`.
+- **`[extraction]` section** holds `delete_when_extracted` (default true) and `create_folder` (default true). Options → Extraction tab writes both. Read by `AppState::op_extract` per invocation so a config save applies to the next extract without a restart.
 - `Columns` defaults to all-on (Size/Type/Modified shown) so pre-existing configs keep the historical four-column view after upgrade. `SortMode::Type` was added alongside — sort works regardless of column visibility, so `type_key()` in `model.rs` is the source of truth and not the Type column label.
 - **TOML can't hold `None` in arrays.** `hotspots` is stored as `Vec<String>` (empty string = unset), not `Vec<Option<String>>` — the latter serializes `None` and fails with `UnsupportedNone`. Hotspot slots must be exactly `HOTSPOT_COUNT` long; the code trusts the file to have the right length (no runtime padding), so a hand-edited short vec can panic — delete `config.toml` if it does.
 
@@ -153,3 +169,5 @@ Jump reuses `AppState.pending_focus` + the existing `refocus_after_up` post-list
 See `README.md` for the user-facing table. User-bound actions live under `shortcuts` in `config.toml`; `navigator_config::shortcuts::default_actions()` returns the seeded defaults (Copy/Cut/Paste/Append/CopyPaths/SelectAll/Rename/Refresh/ToggleHidden/ToggleSystem/Search/NavigateUp/Hist Back+Forward/Undo + Hotspot1..10 + HotspotSet1..10 + ShowProperties[Alt+Enter] + DumpTree[Alt+L]). The accel table is rebuilt on startup and on shortcut-editor save via `window::rebuild_accels`.
 
 Adding a new `InternalCommand` variant touches three places: enum in `shortcuts.rs`, seed line in `default_actions()`, and a `dispatch_internal` arm in `window.rs`. Accel matches modifiers strictly, so `Alt+Enter` does **not** collide with the listview's plain-Enter handler (those are distinct ACCEL entries only when modifiers match).
+
+A user's existing `config.toml` does NOT auto-pick up new default shortcuts — `default_actions()` only seeds on first run. Ship the breaking default change, expect the user to either re-run with no config or hand-edit. There is intentionally no migration chain.

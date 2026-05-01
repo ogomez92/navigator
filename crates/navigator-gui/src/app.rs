@@ -1234,6 +1234,46 @@ impl AppState {
         }
     }
 
+    /// Extract every selected archive 7-Zip can open, using `7z.exe` on
+    /// `PATH`. The set is filtered to known-extractable extensions
+    /// before validating the binary so the user gets the more useful
+    /// "nothing extractable selected" error instead of "7z missing".
+    /// Behaviour (delete after, wrapper folder) is read from the
+    /// `[extraction]` config section. Runs on a worker; the file
+    /// watcher folds the new entries into the listing automatically so
+    /// the user doesn't need to refresh.
+    pub fn op_extract(&self) {
+        let selection = self.model.selected_paths();
+        if selection.is_empty() {
+            self.say("nothing selected", false);
+            return;
+        }
+        let local: Vec<navigator_core::NavPath> = selection
+            .into_iter()
+            .filter(|p| !p.is_remote())
+            .collect();
+        let extractable = crate::extract::filter_extractable(&local);
+        if extractable.is_empty() {
+            self.say("no extractable archives selected", true);
+            return;
+        }
+        let seven_zip = match crate::extract::find_7z() {
+            Some(p) => p,
+            None => {
+                self.say("7z not found on PATH; install 7-Zip to extract archives", true);
+                return;
+            }
+        };
+        let opts = self.config.read().extraction;
+        let speech = self.speech.handle();
+        let total = extractable.len();
+        self.say(&format!("extracting {} archive(s)", total), false);
+        std::thread::Builder::new()
+            .name("navigator-extract".into())
+            .spawn(move || crate::extract::run_extract(extractable, opts, seven_zip, speech))
+            .expect("spawn extract worker");
+    }
+
     /// Show the read-only properties viewer for the focused entry. For
     /// directories the recursive size / counts / extension histogram
     /// come from a worker thread so a giant tree doesn't freeze the UI;
@@ -1254,6 +1294,27 @@ impl AppState {
         if is_dir {
             self.say(&format!("scanning {}…", entry.name), false);
         }
+
+        if path.is_remote() {
+            let rclone = self.rclone.clone();
+            std::thread::Builder::new()
+                .name("navigator-properties-remote".into())
+                .spawn(move || {
+                    let arg = path.rclone_arg().unwrap_or_default();
+                    let stat = rclone.stat(&arg).ok().flatten();
+                    let size = if is_dir { rclone.size(&arg).ok() } else { None };
+                    let body = crate::props::format_remote_properties(
+                        &entry,
+                        &path,
+                        stat.as_ref(),
+                        size.as_ref(),
+                    );
+                    post_viewer(hwnd, title, body);
+                })
+                .expect("spawn remote properties worker");
+            return;
+        }
+
         std::thread::Builder::new()
             .name("navigator-properties".into())
             .spawn(move || {
@@ -1484,13 +1545,17 @@ fn shell_open(path: &std::path::Path) {
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     let path_w: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let dir_w: Option<Vec<u16>> = path
+        .parent()
+        .map(|p| p.as_os_str().encode_wide().chain([0]).collect());
+    let dir_ptr = dir_w.as_ref().map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr()));
     unsafe {
         let _ = ShellExecuteW(
             None,
             w!("open"),
             PCWSTR(path_w.as_ptr()),
             PCWSTR::null(),
-            PCWSTR::null(),
+            dir_ptr,
             SW_SHOWNORMAL,
         );
     }

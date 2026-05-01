@@ -201,6 +201,50 @@ fn columns_section_is_optional_in_toml() {
 }
 
 #[test]
+fn extraction_defaults_match_spec() {
+    // Default behaviour: delete the archive after a clean extraction,
+    // and wrap loose-content archives in a folder. Flip these here only
+    // alongside the corresponding behavioural change in `extract`.
+    let c = Config::default();
+    assert!(c.extraction.delete_when_extracted);
+    assert!(c.extraction.create_folder);
+}
+
+#[test]
+fn extraction_section_is_optional_in_toml() {
+    // Pre-existing configs never saw `[extraction]` — they must load
+    // with the spec defaults rather than crashing.
+    let text = r#"
+        [general]
+        show_hidden = false
+    "#;
+    let c: Config = toml::from_str(text).expect("parse");
+    assert!(c.extraction.delete_when_extracted);
+    assert!(c.extraction.create_folder);
+}
+
+#[test]
+fn extraction_section_roundtrips_through_toml() {
+    let mut c = Config::default();
+    c.extraction.delete_when_extracted = false;
+    c.extraction.create_folder = false;
+    let text = toml::to_string_pretty(&c).expect("serialize");
+    let back: Config = toml::from_str(&text).expect("reparse");
+    assert!(!back.extraction.delete_when_extracted);
+    assert!(!back.extraction.create_folder);
+}
+
+#[test]
+fn new_items_at_bottom_default_is_on() {
+    // Extract-without-refresh relies on the watcher folding new files
+    // into the listing via `Model::append_entries`, which only happens
+    // when `general.new_items_at_bottom` is true. Flipping the default
+    // would silently break that flow — guard it here.
+    let c = Config::default();
+    assert!(c.general.new_items_at_bottom);
+}
+
+#[test]
 fn sort_mode_type_roundtrips_through_toml() {
     // The Type variant was added after Name/Size/Modified/Created — guard
     // against accidentally dropping it from the enum.

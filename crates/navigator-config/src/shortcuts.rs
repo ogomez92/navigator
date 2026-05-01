@@ -110,6 +110,10 @@ pub enum InternalCommand {
     /// files. Distinct from the app's own file-backed clipboard, which
     /// only navigator instances see. Default chord: Alt+C.
     CopyToClipboard,
+    /// Extract the selected archive(s) using `7z` on PATH. Default chord:
+    /// Ctrl+E. Behaviour (delete-after, wrapper folder) is governed by
+    /// the `[extraction]` config section.
+    Extract,
 }
 
 impl InternalCommand {
@@ -237,6 +241,7 @@ pub fn default_actions() -> Vec<ShortcutAction> {
         internal("Focus address bar", FocusAddress, chord(false, false, true,  "D")),
         // Real Windows clipboard (CF_HDROP) — paste into Explorer etc.
         internal("Copy to OS clipboard", CopyToClipboard, chord(false, false, true, "C")),
+        internal("Extract archive",      Extract,         chord(true,  false, false, "E")),
     ]
 }
 
@@ -267,6 +272,13 @@ mod tests {
         let c = default_chord(InternalCommand::DumpTree).expect("seeded");
         assert!(c.alt && !c.ctrl && !c.shift);
         assert!(c.key.eq_ignore_ascii_case("l"), "unexpected key: {:?}", c.key);
+    }
+
+    #[test]
+    fn extract_default_is_ctrl_e() {
+        let c = default_chord(InternalCommand::Extract).expect("seeded");
+        assert!(c.ctrl && !c.shift && !c.alt);
+        assert!(c.key.eq_ignore_ascii_case("e"), "unexpected key: {:?}", c.key);
     }
 
     #[test]
