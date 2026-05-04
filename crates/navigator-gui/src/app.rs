@@ -1000,6 +1000,104 @@ impl AppState {
             .expect("spawn delete batch");
     }
 
+    /// Permanently delete every `<drive>\.trash` directory on every
+    /// connected local drive. Walks each candidate trash to compute the
+    /// space it occupies, surfaces a per-drive breakdown in a Yes/No
+    /// confirmation, and on Yes spawns a worker that runs
+    /// `remove_dir_all` per drive. After completion any in-memory
+    /// `UndoAction::Delete` entries are dropped because their staged
+    /// paths no longer exist. This is the one path that bypasses the
+    /// usual rclone-driven mutation flow — trash dirs are an internal
+    /// implementation detail, not user-visible files, so a direct
+    /// `std::fs` call is fine and avoids spinning rclone up just to
+    /// purge a local folder.
+    pub fn op_empty_trash(&self) {
+        let drives = navigator_fs::list_drives();
+        let mut entries: Vec<(PathBuf, String, u64)> = Vec::new();
+        let mut total: u64 = 0;
+        for d in drives {
+            let Some(root_str) = navigator_fs::drive_path_from_display(&d.name) else { continue; };
+            let trash = PathBuf::from(&root_str).join(".trash");
+            if !trash.exists() { continue; }
+            let nav = match NavPath::new(&trash) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let stats = crate::props::compute_folder_stats(&nav);
+            total = total.saturating_add(stats.total_size);
+            entries.push((trash, d.name, stats.total_size));
+        }
+
+        if entries.is_empty() {
+            self.say(".trash is already empty on all drives", false);
+            return;
+        }
+
+        let mut body = String::from(
+            "Permanently delete .trash on the following drives?\n\
+             This cannot be undone.\n\n",
+        );
+        for (_, label, size) in &entries {
+            body.push_str(&format!(
+                "• {} — {}\n",
+                label,
+                crate::listview::format_size(*size),
+            ));
+        }
+        body.push_str(&format!(
+            "\nTotal to free: {}",
+            crate::listview::format_size(total),
+        ));
+
+        if !confirm_empty_trash(self.main_hwnd(), &body) {
+            return;
+        }
+
+        let speech = self.speech.handle();
+        let state_weak = self.self_weak.get().cloned().unwrap_or_else(Weak::new);
+        let dirs: Vec<PathBuf> = entries.into_iter().map(|(p, _, _)| p).collect();
+        let total_freed = total;
+        std::thread::Builder::new()
+            .name("navigator-empty-trash".into())
+            .spawn(move || {
+                let mut ok = 0u32;
+                let mut failed = 0u32;
+                for d in &dirs {
+                    match std::fs::remove_dir_all(d) {
+                        Ok(()) => ok += 1,
+                        Err(e) => {
+                            failed += 1;
+                            let _ = speech.send(crate::speech::Utterance {
+                                text: format!("failed to empty {}: {}", d.display(), e),
+                                interrupt: true,
+                            });
+                        }
+                    }
+                }
+                let msg = if failed == 0 {
+                    format!(
+                        "emptied .trash on {} drive(s); {} freed",
+                        ok,
+                        crate::listview::format_size(total_freed),
+                    )
+                } else {
+                    format!("emptied {}, {} failed", ok, failed)
+                };
+                let _ = speech.send(crate::speech::Utterance {
+                    text: msg,
+                    interrupt: failed > 0,
+                });
+                if let Some(state) = state_weak.upgrade() {
+                    state
+                        .undo_stack
+                        .lock()
+                        .retain(|u| !matches!(u, UndoAction::Delete { .. }));
+                    state.refresh();
+                }
+            })
+            .expect("spawn empty-trash worker");
+    }
+
     /// Fire `rclone purge` once per remote target on a background
     /// thread. No undo — rclone purge is destructive, and most backends
     /// (S3 without versioning, SFTP, WebDAV) have no recovery path. UI
@@ -1519,6 +1617,34 @@ fn confirm_remote_delete(parent: Option<HWND>, targets: &[NavPath]) -> bool {
         extra,
     );
     let title_w: Vec<u16> = "Delete from remote?".encode_utf16().chain([0]).collect();
+    let body_w: Vec<u16> = body.encode_utf16().chain([0]).collect();
+    let is_foreground = parent
+        .map(|h| unsafe { GetForegroundWindow() } == h)
+        .unwrap_or(false);
+    let mut flags = MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2;
+    if is_foreground { flags |= MB_SETFOREGROUND; }
+    let rc = unsafe {
+        MessageBoxW(
+            parent,
+            PCWSTR(body_w.as_ptr()),
+            PCWSTR(title_w.as_ptr()),
+            flags,
+        ).0
+    };
+    rc == IDYES.0
+}
+
+/// Confirm a permanent trash purge across all drives. Defaults to No.
+/// `body` is built by the caller because it lists per-drive sizes that
+/// only the trash-walking pass knows about.
+fn confirm_empty_trash(parent: Option<HWND>, body: &str) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, MessageBoxW, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND,
+        MB_YESNO, IDYES,
+    };
+    use windows::core::PCWSTR;
+
+    let title_w: Vec<u16> = "Empty .trash on all drives?".encode_utf16().chain([0]).collect();
     let body_w: Vec<u16> = body.encode_utf16().chain([0]).collect();
     let is_foreground = parent
         .map(|h| unsafe { GetForegroundWindow() } == h)

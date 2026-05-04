@@ -342,6 +342,7 @@ pub enum Commands {
     NewFolder = 144,
     DumpTree = 145,
     Extract = 146,
+    EmptyTrash = 147,
     // Help menu
     About = 160,
     // Shortcut/Action dynamic range
@@ -368,6 +369,7 @@ fn build_menu() -> HMENU {
         let _ = AppendMenuW(file, MF_STRING, Commands::ShowProperties as usize,  w!("P&roperties\tAlt+Enter"));
         let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(file, MF_STRING, Commands::RecentOpsWindow as usize, w!("Recent &operations…"));
+        let _ = AppendMenuW(file, MF_STRING, Commands::EmptyTrash as usize,      w!("E&mpty .trash on all drives…"));
         let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(file, MF_STRING, Commands::ToggleHidden as usize,    w!("Show &hidden files\tCtrl+H"));
         let _ = AppendMenuW(file, MF_STRING, Commands::ToggleSystem as usize,    w!("Show &system files\tCtrl+Shift+H"));
@@ -1164,6 +1166,7 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
         x if x == Commands::ShowProperties as u16 => data.state.op_show_properties(),
         x if x == Commands::DumpTree as u16 => data.state.op_dump_tree(),
         x if x == Commands::Extract as u16 => data.state.op_extract(),
+        x if x == Commands::EmptyTrash as u16 => data.state.op_empty_trash(),
         x if x == Commands::FocusAddress as u16 => focus_address(data),
         x if x == Commands::ToggleHidden as u16 => {
             data.state.toggle_hidden();
