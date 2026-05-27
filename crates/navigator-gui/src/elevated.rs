@@ -20,17 +20,13 @@
 
 use std::path::PathBuf;
 
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::System::Threading::{
-    GetExitCodeProcess, WaitForSingleObject, INFINITE,
-};
-use windows::Win32::UI::Shell::{
-    ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
-};
+use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
+use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+use windows::core::PCWSTR;
 
-use navigator_rclone::op::{op_args, Operation, RcloneDriver};
+use navigator_rclone::op::{Operation, RcloneDriver, op_args};
 
 /// Outcome of a UAC-elevated rclone retry.
 pub struct Outcome {
@@ -50,8 +46,8 @@ pub fn run(driver: &RcloneDriver, op: &Operation) -> std::io::Result<Outcome> {
     // Per-op temp log path. Includes the parent PID so concurrent
     // retries from peer instances can't stomp each other; rclone
     // appends if the file exists, but we want a clean read.
-    let log_path: PathBuf = std::env::temp_dir()
-        .join(format!("navigator-elevated-{}.log", std::process::id()));
+    let log_path: PathBuf =
+        std::env::temp_dir().join(format!("navigator-elevated-{}.log", std::process::id()));
     let _ = std::fs::remove_file(&log_path);
 
     // Compose argv that mirrors `RcloneDriver::spawn`, plus the
@@ -115,7 +111,9 @@ pub fn run(driver: &RcloneDriver, op: &Operation) -> std::io::Result<Outcome> {
 fn quote_argv(argv: &[String]) -> String {
     let mut out = String::new();
     for (i, a) in argv.iter().enumerate() {
-        if i > 0 { out.push(' '); }
+        if i > 0 {
+            out.push(' ');
+        }
         out.push_str(&quote_one(a));
     }
     out
@@ -130,20 +128,30 @@ fn quote_one(s: &str) -> String {
     let mut backslashes = 0usize;
     for ch in s.chars() {
         match ch {
-            '\\' => { backslashes += 1; out.push('\\'); }
+            '\\' => {
+                backslashes += 1;
+                out.push('\\');
+            }
             '"' => {
                 // Escape every preceding backslash, then the quote.
-                for _ in 0..backslashes { out.push('\\'); }
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
                 out.push('\\');
                 out.push('"');
                 backslashes = 0;
             }
-            _ => { backslashes = 0; out.push(ch); }
+            _ => {
+                backslashes = 0;
+                out.push(ch);
+            }
         }
     }
     // Trailing backslashes need doubling so the closing quote isn't
     // interpreted as escaped.
-    for _ in 0..backslashes { out.push('\\'); }
+    for _ in 0..backslashes {
+        out.push('\\');
+    }
     out.push('"');
     out
 }
@@ -155,7 +163,11 @@ mod tests {
     #[test]
     fn no_quoting_for_simple_args() {
         assert_eq!(
-            quote_argv(&["copyto".into(), "lin:/home/x.md".into(), "D:\\dst.md".into()]),
+            quote_argv(&[
+                "copyto".into(),
+                "lin:/home/x.md".into(),
+                "D:\\dst.md".into()
+            ]),
             "copyto lin:/home/x.md D:\\dst.md"
         );
     }

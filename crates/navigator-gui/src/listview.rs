@@ -7,21 +7,21 @@
 
 use std::ffi::c_void;
 
-use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Controls::{
-    ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, LVCFMT_LEFT, LVCFMT_RIGHT,
-    LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVM_INSERTCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETITEMCOUNT, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES,
-    LVS_EX_HEADERDRAGDROP,
+    ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, LVCF_FMT, LVCF_TEXT,
+    LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW, LVM_INSERTCOLUMNW,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
+    LVS_EX_GRIDLINES, LVS_EX_HEADERDRAGDROP,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus};
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, GetNextDlgTabItem, GetParent, PostMessageW, SendMessageW, SetWindowPos,
-    ShowWindow, HMENU, SWP_NOZORDER, SW_SHOW, WINDOW_EX_STYLE, WM_COMMAND, WM_KEYDOWN, WS_BORDER,
+    CreateWindowExW, GetNextDlgTabItem, GetParent, HMENU, PostMessageW, SW_SHOW, SWP_NOZORDER,
+    SendMessageW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WM_COMMAND, WM_KEYDOWN, WS_BORDER,
     WS_CHILD, WS_VISIBLE,
 };
-use windows::Win32::UI::Shell::{SetWindowSubclass, DefSubclassProc};
+use windows::core::{PCWSTR, w};
 
 // ListView-specific window style bits (not all exposed by the windows crate today).
 const LVS_REPORT: u32 = 0x0001;
@@ -47,9 +47,15 @@ pub enum LogicalColumn {
 /// flag is on. Exposed for unit tests that assert on the mapping.
 pub fn visible_columns(cols: &navigator_config::Columns) -> Vec<LogicalColumn> {
     let mut out = vec![LogicalColumn::Name];
-    if cols.show_size     { out.push(LogicalColumn::Size); }
-    if cols.show_type     { out.push(LogicalColumn::Type); }
-    if cols.show_modified { out.push(LogicalColumn::Modified); }
+    if cols.show_size {
+        out.push(LogicalColumn::Size);
+    }
+    if cols.show_type {
+        out.push(LogicalColumn::Type);
+    }
+    if cols.show_modified {
+        out.push(LogicalColumn::Modified);
+    }
     out
 }
 
@@ -61,7 +67,9 @@ pub fn column_for_subitem(
     cols: &navigator_config::Columns,
     sub_item: i32,
 ) -> Option<LogicalColumn> {
-    if sub_item < 0 { return None; }
+    if sub_item < 0 {
+        return None;
+    }
     visible_columns(cols).get(sub_item as usize).copied()
 }
 
@@ -77,19 +85,30 @@ impl ListView {
     /// WM_CHAR handler can drive our own incremental type-ahead buffer.
     /// `AppState` is an Arc held by the main window — it outlives the
     /// listview, so the pointer stays valid for the window's lifetime.
-    pub fn create(parent: HWND, id: u16, state: &std::sync::Arc<crate::app::AppState>) -> windows::core::Result<Self> {
+    pub fn create(
+        parent: HWND,
+        id: u16,
+        state: &std::sync::Arc<crate::app::AppState>,
+    ) -> windows::core::Result<Self> {
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_LISTVIEW_CLASSES,
         };
-        unsafe { let _ = InitCommonControlsEx(&icc); }
+        unsafe {
+            let _ = InitCommonControlsEx(&icc);
+        }
 
         // WS_TABSTOP lets IsDialogMessageW cycle focus onto the ListView
         // the same way it does onto the address bar. Without it, Tab leaves
         // the listview and never comes back.
-        let style = WS_CHILD.0 | WS_VISIBLE.0 | WS_BORDER.0
+        let style = WS_CHILD.0
+            | WS_VISIBLE.0
+            | WS_BORDER.0
             | windows::Win32::UI::WindowsAndMessaging::WS_TABSTOP.0
-            | LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS | LVS_EDITLABELS;
+            | LVS_REPORT
+            | LVS_OWNERDATA
+            | LVS_SHOWSELALWAYS
+            | LVS_EDITLABELS;
 
         let hwnd = unsafe {
             CreateWindowExW(
@@ -97,7 +116,10 @@ impl ListView {
                 w!("SysListView32"),
                 PCWSTR::null(),
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(style),
-                0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
                 Some(parent),
                 Some(HMENU(id as isize as *mut c_void)),
                 None,
@@ -108,10 +130,8 @@ impl ListView {
         // Full row select + double buffering + header drag/drop + light
         // gridlines. LABELTIP omitted: it's a hover-tooltip for truncated
         // labels — invisible to screen-reader-only use, costs paint time.
-        let ex_style = LVS_EX_FULLROWSELECT
-            | LVS_EX_DOUBLEBUFFER
-            | LVS_EX_GRIDLINES
-            | LVS_EX_HEADERDRAGDROP;
+        let ex_style =
+            LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_GRIDLINES | LVS_EX_HEADERDRAGDROP;
         unsafe {
             SendMessageW(
                 hwnd,
@@ -126,16 +146,18 @@ impl ListView {
         let mut next_idx = 0i32;
         for col in visible_columns(&cols) {
             let (title, width, right) = match col {
-                LogicalColumn::Name     => (w!("Name"),     320, false),
-                LogicalColumn::Size     => (w!("Size"),     100, true),
-                LogicalColumn::Type     => (w!("Type"),     120, false),
+                LogicalColumn::Name => (w!("Name"), 320, false),
+                LogicalColumn::Size => (w!("Size"), 100, true),
+                LogicalColumn::Type => (w!("Type"), 120, false),
                 LogicalColumn::Modified => (w!("Modified"), 160, false),
             };
             lv.add_column(next_idx, title, width, right);
             next_idx += 1;
         }
 
-        unsafe { let _ = ShowWindow(hwnd, SW_SHOW); }
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+        }
 
         // Subclass so we can intercept VK_BACK on the listview before it
         // gets consumed by the control's built-in incremental-search
@@ -151,7 +173,11 @@ impl ListView {
     fn add_column(&mut self, index: i32, text: PCWSTR, width: i32, right_align: bool) {
         let mut col: LVCOLUMNW = unsafe { std::mem::zeroed() };
         col.mask = LVCF_FMT | LVCF_WIDTH | LVCF_TEXT;
-        col.fmt = if right_align { LVCFMT_RIGHT } else { LVCFMT_LEFT };
+        col.fmt = if right_align {
+            LVCFMT_RIGHT
+        } else {
+            LVCFMT_LEFT
+        };
         col.cx = width;
         col.pszText = windows::core::PWSTR(text.as_ptr() as *mut _);
         unsafe {
@@ -178,17 +204,14 @@ impl ListView {
 
     pub fn resize(&self, x: i32, y: i32, w: i32, h: i32) {
         unsafe {
-            let _ = SetWindowPos(
-                self.hwnd,
-                None,
-                x, y, w, h,
-                SWP_NOZORDER,
-            );
+            let _ = SetWindowPos(self.hwnd, None, x, y, w, h, SWP_NOZORDER);
         }
     }
 
     pub fn focus(&self) {
-        unsafe { let _ = SetFocus(Some(self.hwnd)); }
+        unsafe {
+            let _ = SetFocus(Some(self.hwnd));
+        }
     }
 
     /// Tear down every column and re-insert the ones enabled by `cols`,
@@ -210,7 +233,9 @@ impl ListView {
                     Some(WPARAM(0)),
                     Some(LPARAM(0)),
                 );
-                if r.0 == 0 { break; }
+                if r.0 == 0 {
+                    break;
+                }
                 let _ = SendMessageW(
                     self.hwnd,
                     LVM_DELETECOLUMN,
@@ -224,9 +249,9 @@ impl ListView {
         let mut next_idx = 0i32;
         for col in visible_columns(cols) {
             let (title, width, right) = match col {
-                LogicalColumn::Name     => (w!("Name"),     320, false),
-                LogicalColumn::Size     => (w!("Size"),     100, true),
-                LogicalColumn::Type     => (w!("Type"),     120, false),
+                LogicalColumn::Name => (w!("Name"), 320, false),
+                LogicalColumn::Size => (w!("Size"), 100, true),
+                LogicalColumn::Type => (w!("Type"), 120, false),
                 LogicalColumn::Modified => (w!("Modified"), 160, false),
             };
             me.add_column(next_idx, title, width, right);
@@ -258,6 +283,7 @@ unsafe extern "system" fn listview_subclass_proc(
     const CMD_BACK: u16 = 106;
     const CMD_DELETE: u16 = 105;
     const CMD_OPEN_FOCUSED: u16 = 112;
+    const CMD_OPEN_CONTAINING: u16 = 148;
     const WM_CHAR: u32 = 0x0102;
 
     // Drive incremental type-ahead ourselves. Consuming WM_CHAR keeps the
@@ -281,9 +307,13 @@ unsafe extern "system" fn listview_subclass_proc(
 
     if msg == WM_KEYDOWN {
         let vk = wp.0 as u32;
+        // Ctrl+Enter is its own gesture: open the focused row's containing
+        // folder in a new navigator instance. Plain Enter still activates.
+        let ctrl_held = unsafe { (GetKeyState(0x11) as i32) < 0 };
         let routed = match vk {
-            0x08 => Some(CMD_BACK),         // VK_BACK
-            0x2E => Some(CMD_DELETE),       // VK_DELETE
+            0x08 => Some(CMD_BACK),   // VK_BACK
+            0x2E => Some(CMD_DELETE), // VK_DELETE
+            0x0D if ctrl_held => Some(CMD_OPEN_CONTAINING),
             0x0D => Some(CMD_OPEN_FOCUSED), // VK_RETURN
             _ => None,
         };
@@ -312,16 +342,16 @@ unsafe extern "system" fn listview_subclass_proc(
         // listview behavior.
         if data != 0 {
             const VK_PRIOR: u32 = 0x21;
-            const VK_NEXT:  u32 = 0x22;
-            const VK_END:   u32 = 0x23;
-            const VK_HOME:  u32 = 0x24;
-            const VK_UP:    u32 = 0x26;
-            const VK_DOWN:  u32 = 0x28;
-            let nav_up   = matches!(vk, VK_UP | VK_HOME | VK_PRIOR);
+            const VK_NEXT: u32 = 0x22;
+            const VK_END: u32 = 0x23;
+            const VK_HOME: u32 = 0x24;
+            const VK_UP: u32 = 0x26;
+            const VK_DOWN: u32 = 0x28;
+            let nav_up = matches!(vk, VK_UP | VK_HOME | VK_PRIOR);
             let nav_down = matches!(vk, VK_DOWN | VK_END | VK_NEXT);
             if nav_up || nav_down {
                 let shift = unsafe { (GetKeyState(0x10) as i32) < 0 };
-                let ctrl  = unsafe { (GetKeyState(0x11) as i32) < 0 };
+                let ctrl = unsafe { (GetKeyState(0x11) as i32) < 0 };
                 if !shift && !ctrl {
                     let state = unsafe { &*(data as *const crate::app::AppState) };
                     let total = state.model.len();
@@ -375,7 +405,9 @@ fn focus_row(lv: windows::Win32::Foundation::HWND, idx: usize) {
             lv,
             LVM_SETITEMSTATE,
             Some(windows::Win32::Foundation::WPARAM(usize::MAX)),
-            Some(windows::Win32::Foundation::LPARAM(&raw const clear as isize)),
+            Some(windows::Win32::Foundation::LPARAM(
+                &raw const clear as isize,
+            )),
         );
         let mut item: LVITEMW = std::mem::zeroed();
         item.state = SEL_FOCUS;
@@ -423,7 +455,9 @@ pub fn format_filetime(ticks: u64) -> String {
     };
     let mut st = SYSTEMTIME::default();
     let ok = unsafe { FileTimeToSystemTime(&ft, &raw mut st) }.is_ok();
-    if !ok { return String::new(); }
+    if !ok {
+        return String::new();
+    }
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}",
         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute
@@ -437,13 +471,14 @@ pub fn format_filetime(ticks: u64) -> String {
 pub fn format_filetime_relative(ticks: u64) -> String {
     use windows::Win32::Foundation::FILETIME;
 
-    if ticks == 0 { return String::new(); }
+    if ticks == 0 {
+        return String::new();
+    }
 
     // Compare against "now" in FILETIME ticks. GetSystemTimeAsFileTime
     // gives UTC-100ns, same basis as ftLastWriteTime.
-    let now_ft: FILETIME = unsafe {
-        windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime()
-    };
+    let now_ft: FILETIME =
+        unsafe { windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime() };
     let now = ((now_ft.dwHighDateTime as u64) << 32) | now_ft.dwLowDateTime as u64;
     if ticks > now {
         // Clock skew or a future mtime — fall back to absolute.
@@ -456,17 +491,31 @@ pub fn format_filetime_relative(ticks: u64) -> String {
     let hours = secs / 3_600;
     let days = secs / 86_400;
 
-    if secs < 45          { "just now".to_string() }
-    else if secs < 90     { "about a minute ago".to_string() }
-    else if mins < 45     { format!("{} minutes ago", mins) }
-    else if mins < 90     { "about an hour ago".to_string() }
-    else if hours < 24    { format!("{} hours ago", hours) }
-    else if days == 1     { "yesterday".to_string() }
-    else if days < 7      { format!("{} days ago", days) }
-    else if days < 14     { "last week".to_string() }
-    else if days < 30     { format!("{} weeks ago", days / 7) }
-    else if days < 60     { "last month".to_string() }
-    else if days < 365    { format!("{} months ago", days / 30) }
-    else if days < 730    { "last year".to_string() }
-    else                  { format!("{} years ago", days / 365) }
+    if secs < 45 {
+        "just now".to_string()
+    } else if secs < 90 {
+        "about a minute ago".to_string()
+    } else if mins < 45 {
+        format!("{} minutes ago", mins)
+    } else if mins < 90 {
+        "about an hour ago".to_string()
+    } else if hours < 24 {
+        format!("{} hours ago", hours)
+    } else if days == 1 {
+        "yesterday".to_string()
+    } else if days < 7 {
+        format!("{} days ago", days)
+    } else if days < 14 {
+        "last week".to_string()
+    } else if days < 30 {
+        format!("{} weeks ago", days / 7)
+    } else if days < 60 {
+        "last month".to_string()
+    } else if days < 365 {
+        format!("{} months ago", days / 30)
+    } else if days < 730 {
+        "last year".to_string()
+    } else {
+        format!("{} years ago", days / 365)
+    }
 }

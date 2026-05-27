@@ -15,10 +15,20 @@ pub enum Event {
     Focused { path: NavPath, index: usize },
 
     /// Operation kicked off by the user.
-    OpStarted { id: u64, kind: OpKind, items: Vec<NavPath>, dest: Option<NavPath> },
+    OpStarted {
+        id: u64,
+        kind: OpKind,
+        items: Vec<NavPath>,
+        dest: Option<NavPath>,
+    },
 
     /// Operation progress update.
-    OpProgress { id: u64, bytes_done: u64, bytes_total: u64, current: Option<String> },
+    OpProgress {
+        id: u64,
+        bytes_done: u64,
+        bytes_total: u64,
+        current: Option<String>,
+    },
 
     /// Operation finished (success or failure).
     OpFinished { id: u64, result: OpOutcome },

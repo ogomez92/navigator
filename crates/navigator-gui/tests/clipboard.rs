@@ -21,7 +21,11 @@ fn clipfile_serde_roundtrip_copy() {
 
 #[test]
 fn clipfile_serde_roundtrip_cut_preserves_flag() {
-    let c = ClipFile { sources: vec!["a".into()], cut: true, ts: 0 };
+    let c = ClipFile {
+        sources: vec!["a".into()],
+        cut: true,
+        ts: 0,
+    };
     let s = serde_json::to_string(&c).unwrap();
     let back: ClipFile = serde_json::from_str(&s).unwrap();
     assert!(back.cut);
@@ -99,8 +103,8 @@ fn entry_label_paste_includes_dest_basename() {
 fn entry_label_append_variants_have_friendly_verb() {
     for (kind, expected) in &[
         ("append-copy", "Append copy x"),
-        ("append-cut",  "Append cut x"),
-        ("delete",      "Delete x"),
+        ("append-cut", "Append cut x"),
+        ("delete", "Delete x"),
     ] {
         let e = HistoryEntry {
             kind: (*kind).into(),

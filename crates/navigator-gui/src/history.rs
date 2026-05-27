@@ -18,12 +18,18 @@ pub struct History {
 }
 
 impl Default for History {
-    fn default() -> Self { Self::with_capacity(DEFAULT_CAP) }
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_CAP)
+    }
 }
 
 impl History {
     pub fn with_capacity(cap: usize) -> Self {
-        Self { entries: Vec::with_capacity(cap.min(DEFAULT_CAP)), cursor: 0, cap: cap.max(1) }
+        Self {
+            entries: Vec::with_capacity(cap.min(DEFAULT_CAP)),
+            cursor: 0,
+            cap: cap.max(1),
+        }
     }
 
     /// Record a navigation. Drops anything the user had after the cursor
@@ -33,7 +39,9 @@ impl History {
         // Collapse consecutive duplicates — navigating to the same place
         // shouldn't grow the history.
         if let Some(current) = self.entries.get(self.cursor) {
-            if *current == path { return; }
+            if *current == path {
+                return;
+            }
         }
         if self.cursor < self.entries.len() {
             self.entries.truncate(self.cursor + 1);
@@ -59,17 +67,25 @@ impl History {
     }
 
     pub fn back(&mut self) -> Option<&NavPath> {
-        if !self.can_back() { return None; }
+        if !self.can_back() {
+            return None;
+        }
         self.cursor -= 1;
         self.entries.get(self.cursor)
     }
 
     pub fn forward(&mut self) -> Option<&NavPath> {
-        if !self.can_forward() { return None; }
+        if !self.can_forward() {
+            return None;
+        }
         self.cursor += 1;
         self.entries.get(self.cursor)
     }
 
-    pub fn len(&self) -> usize { self.entries.len() }
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }

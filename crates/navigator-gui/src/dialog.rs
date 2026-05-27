@@ -18,20 +18,20 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DLGPROC, DialogBoxIndirectParamW, SetWindowsHookExW, UnhookWindowsHookEx,
-    HCBT_CREATEWND, HHOOK, WH_CBT,
+    CallNextHookEx, DLGPROC, DialogBoxIndirectParamW, HCBT_CREATEWND, HHOOK, SetWindowsHookExW,
+    UnhookWindowsHookEx, WH_CBT,
 };
 
 // DLGTEMPLATE style bits. The `windows` crate exposes most of these but
 // the DS_* constants live in scattered modules; defining them here keeps
 // the template builder self-contained.
-const WS_POPUP: u32      = 0x80000000;
-const WS_CAPTION: u32    = 0x00C00000;
-const WS_SYSMENU: u32    = 0x00080000;
+const WS_POPUP: u32 = 0x80000000;
+const WS_CAPTION: u32 = 0x00C00000;
+const WS_SYSMENU: u32 = 0x00080000;
 const DS_MODALFRAME: u32 = 0x00000080;
-const DS_SETFONT: u32    = 0x00000040;
-const DS_CENTER: u32     = 0x00000800;
-const DS_3DLOOK: u32     = 0x00000004;
+const DS_SETFONT: u32 = 0x00000040;
+const DS_CENTER: u32 = 0x00000800;
+const DS_3DLOOK: u32 = 0x00000004;
 const WS_EX_CONTROLPARENT: u32 = 0x00010000;
 
 /// Run a modal dialog described by `title` + `(cx_dlu, cy_dlu)`. Controls
@@ -105,53 +105,63 @@ unsafe extern "system" fn cbt_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
 /// auto-sizes the host to fit the largest page, so exact dims here only
 /// matter when there's a single page.
 pub fn build_propsheet_page_template(cx_dlu: u16, cy_dlu: u16) -> Vec<u8> {
-    const WS_CHILD: u32    = 0x40000000;
-    const DS_CONTROL: u32  = 0x00000400;
+    const WS_CHILD: u32 = 0x40000000;
+    const DS_CONTROL: u32 = 0x00000400;
 
     let style = WS_CHILD | DS_3DLOOK | DS_CONTROL | DS_SETFONT;
 
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     buf.extend_from_slice(&style.to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes());              // ex_style
-    buf.extend_from_slice(&0u16.to_le_bytes());              // cdit = 0
-    buf.extend_from_slice(&0i16.to_le_bytes());              // x
-    buf.extend_from_slice(&0i16.to_le_bytes());              // y
+    buf.extend_from_slice(&0u32.to_le_bytes()); // ex_style
+    buf.extend_from_slice(&0u16.to_le_bytes()); // cdit = 0
+    buf.extend_from_slice(&0i16.to_le_bytes()); // x
+    buf.extend_from_slice(&0i16.to_le_bytes()); // y
     buf.extend_from_slice(&(cx_dlu as i16).to_le_bytes());
     buf.extend_from_slice(&(cy_dlu as i16).to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes());              // no menu
-    buf.extend_from_slice(&0u16.to_le_bytes());              // default dialog class
-    buf.extend_from_slice(&0u16.to_le_bytes());              // empty title terminator
+    buf.extend_from_slice(&0u16.to_le_bytes()); // no menu
+    buf.extend_from_slice(&0u16.to_le_bytes()); // default dialog class
+    buf.extend_from_slice(&0u16.to_le_bytes()); // empty title terminator
 
     buf.extend_from_slice(&9u16.to_le_bytes());
-    for u in "MS Shell Dlg".encode_utf16() { buf.extend_from_slice(&u.to_le_bytes()); }
+    for u in "MS Shell Dlg".encode_utf16() {
+        buf.extend_from_slice(&u.to_le_bytes());
+    }
     buf.extend_from_slice(&0u16.to_le_bytes());
 
-    while buf.len() % 4 != 0 { buf.push(0); }
+    while buf.len() % 4 != 0 {
+        buf.push(0);
+    }
     buf
 }
 
 fn build_template(title: &str, cx: u16, cy: u16) -> Vec<u8> {
-    let style = WS_POPUP | WS_CAPTION | WS_SYSMENU
-        | DS_MODALFRAME | DS_SETFONT | DS_CENTER | DS_3DLOOK;
+    let style =
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_SETFONT | DS_CENTER | DS_3DLOOK;
 
     let mut buf: Vec<u8> = Vec::with_capacity(128);
     buf.extend_from_slice(&style.to_le_bytes());
     buf.extend_from_slice(&WS_EX_CONTROLPARENT.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes());           // cdit = 0
-    buf.extend_from_slice(&0i16.to_le_bytes());           // x
-    buf.extend_from_slice(&0i16.to_le_bytes());           // y
-    buf.extend_from_slice(&(cx as i16).to_le_bytes());    // cx
-    buf.extend_from_slice(&(cy as i16).to_le_bytes());    // cy
-    buf.extend_from_slice(&0u16.to_le_bytes());           // no menu
-    buf.extend_from_slice(&0u16.to_le_bytes());           // default dialog class
-    for u in title.encode_utf16() { buf.extend_from_slice(&u.to_le_bytes()); }
-    buf.extend_from_slice(&0u16.to_le_bytes());           // title terminator
+    buf.extend_from_slice(&0u16.to_le_bytes()); // cdit = 0
+    buf.extend_from_slice(&0i16.to_le_bytes()); // x
+    buf.extend_from_slice(&0i16.to_le_bytes()); // y
+    buf.extend_from_slice(&(cx as i16).to_le_bytes()); // cx
+    buf.extend_from_slice(&(cy as i16).to_le_bytes()); // cy
+    buf.extend_from_slice(&0u16.to_le_bytes()); // no menu
+    buf.extend_from_slice(&0u16.to_le_bytes()); // default dialog class
+    for u in title.encode_utf16() {
+        buf.extend_from_slice(&u.to_le_bytes());
+    }
+    buf.extend_from_slice(&0u16.to_le_bytes()); // title terminator
 
     // DS_SETFONT: point size + typeface (null-terminated UTF-16).
     buf.extend_from_slice(&9u16.to_le_bytes());
-    for u in "MS Shell Dlg".encode_utf16() { buf.extend_from_slice(&u.to_le_bytes()); }
+    for u in "MS Shell Dlg".encode_utf16() {
+        buf.extend_from_slice(&u.to_le_bytes());
+    }
     buf.extend_from_slice(&0u16.to_le_bytes());
 
-    while buf.len() % 4 != 0 { buf.push(0); }
+    while buf.len() % 4 != 0 {
+        buf.push(0);
+    }
     buf
 }

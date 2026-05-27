@@ -3,8 +3,8 @@
 //! widgets fall back to the classic look. DPI awareness is set to
 //! per-monitor-v2 so the listview doesn't blur on high-DPI displays.
 
-use embed_manifest::{embed_manifest, new_manifest};
 use embed_manifest::manifest::{ActiveCodePage, DpiAwareness, SupportedOS};
+use embed_manifest::{embed_manifest, new_manifest};
 
 fn main() {
     if std::env::var_os("CARGO_CFG_WINDOWS").is_none() {

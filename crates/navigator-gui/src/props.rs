@@ -49,7 +49,10 @@ pub fn compute_folder_stats(root: &NavPath) -> FolderStats {
     while let Some(dir) = stack.pop() {
         let entries = match read_dir(&dir) {
             Ok(v) => v,
-            Err(_) => { stats.errors += 1; continue; }
+            Err(_) => {
+                stats.errors += 1;
+                continue;
+            }
         };
         for e in entries {
             match e.kind {
@@ -104,15 +107,18 @@ pub fn ext_of(name: &str) -> String {
 pub fn format_properties(entry: &Entry, path: &NavPath, stats: Option<&FolderStats>) -> String {
     let mut s = String::new();
     let kind = match entry.kind {
-        EntryKind::File      => "File",
+        EntryKind::File => "File",
         EntryKind::Directory => "Directory",
-        EntryKind::Symlink   => "Symlink / reparse point",
-        EntryKind::Other     => "Other",
+        EntryKind::Symlink => "Symlink / reparse point",
+        EntryKind::Other => "Other",
     };
     s.push_str(&format!("Name:      {}\n", entry.name));
     s.push_str(&format!("Path:      {}\n", path));
     s.push_str(&format!("Type:      {}\n", kind));
-    if matches!(entry.kind, EntryKind::File | EntryKind::Other | EntryKind::Symlink) {
+    if matches!(
+        entry.kind,
+        EntryKind::File | EntryKind::Other | EntryKind::Symlink
+    ) {
         let ext = ext_of(&entry.name);
         if !ext.is_empty() {
             s.push_str(&format!("Extension: .{}\n", ext));
@@ -125,7 +131,10 @@ pub fn format_properties(entry: &Entry, path: &NavPath, stats: Option<&FolderSta
         (true, Some(st)) => st.total_size,
         _ => entry.size,
     };
-    s.push_str(&format!("Size:      {}\n", format_size_with_bytes(header_size)));
+    s.push_str(&format!(
+        "Size:      {}\n",
+        format_size_with_bytes(header_size)
+    ));
     s.push_str(&format!(
         "Modified:  {}\n",
         fmt_time_or_dash(entry.modified.0),
@@ -134,14 +143,20 @@ pub fn format_properties(entry: &Entry, path: &NavPath, stats: Option<&FolderSta
         "Created:   {}\n",
         fmt_time_or_dash(entry.created.0),
     ));
-    s.push_str(&format!("Attrs:     {}\n", format_attrs(entry.attrs, entry.hidden, entry.system)));
+    s.push_str(&format!(
+        "Attrs:     {}\n",
+        format_attrs(entry.attrs, entry.hidden, entry.system)
+    ));
 
     if let Some(st) = stats {
         s.push('\n');
         s.push_str("--- Folder contents (recursive) ---\n");
         s.push_str(&format!("Files:     {}\n", st.file_count));
         s.push_str(&format!("Folders:   {}\n", st.dir_count));
-        s.push_str(&format!("Total:     {}\n", format_size_with_bytes(st.total_size)));
+        s.push_str(&format!(
+            "Total:     {}\n",
+            format_size_with_bytes(st.total_size)
+        ));
         if st.errors > 0 {
             s.push_str(&format!("Unreadable subfolders: {}\n", st.errors));
         }
@@ -183,7 +198,11 @@ pub fn format_remote_properties(
     size: Option<&RemoteSize>,
 ) -> String {
     let mut s = String::new();
-    let kind = if entry.is_dir() { "Directory (remote)" } else { "File (remote)" };
+    let kind = if entry.is_dir() {
+        "Directory (remote)"
+    } else {
+        "File (remote)"
+    };
     s.push_str(&format!("Name:      {}\n", entry.name));
     s.push_str(&format!("Path:      {}\n", path));
     s.push_str(&format!("Type:      {}\n", kind));
@@ -198,7 +217,10 @@ pub fn format_remote_properties(
     } else {
         stat.map(|st| st.size.max(0) as u64).unwrap_or(entry.size)
     };
-    s.push_str(&format!("Size:      {}\n", format_size_with_bytes(header_size)));
+    s.push_str(&format!(
+        "Size:      {}\n",
+        format_size_with_bytes(header_size)
+    ));
     let mod_str = stat
         .and_then(|st| st.mod_time.as_deref())
         .map(|s| s.to_string())
@@ -222,7 +244,16 @@ pub fn format_remote_properties(
                     format!("0o{:o}", m & 0o7777)
                 ));
             }
-            for key in ["uid", "gid", "mtime", "atime", "btime", "link-target", "owner", "group"] {
+            for key in [
+                "uid",
+                "gid",
+                "mtime",
+                "atime",
+                "btime",
+                "link-target",
+                "owner",
+                "group",
+            ] {
                 if let Some(v) = st.metadata.get(key) {
                     s.push_str(&format!("{:<10} {}\n", format!("{}:", key), v));
                 }
@@ -230,7 +261,15 @@ pub fn format_remote_properties(
             // Dump remaining metadata keys we didn't render above so nothing
             // useful is hidden — sorted for stable output.
             let known: &[&str] = &[
-                "mode", "uid", "gid", "mtime", "atime", "btime", "link-target", "owner", "group",
+                "mode",
+                "uid",
+                "gid",
+                "mtime",
+                "atime",
+                "btime",
+                "link-target",
+                "owner",
+                "group",
             ];
             let mut extras: Vec<(&String, &String)> = st
                 .metadata
@@ -248,7 +287,10 @@ pub fn format_remote_properties(
         s.push('\n');
         s.push_str("--- Folder contents (recursive) ---\n");
         s.push_str(&format!("Files:     {}\n", sz.count.max(0)));
-        s.push_str(&format!("Total:     {}\n", format_size_with_bytes(sz.bytes.max(0) as u64)));
+        s.push_str(&format!(
+            "Total:     {}\n",
+            format_size_with_bytes(sz.bytes.max(0) as u64)
+        ));
         if sz.sizeless > 0 {
             s.push_str(&format!("Sizeless objects: {}\n", sz.sizeless));
         }
@@ -280,12 +322,12 @@ pub fn format_unix_mode(mode: u32) -> String {
         let w = if bits & 0o2 != 0 { 'w' } else { '-' };
         let x = bits & 0o1 != 0;
         let last = match (suid, sticky, x) {
-            (true, _, true)   => exec_letter,
-            (true, _, false)  => exec_letter.to_ascii_uppercase(),
-            (_, true, true)   => 't',
-            (_, true, false)  => 'T',
-            (_, _, true)      => 'x',
-            (_, _, false)     => '-',
+            (true, _, true) => exec_letter,
+            (true, _, false) => exec_letter.to_ascii_uppercase(),
+            (_, true, true) => 't',
+            (_, true, false) => 'T',
+            (_, _, true) => 'x',
+            (_, _, false) => '-',
         };
         format!("{r}{w}{last}")
     };
@@ -311,7 +353,10 @@ pub fn dump_tree_toml(root: &NavPath) -> String {
     while let Some(dir) = stack.pop() {
         let entries = match read_dir(&dir) {
             Ok(v) => v,
-            Err(_) => { errors += 1; continue; }
+            Err(_) => {
+                errors += 1;
+                continue;
+            }
         };
         for e in entries {
             let full = dir.join(&e.name);
@@ -369,7 +414,7 @@ pub fn toml_string(s: &str) -> String {
     out.push('"');
     for c in s.chars() {
         match c {
-            '"'  => out.push_str("\\\""),
+            '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
@@ -391,7 +436,9 @@ fn format_size_with_bytes(n: u64) -> String {
 }
 
 fn fmt_time_or_dash(ticks: u64) -> String {
-    if ticks == 0 { return "—".to_string(); }
+    if ticks == 0 {
+        return "—".to_string();
+    }
     crate::listview::format_filetime(ticks)
 }
 
@@ -399,14 +446,30 @@ fn format_attrs(attrs: u32, hidden: bool, system: bool) -> String {
     // Low-cost decoder for the bits users actually care about. Keeps the
     // numeric value too so power users can still cross-check.
     let mut flags: Vec<&str> = Vec::new();
-    if attrs & 0x0001 != 0 { flags.push("readonly"); }
-    if hidden             { flags.push("hidden"); }
-    if system             { flags.push("system"); }
-    if attrs & 0x0010 != 0 { flags.push("directory"); }
-    if attrs & 0x0020 != 0 { flags.push("archive"); }
-    if attrs & 0x0400 != 0 { flags.push("reparse"); }
-    if attrs & 0x0800 != 0 { flags.push("compressed"); }
-    if attrs & 0x4000 != 0 { flags.push("encrypted"); }
+    if attrs & 0x0001 != 0 {
+        flags.push("readonly");
+    }
+    if hidden {
+        flags.push("hidden");
+    }
+    if system {
+        flags.push("system");
+    }
+    if attrs & 0x0010 != 0 {
+        flags.push("directory");
+    }
+    if attrs & 0x0020 != 0 {
+        flags.push("archive");
+    }
+    if attrs & 0x0400 != 0 {
+        flags.push("reparse");
+    }
+    if attrs & 0x0800 != 0 {
+        flags.push("compressed");
+    }
+    if attrs & 0x4000 != 0 {
+        flags.push("encrypted");
+    }
     if flags.is_empty() {
         format!("0x{:04X}", attrs)
     } else {
@@ -439,8 +502,12 @@ mod tests {
             fs::create_dir_all(&p).unwrap();
             Self(p)
         }
-        fn path(&self) -> &Path { &self.0 }
-        fn nav(&self) -> NavPath { NavPath::new(self.0.clone()).unwrap() }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+        fn nav(&self) -> NavPath {
+            NavPath::new(self.0.clone()).unwrap()
+        }
     }
     impl Drop for TempDir {
         fn drop(&mut self) {
@@ -458,26 +525,26 @@ mod tests {
     #[test]
     fn ext_of_handles_common_cases() {
         assert_eq!(ext_of("foo.TXT"), "txt");
-        assert_eq!(ext_of("README"),  "");
+        assert_eq!(ext_of("README"), "");
         assert_eq!(ext_of(".gitignore"), "");
         assert_eq!(ext_of("archive.tar.gz"), "gz");
     }
 
     #[test]
     fn toml_string_escapes_metacharacters() {
-        assert_eq!(toml_string("foo"),           "\"foo\"");
-        assert_eq!(toml_string("a\\b"),          "\"a\\\\b\"");
-        assert_eq!(toml_string("a\"b"),          "\"a\\\"b\"");
-        assert_eq!(toml_string("line\nbreak"),   "\"line\\nbreak\"");
+        assert_eq!(toml_string("foo"), "\"foo\"");
+        assert_eq!(toml_string("a\\b"), "\"a\\\\b\"");
+        assert_eq!(toml_string("a\"b"), "\"a\\\"b\"");
+        assert_eq!(toml_string("line\nbreak"), "\"line\\nbreak\"");
     }
 
     #[test]
     fn folder_stats_totals_files_dirs_and_sizes() {
         let td = TempDir::new();
-        write(&td.path().join("a.txt"),            b"hello");         // 5 bytes
-        write(&td.path().join("b.rs"),             b"fn main(){}");    // 11 bytes
-        write(&td.path().join("sub/c.txt"),        b"world!");         // 6 bytes
-        write(&td.path().join("sub/nested/d.md"),  b"# hi");           // 4 bytes
+        write(&td.path().join("a.txt"), b"hello"); // 5 bytes
+        write(&td.path().join("b.rs"), b"fn main(){}"); // 11 bytes
+        write(&td.path().join("sub/c.txt"), b"world!"); // 6 bytes
+        write(&td.path().join("sub/nested/d.md"), b"# hi"); // 4 bytes
         fs::create_dir_all(td.path().join("empty_dir")).unwrap();
 
         let stats = compute_folder_stats(&td.nav());
@@ -488,11 +555,14 @@ mod tests {
         assert_eq!(stats.errors, 0);
 
         // Two .txt, one .rs, one .md — sorted by count desc, ties by ext asc.
-        let counts: std::collections::HashMap<&str, u64> =
-            stats.by_ext.iter().map(|e| (e.ext.as_str(), e.count)).collect();
+        let counts: std::collections::HashMap<&str, u64> = stats
+            .by_ext
+            .iter()
+            .map(|e| (e.ext.as_str(), e.count))
+            .collect();
         assert_eq!(counts.get("txt"), Some(&2));
-        assert_eq!(counts.get("rs"),  Some(&1));
-        assert_eq!(counts.get("md"),  Some(&1));
+        assert_eq!(counts.get("rs"), Some(&1));
+        assert_eq!(counts.get("md"), Some(&1));
         assert_eq!(stats.by_ext.first().map(|e| e.ext.as_str()), Some("txt"));
     }
 
@@ -505,19 +575,37 @@ mod tests {
 
         let out = dump_tree_toml(&td.nav());
         // Header.
-        assert!(out.contains("file_count = 2"),  "missing file_count in:\n{out}");
-        assert!(out.contains("dir_count = 2"),   "missing dir_count in:\n{out}");
-        assert!(out.contains("total_size = 3"),  "missing total_size in:\n{out}");
+        assert!(
+            out.contains("file_count = 2"),
+            "missing file_count in:\n{out}"
+        );
+        assert!(
+            out.contains("dir_count = 2"),
+            "missing dir_count in:\n{out}"
+        );
+        assert!(
+            out.contains("total_size = 3"),
+            "missing total_size in:\n{out}"
+        );
         // Arrays — relative paths, forward slashes, sorted.
-        assert!(out.contains("\"a.txt\""),        "missing a.txt in:\n{out}");
-        assert!(out.contains("\"sub/b.txt\""),    "missing sub/b.txt in:\n{out}");
-        assert!(out.contains("\"sub\""),          "missing sub dir in:\n{out}");
-        assert!(out.contains("\"emptydir\""),     "missing emptydir dir in:\n{out}");
+        assert!(out.contains("\"a.txt\""), "missing a.txt in:\n{out}");
+        assert!(
+            out.contains("\"sub/b.txt\""),
+            "missing sub/b.txt in:\n{out}"
+        );
+        assert!(out.contains("\"sub\""), "missing sub dir in:\n{out}");
+        assert!(
+            out.contains("\"emptydir\""),
+            "missing emptydir dir in:\n{out}"
+        );
         // Relative paths must use forward slashes — only the `root` line
         // is allowed to carry an escaped Windows path. Check the array
         // lines rather than the whole blob.
         for line in out.lines().filter(|l| l.trim_start().starts_with('"')) {
-            assert!(!line.contains("\\\\"), "relative path has backslashes: {line}");
+            assert!(
+                !line.contains("\\\\"),
+                "relative path has backslashes: {line}"
+            );
         }
     }
 
@@ -528,7 +616,7 @@ mod tests {
             kind: EntryKind::File,
             size: 42,
             modified: navigator_core::FileTime(0),
-            created:  navigator_core::FileTime(0),
+            created: navigator_core::FileTime(0),
             attrs: 0x20,
             hidden: false,
             system: false,
@@ -550,7 +638,7 @@ mod tests {
             kind: EntryKind::Directory,
             size: 0,
             modified: navigator_core::FileTime(0),
-            created:  navigator_core::FileTime(0),
+            created: navigator_core::FileTime(0),
             attrs: 0x10,
             hidden: false,
             system: false,
@@ -562,8 +650,16 @@ mod tests {
             total_size: 1234,
             errors: 0,
             by_ext: vec![
-                ExtStat { ext: "txt".into(), count: 2, size: 20 },
-                ExtStat { ext: "rs".into(),  count: 1, size: 1214 },
+                ExtStat {
+                    ext: "txt".into(),
+                    count: 2,
+                    size: 20,
+                },
+                ExtStat {
+                    ext: "rs".into(),
+                    count: 1,
+                    size: 1214,
+                },
             ],
         };
         let s = format_properties(&e, &p, Some(&stats));
@@ -574,9 +670,13 @@ mod tests {
         assert!(s.contains(".rs"));
         // Header Size line must report the recursive total, not the
         // zero that WIN32_FIND_DATAW reports for a directory.
-        assert!(s.contains("Size:      1.2 KB (1234 bytes)"),
-            "expected recursive size in header, got:\n{s}");
-        assert!(!s.contains("Size:      0 bytes"),
-            "folder header must not show 0 bytes when stats present:\n{s}");
+        assert!(
+            s.contains("Size:      1.2 KB (1234 bytes)"),
+            "expected recursive size in header, got:\n{s}"
+        );
+        assert!(
+            !s.contains("Size:      0 bytes"),
+            "folder header must not show 0 bytes when stats present:\n{s}"
+        );
     }
 }

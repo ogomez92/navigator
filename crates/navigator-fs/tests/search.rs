@@ -8,13 +8,15 @@ use std::fs;
 use navigator_core::NavPath;
 use navigator_fs::search_recursive;
 
-fn abs(p: &std::path::Path) -> NavPath { NavPath::new(p.to_path_buf()).unwrap() }
+fn abs(p: &std::path::Path) -> NavPath {
+    NavPath::new(p.to_path_buf()).unwrap()
+}
 
 #[test]
 fn substring_match_case_insensitive() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("Report.pdf"), b"").unwrap();
-    fs::write(dir.path().join("notes.txt"),  b"").unwrap();
+    fs::write(dir.path().join("notes.txt"), b"").unwrap();
 
     let results = search_recursive(&abs(dir.path()), "REPORT", 100);
     assert_eq!(results.len(), 1);
@@ -35,8 +37,16 @@ fn recurses_into_subdirectories() {
     // Names are relative paths from the search root. Separator is
     // whatever PathBuf uses on Windows (`\`).
     assert!(names.iter().any(|n| n == "root.txt"));
-    assert!(names.iter().any(|n| n.ends_with("mid.txt")   && n.contains("sub1")));
-    assert!(names.iter().any(|n| n.ends_with("deep.txt") && n.contains("sub2")));
+    assert!(
+        names
+            .iter()
+            .any(|n| n.ends_with("mid.txt") && n.contains("sub1"))
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n.ends_with("deep.txt") && n.contains("sub2"))
+    );
 }
 
 #[test]

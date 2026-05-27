@@ -22,20 +22,20 @@ use std::iter::once;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
-use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::Com::{
-    CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
 };
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, ILFree, SHBindToParent,
-    SHGetDesktopFolder, SHParseDisplayName, CMINVOKECOMMANDINFO,
+    CMINVOKECOMMANDINFO, IContextMenu, IContextMenu2, IContextMenu3, ILFree, IShellFolder,
+    SHBindToParent, SHGetDesktopFolder, SHParseDisplayName,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, DestroyMenu, TrackPopupMenuEx, HMENU, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON,
+    CreatePopupMenu, DestroyMenu, HMENU, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenuEx,
 };
+use windows::core::{Interface, PCWSTR};
 
 use navigator_core::NavPath;
 
@@ -71,10 +71,7 @@ fn ensure_com() {
     COM_READY.with(|f| {
         if !*f.borrow() {
             unsafe {
-                let _ = CoInitializeEx(
-                    None,
-                    COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
-                );
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
             }
             *f.borrow_mut() = true;
         }
@@ -90,25 +87,36 @@ fn ensure_com() {
 /// announce something. Right-click should leave selection alone (Explorer
 /// parity).
 pub fn show(hwnd: HWND, pt: POINT, paths: &[NavPath], from_keyboard: bool) {
-    if paths.is_empty() { return; }
+    if paths.is_empty() {
+        return;
+    }
     ensure_com();
 
     match unsafe { show_inner(hwnd, pt, paths, from_keyboard) } {
-        Ok(()) => {},
+        Ok(()) => {}
         Err(e) => {
             tracing::warn!("context menu failed: {e:?}");
         }
     }
 }
 
-unsafe fn show_inner(hwnd: HWND, pt: POINT, paths: &[NavPath], from_keyboard: bool) -> windows::core::Result<()> {
+unsafe fn show_inner(
+    hwnd: HWND,
+    pt: POINT,
+    paths: &[NavPath],
+    from_keyboard: bool,
+) -> windows::core::Result<()> {
     // Build absolute PIDLs for each path. PIDLs are returned owned — free
     // them via ILFree on scope exit.
     struct PidlGuard(Vec<*mut ITEMIDLIST>);
     impl Drop for PidlGuard {
         fn drop(&mut self) {
             for p in self.0.drain(..) {
-                if !p.is_null() { unsafe { ILFree(Some(p)); } }
+                if !p.is_null() {
+                    unsafe {
+                        ILFree(Some(p));
+                    }
+                }
             }
         }
     }
@@ -116,14 +124,16 @@ unsafe fn show_inner(hwnd: HWND, pt: POINT, paths: &[NavPath], from_keyboard: bo
     for p in paths {
         let wide = to_wide(p.as_path());
         let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
-        let r = unsafe {
-            SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None)
-        };
-        if r.is_err() || pidl.is_null() { continue; }
+        let r = unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None) };
+        if r.is_err() || pidl.is_null() {
+            continue;
+        }
         abs_pidls.push(pidl);
     }
     let _guard = PidlGuard(abs_pidls.clone());
-    if abs_pidls.is_empty() { return Ok(()); }
+    if abs_pidls.is_empty() {
+        return Ok(());
+    }
 
     // Decide the parent IShellFolder:
     //   * All selections share one parent → bind to that folder and use the
@@ -138,16 +148,12 @@ unsafe fn show_inner(hwnd: HWND, pt: POINT, paths: &[NavPath], from_keyboard: bo
 
     let (parent, children_owned): (IShellFolder, Vec<*const ITEMIDLIST>) = if same_parent {
         let mut child_first: *mut ITEMIDLIST = std::ptr::null_mut();
-        let parent: IShellFolder = unsafe {
-            SHBindToParent(abs_pidls[0], Some(&mut child_first))?
-        };
+        let parent: IShellFolder = unsafe { SHBindToParent(abs_pidls[0], Some(&mut child_first))? };
         let mut children: Vec<*const ITEMIDLIST> = Vec::with_capacity(abs_pidls.len());
         children.push(child_first as *const _);
         for &abs in &abs_pidls[1..] {
             let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
-            let _: IShellFolder = unsafe {
-                SHBindToParent(abs, Some(&mut child))?
-            };
+            let _: IShellFolder = unsafe { SHBindToParent(abs, Some(&mut child))? };
             children.push(child as *const _);
         }
         (parent, children)
@@ -157,14 +163,11 @@ unsafe fn show_inner(hwnd: HWND, pt: POINT, paths: &[NavPath], from_keyboard: bo
         // the full selection, which is what Explorer does when you
         // Ctrl-click across folders.
         let desktop = unsafe { SHGetDesktopFolder()? };
-        let children: Vec<*const ITEMIDLIST> =
-            abs_pidls.iter().map(|&p| p as *const _).collect();
+        let children: Vec<*const ITEMIDLIST> = abs_pidls.iter().map(|&p| p as *const _).collect();
         (desktop, children)
     };
 
-    let ctx_menu: IContextMenu = unsafe {
-        parent.GetUIObjectOf(hwnd, &*children_owned, None)?
-    };
+    let ctx_menu: IContextMenu = unsafe { parent.GetUIObjectOf(hwnd, &*children_owned, None)? };
 
     // Populate an HMENU from the context-menu object.
     let hmenu: HMENU = unsafe { CreatePopupMenu()? };
@@ -202,8 +205,12 @@ unsafe fn show_inner(hwnd: HWND, pt: POINT, paths: &[NavPath], from_keyboard: bo
     // workaround is `SetForegroundWindow(hwnd)` before the call plus a
     // dummy `PostMessage(hwnd, WM_NULL, 0, 0)` after so the menu's idle
     // loop gets one more pump to exit cleanly.
-    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, SetForegroundWindow, WM_KEYDOWN, WM_NULL};
-    unsafe { let _ = SetForegroundWindow(hwnd); }
+    use windows::Win32::UI::WindowsAndMessaging::{
+        PostMessageW, SetForegroundWindow, WM_KEYDOWN, WM_NULL,
+    };
+    unsafe {
+        let _ = SetForegroundWindow(hwnd);
+    }
     // Keyboard invocation: post a synthetic VK_DOWN so the menu's modal
     // pump highlights the first item on entry. Without this the popup
     // appears with no selection, so MSAA/UIA emits no focus change and
@@ -219,10 +226,12 @@ unsafe fn show_inner(hwnd: HWND, pt: POINT, paths: &[NavPath], from_keyboard: bo
         TrackPopupMenuEx(
             hmenu,
             (TPM_RETURNCMD | TPM_LEFTALIGN | TPM_RIGHTBUTTON).0,
-            pt.x, pt.y,
+            pt.x,
+            pt.y,
             hwnd,
             None,
-        ).0 as u32
+        )
+        .0 as u32
     };
     unsafe {
         let _ = PostMessageW(
@@ -237,10 +246,14 @@ unsafe fn show_inner(hwnd: HWND, pt: POINT, paths: &[NavPath], from_keyboard: bo
 
     if cmd >= CMD_BASE && cmd <= CMD_MAX {
         let verb_id = cmd - CMD_BASE;
-        unsafe { invoke(&ctx_menu, hwnd, verb_id)?; }
+        unsafe {
+            invoke(&ctx_menu, hwnd, verb_id)?;
+        }
     }
 
-    unsafe { let _ = DestroyMenu(hmenu); }
+    unsafe {
+        let _ = DestroyMenu(hmenu);
+    }
     Ok(())
 }
 
@@ -259,7 +272,9 @@ unsafe fn invoke(ctx: &IContextMenu, hwnd: HWND, verb_id: u32) -> windows::core:
         dwHotKey: 0,
         hIcon: Default::default(),
     };
-    unsafe { ctx.InvokeCommand(&info)?; }
+    unsafe {
+        ctx.InvokeCommand(&info)?;
+    }
     Ok(())
 }
 
@@ -277,11 +292,15 @@ pub fn forward_menu_msg(msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         if let Some(m3) = active.m3.as_ref() {
             let mut out = LRESULT(0);
             let r = unsafe { m3.HandleMenuMsg2(msg, wp, lp, Some(&mut out)) };
-            if r.is_ok() { return Some(out); }
+            if r.is_ok() {
+                return Some(out);
+            }
         }
         if let Some(m2) = active.m2.as_ref() {
             let r = unsafe { m2.HandleMenuMsg(msg, wp, lp) };
-            if r.is_ok() { return Some(LRESULT(0)); }
+            if r.is_ok() {
+                return Some(LRESULT(0));
+            }
         }
         None
     })

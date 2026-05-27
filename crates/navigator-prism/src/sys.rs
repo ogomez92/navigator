@@ -13,9 +13,13 @@ pub type PrismError = c_int;
 pub const PRISM_OK: PrismError = 0;
 
 #[repr(C)]
-pub struct PrismContext { _private: [u8; 0] }
+pub struct PrismContext {
+    _private: [u8; 0],
+}
 #[repr(C)]
-pub struct PrismBackend { _private: [u8; 0] }
+pub struct PrismBackend {
+    _private: [u8; 0],
+}
 
 pub type PrismBackendId = u64;
 

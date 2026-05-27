@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 
 /// Windows FILETIME — 100-ns ticks since 1601-01-01 UTC. Kept raw so no
 /// precision is lost; convert only at display time.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct FileTime(pub u64);
 
 impl FileTime {
@@ -37,5 +39,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    pub fn is_dir(&self) -> bool { matches!(self.kind, EntryKind::Directory) }
+    pub fn is_dir(&self) -> bool {
+        matches!(self.kind, EntryKind::Directory)
+    }
 }

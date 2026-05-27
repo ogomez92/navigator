@@ -32,12 +32,20 @@ fn is_dir_on_directory_kind() {
 #[test]
 fn is_dir_false_for_files_and_links() {
     let e = Entry {
-        name: "foo".into(), kind: EntryKind::File,
-        size: 0, modified: FileTime::default(), created: FileTime::default(),
-        attrs: 0, hidden: false, system: false,
+        name: "foo".into(),
+        kind: EntryKind::File,
+        size: 0,
+        modified: FileTime::default(),
+        created: FileTime::default(),
+        attrs: 0,
+        hidden: false,
+        system: false,
     };
     assert!(!e.is_dir());
 
-    let link = Entry { kind: EntryKind::Symlink, ..e.clone() };
+    let link = Entry {
+        kind: EntryKind::Symlink,
+        ..e.clone()
+    };
     assert!(!link.is_dir());
 }

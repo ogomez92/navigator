@@ -20,7 +20,10 @@ pub enum WatchEvent {
     /// Mtime/size changed — easiest correct behaviour is a full refresh.
     Modified(String),
     /// Rename/move. We treat it as Remove(from) + Add(to) at the UI.
-    Renamed { from: Option<String>, to: Option<String> },
+    Renamed {
+        from: Option<String>,
+        to: Option<String>,
+    },
 }
 
 /// Start watching `path`. Every relevant change posts a
@@ -38,7 +41,9 @@ pub fn watch(path: NavPath, hwnd: HwndSend) -> notify::Result<RecommendedWatcher
     let hwnd_raw: isize = hwnd.0.0 as isize;
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-        let Ok(event) = res else { return; };
+        let Ok(event) = res else {
+            return;
+        };
         for ev in simplify(&event) {
             let payload = Box::new((root.clone(), ev));
             unsafe {
@@ -62,27 +67,37 @@ pub fn watch(path: NavPath, hwnd: HwndSend) -> notify::Result<RecommendedWatcher
 fn simplify(event: &Event) -> Vec<WatchEvent> {
     use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 
-    let names: Vec<String> = event.paths.iter()
+    let names: Vec<String> = event
+        .paths
+        .iter()
         .filter_map(|p| p.file_name().and_then(|s| s.to_str()).map(String::from))
         .collect();
 
     match event.kind {
-        EventKind::Create(CreateKind::Any | CreateKind::File | CreateKind::Folder | CreateKind::Other) => {
-            names.into_iter().map(WatchEvent::Added).collect()
-        }
-        EventKind::Remove(RemoveKind::Any | RemoveKind::File | RemoveKind::Folder | RemoveKind::Other) => {
-            names.into_iter().map(WatchEvent::Removed).collect()
-        }
+        EventKind::Create(
+            CreateKind::Any | CreateKind::File | CreateKind::Folder | CreateKind::Other,
+        ) => names.into_iter().map(WatchEvent::Added).collect(),
+        EventKind::Remove(
+            RemoveKind::Any | RemoveKind::File | RemoveKind::Folder | RemoveKind::Other,
+        ) => names.into_iter().map(WatchEvent::Removed).collect(),
         EventKind::Modify(ModifyKind::Name(mode)) => {
             // Rename can arrive as split From + To events (one path each) or
             // a combined Both event (two paths). Handle both shapes.
             match mode {
-                RenameMode::From => names.into_iter().map(|n| {
-                    WatchEvent::Renamed { from: Some(n), to: None }
-                }).collect(),
-                RenameMode::To => names.into_iter().map(|n| {
-                    WatchEvent::Renamed { from: None, to: Some(n) }
-                }).collect(),
+                RenameMode::From => names
+                    .into_iter()
+                    .map(|n| WatchEvent::Renamed {
+                        from: Some(n),
+                        to: None,
+                    })
+                    .collect(),
+                RenameMode::To => names
+                    .into_iter()
+                    .map(|n| WatchEvent::Renamed {
+                        from: None,
+                        to: Some(n),
+                    })
+                    .collect(),
                 RenameMode::Both => {
                     let mut it = names.into_iter();
                     let from = it.next();
@@ -92,9 +107,7 @@ fn simplify(event: &Event) -> Vec<WatchEvent> {
                 _ => names.into_iter().map(WatchEvent::Modified).collect(),
             }
         }
-        EventKind::Modify(_) => {
-            names.into_iter().map(WatchEvent::Modified).collect()
-        }
+        EventKind::Modify(_) => names.into_iter().map(WatchEvent::Modified).collect(),
         _ => Vec::new(),
     }
 }

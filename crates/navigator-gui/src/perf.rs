@@ -15,10 +15,10 @@
 #![cfg(windows)]
 
 use std::ffi::c_void;
-use windows::core::{w, BOOL};
 use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
+use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
 use windows::Win32::UI::Controls::SetWindowTheme;
+use windows::core::{BOOL, w};
 
 pub fn disable_animations(hwnd: HWND) {
     if hwnd.is_invalid() {

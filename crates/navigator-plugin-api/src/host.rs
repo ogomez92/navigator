@@ -6,7 +6,7 @@
 
 use std::ffi::c_void;
 
-use crate::abi::{HostApi, Str, ABI_VERSION};
+use crate::abi::{ABI_VERSION, HostApi, Str};
 
 /// What the host has to implement for plugins to talk to it.
 pub trait HostCallbacks: Send + Sync + 'static {
@@ -16,7 +16,13 @@ pub trait HostCallbacks: Send + Sync + 'static {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogLevel { Trace, Debug, Info, Warn, Error }
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
 
 impl LogLevel {
     fn from_u8(v: u8) -> Self {

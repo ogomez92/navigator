@@ -63,7 +63,9 @@ impl RemoteCache {
         let mut p = self.root.clone();
         p.push(sanitize_component(remote_name));
         for part in sub.split(['/', '\\']) {
-            if part.is_empty() { continue; }
+            if part.is_empty() {
+                continue;
+            }
             p.push(sanitize_component(part));
         }
         if let Some(parent) = p.parent() {
@@ -84,7 +86,11 @@ impl RemoteCache {
     /// `PostMessageW` target.
     pub fn insert_record(&self, staged: PathBuf, remote: NavPath) {
         let mtime = staged.metadata().ok().and_then(|m| m.modified().ok());
-        let rec = StageRecord { remote, last_known_mtime: mtime, prompting: false };
+        let rec = StageRecord {
+            remote,
+            last_known_mtime: mtime,
+            prompting: false,
+        };
         self.records.lock().insert(staged, rec);
     }
 
@@ -93,14 +99,20 @@ impl RemoteCache {
     #[cfg(test)]
     fn should_prompt(&self, staged: &Path, new_mtime: Option<SystemTime>) -> bool {
         let mut g = self.records.lock();
-        let Some(rec) = g.get_mut(staged) else { return false };
-        if rec.prompting { return false; }
+        let Some(rec) = g.get_mut(staged) else {
+            return false;
+        };
+        if rec.prompting {
+            return false;
+        }
         let changed = match (new_mtime, rec.last_known_mtime) {
             (Some(a), Some(b)) => a > b,
             (Some(_), None) => true,
             _ => false,
         };
-        if changed { rec.prompting = true; }
+        if changed {
+            rec.prompting = true;
+        }
         changed
     }
 
@@ -124,21 +136,29 @@ impl RemoteCache {
 
     fn ensure_watcher(self: &Arc<Self>, hwnd: HwndSend) {
         let mut guard = self.watcher.lock();
-        if guard.is_some() { return; }
+        if guard.is_some() {
+            return;
+        }
 
         let records = Arc::clone(&self.records);
         let hwnd_raw: isize = hwnd.0.0 as isize;
 
         let watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-            let Ok(event) = res else { return; };
+            let Ok(event) = res else {
+                return;
+            };
             if !matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
                 return;
             }
             for path in event.paths {
                 let mtime = path.metadata().ok().and_then(|m| m.modified().ok());
                 let mut g = records.lock();
-                let Some(rec) = g.get_mut(&path) else { continue; };
-                if rec.prompting { continue; }
+                let Some(rec) = g.get_mut(&path) else {
+                    continue;
+                };
+                if rec.prompting {
+                    continue;
+                }
                 // Prompt only if the file is newer than what we last
                 // baselined (or mtime is unreadable but record exists —
                 // still likely a save).
@@ -147,7 +167,9 @@ impl RemoteCache {
                     (Some(_), None) => true,
                     _ => false,
                 };
-                if !changed { continue; }
+                if !changed {
+                    continue;
+                }
                 rec.prompting = true;
                 drop(g);
                 let payload = Box::into_raw(Box::new(path.clone())) as isize;
@@ -179,7 +201,9 @@ impl RemoteCache {
 }
 
 impl Default for RemoteCache {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Strip characters that would break a Windows path component.
@@ -197,20 +221,28 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn fake_cache() -> RemoteCache { RemoteCache::new() }
+    fn fake_cache() -> RemoteCache {
+        RemoteCache::new()
+    }
 
     #[test]
     fn stage_path_preserves_sub_layout() {
         let cache = fake_cache();
         let p = cache.stage_path_for("gdrive", "photos/2024/trip.jpg");
-        assert!(p.ends_with("gdrive/photos/2024/trip.jpg") || p.ends_with(r"gdrive\photos\2024\trip.jpg"));
+        assert!(
+            p.ends_with("gdrive/photos/2024/trip.jpg")
+                || p.ends_with(r"gdrive\photos\2024\trip.jpg")
+        );
     }
 
     #[test]
     fn stage_path_accepts_backslash_sub() {
         let cache = fake_cache();
         let p = cache.stage_path_for("mac", r"Downloads\incoming\a.txt");
-        assert!(p.ends_with("mac/Downloads/incoming/a.txt") || p.ends_with(r"mac\Downloads\incoming\a.txt"));
+        assert!(
+            p.ends_with("mac/Downloads/incoming/a.txt")
+                || p.ends_with(r"mac\Downloads\incoming\a.txt")
+        );
     }
 
     #[test]

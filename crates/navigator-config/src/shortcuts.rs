@@ -182,7 +182,10 @@ pub struct ShortcutAction {
 pub fn default_actions() -> Vec<ShortcutAction> {
     use InternalCommand::*;
     let chord = |ctrl: bool, shift: bool, alt: bool, key: &str| ShortcutChord {
-        ctrl, shift, alt, key: key.into(),
+        ctrl,
+        shift,
+        alt,
+        key: key.into(),
     };
     let internal = |name: &str, ic: InternalCommand, c: ShortcutChord| ShortcutAction {
         name: name.into(),
@@ -193,55 +196,79 @@ pub fn default_actions() -> Vec<ShortcutAction> {
         single: false,
     };
     vec![
-        internal("Copy",           Copy,         chord(true,  false, false, "C")),
-        internal("Cut",            Cut,          chord(true,  false, false, "X")),
+        internal("Copy", Copy, chord(true, false, false, "C")),
+        internal("Cut", Cut, chord(true, false, false, "X")),
         // Append-to-clipboard lives on Ctrl+Alt+C/X so Ctrl+Shift+C can
         // be the Windows-11-style "copy full path(s)" chord users expect.
-        internal("Append to copy", AppendCopy,   chord(true,  false, true,  "C")),
-        internal("Append to cut",  AppendCut,    chord(true,  false, true,  "X")),
-        internal("Paste",          Paste,        chord(true,  false, false, "V")),
-        internal("Copy paths",     CopyPaths,    chord(true,  true,  false, "C")),
-        internal("Select all",     SelectAll,    chord(true,  false, false, "A")),
-        internal("Rename",         Rename,       chord(false, false, false, "F2")),
-        internal("Refresh",        Refresh,      chord(false, false, false, "F5")),
-        internal("Toggle hidden",  ToggleHidden, chord(true,  false, false, "H")),
-        internal("Toggle system",  ToggleSystem, chord(true,  true,  false, "H")),
-        internal("Find in folder", Search,       chord(true,  false, false, "F")),
-        internal("Navigate up",    NavigateUp,   chord(false, false, true,  "Up")),
-        internal("History back",   HistBack,     chord(false, false, true,  "Left")),
-        internal("History forward",HistForward,  chord(false, false, true,  "Right")),
-        internal("Undo",           Undo,         chord(true,  false, false, "Z")),
+        internal("Append to copy", AppendCopy, chord(true, false, true, "C")),
+        internal("Append to cut", AppendCut, chord(true, false, true, "X")),
+        internal("Paste", Paste, chord(true, false, false, "V")),
+        internal("Copy paths", CopyPaths, chord(true, true, false, "C")),
+        internal("Select all", SelectAll, chord(true, false, false, "A")),
+        internal("Rename", Rename, chord(false, false, false, "F2")),
+        internal("Refresh", Refresh, chord(false, false, false, "F5")),
+        internal(
+            "Toggle hidden",
+            ToggleHidden,
+            chord(true, false, false, "H"),
+        ),
+        internal("Toggle system", ToggleSystem, chord(true, true, false, "H")),
+        internal("Find in folder", Search, chord(true, false, false, "F")),
+        internal("Navigate up", NavigateUp, chord(false, false, true, "Up")),
+        internal("History back", HistBack, chord(false, false, true, "Left")),
+        internal(
+            "History forward",
+            HistForward,
+            chord(false, false, true, "Right"),
+        ),
+        internal("Undo", Undo, chord(true, false, false, "Z")),
         // Hotspot GOTO (Ctrl+N → jump to slot N).
-        internal("Hotspot 1",  Hotspot1,  chord(true, false, false, "1")),
-        internal("Hotspot 2",  Hotspot2,  chord(true, false, false, "2")),
-        internal("Hotspot 3",  Hotspot3,  chord(true, false, false, "3")),
-        internal("Hotspot 4",  Hotspot4,  chord(true, false, false, "4")),
-        internal("Hotspot 5",  Hotspot5,  chord(true, false, false, "5")),
-        internal("Hotspot 6",  Hotspot6,  chord(true, false, false, "6")),
-        internal("Hotspot 7",  Hotspot7,  chord(true, false, false, "7")),
-        internal("Hotspot 8",  Hotspot8,  chord(true, false, false, "8")),
-        internal("Hotspot 9",  Hotspot9,  chord(true, false, false, "9")),
+        internal("Hotspot 1", Hotspot1, chord(true, false, false, "1")),
+        internal("Hotspot 2", Hotspot2, chord(true, false, false, "2")),
+        internal("Hotspot 3", Hotspot3, chord(true, false, false, "3")),
+        internal("Hotspot 4", Hotspot4, chord(true, false, false, "4")),
+        internal("Hotspot 5", Hotspot5, chord(true, false, false, "5")),
+        internal("Hotspot 6", Hotspot6, chord(true, false, false, "6")),
+        internal("Hotspot 7", Hotspot7, chord(true, false, false, "7")),
+        internal("Hotspot 8", Hotspot8, chord(true, false, false, "8")),
+        internal("Hotspot 9", Hotspot9, chord(true, false, false, "9")),
         internal("Hotspot 10", Hotspot10, chord(true, false, false, "0")),
         // Hotspot SET (Ctrl+Shift+N → save current selection to slot N).
-        internal("Set hotspot 1",  HotspotSet1,  chord(true, true, false, "1")),
-        internal("Set hotspot 2",  HotspotSet2,  chord(true, true, false, "2")),
-        internal("Set hotspot 3",  HotspotSet3,  chord(true, true, false, "3")),
-        internal("Set hotspot 4",  HotspotSet4,  chord(true, true, false, "4")),
-        internal("Set hotspot 5",  HotspotSet5,  chord(true, true, false, "5")),
-        internal("Set hotspot 6",  HotspotSet6,  chord(true, true, false, "6")),
-        internal("Set hotspot 7",  HotspotSet7,  chord(true, true, false, "7")),
-        internal("Set hotspot 8",  HotspotSet8,  chord(true, true, false, "8")),
-        internal("Set hotspot 9",  HotspotSet9,  chord(true, true, false, "9")),
-        internal("Set hotspot 10", HotspotSet10, chord(true, true, false, "0")),
+        internal("Set hotspot 1", HotspotSet1, chord(true, true, false, "1")),
+        internal("Set hotspot 2", HotspotSet2, chord(true, true, false, "2")),
+        internal("Set hotspot 3", HotspotSet3, chord(true, true, false, "3")),
+        internal("Set hotspot 4", HotspotSet4, chord(true, true, false, "4")),
+        internal("Set hotspot 5", HotspotSet5, chord(true, true, false, "5")),
+        internal("Set hotspot 6", HotspotSet6, chord(true, true, false, "6")),
+        internal("Set hotspot 7", HotspotSet7, chord(true, true, false, "7")),
+        internal("Set hotspot 8", HotspotSet8, chord(true, true, false, "8")),
+        internal("Set hotspot 9", HotspotSet9, chord(true, true, false, "9")),
+        internal(
+            "Set hotspot 10",
+            HotspotSet10,
+            chord(true, true, false, "0"),
+        ),
         // Read-only info viewers. Alt+Enter matches Explorer's Properties
         // chord; Alt+L dumps the tree as TOML in the same viewer shell.
-        internal("Show properties", ShowProperties, chord(false, false, true, "Return")),
-        internal("Dump tree",       DumpTree,       chord(false, false, true, "L")),
-        internal("New folder",      NewFolder,      chord(true,  false, false, "N")),
-        internal("Focus address bar", FocusAddress, chord(false, false, true,  "D")),
+        internal(
+            "Show properties",
+            ShowProperties,
+            chord(false, false, true, "Return"),
+        ),
+        internal("Dump tree", DumpTree, chord(false, false, true, "L")),
+        internal("New folder", NewFolder, chord(true, false, false, "N")),
+        internal(
+            "Focus address bar",
+            FocusAddress,
+            chord(false, false, true, "D"),
+        ),
         // Real Windows clipboard (CF_HDROP) — paste into Explorer etc.
-        internal("Copy to OS clipboard", CopyToClipboard, chord(false, false, true, "C")),
-        internal("Extract archive",      Extract,         chord(true,  false, false, "E")),
+        internal(
+            "Copy to OS clipboard",
+            CopyToClipboard,
+            chord(false, false, true, "C"),
+        ),
+        internal("Extract archive", Extract, chord(true, false, false, "E")),
     ]
 }
 
@@ -263,7 +290,8 @@ mod tests {
         assert!(c.alt && !c.ctrl && !c.shift);
         assert!(
             c.key.eq_ignore_ascii_case("return") || c.key.eq_ignore_ascii_case("enter"),
-            "unexpected key: {:?}", c.key,
+            "unexpected key: {:?}",
+            c.key,
         );
     }
 
@@ -271,14 +299,22 @@ mod tests {
     fn dump_tree_default_is_alt_l() {
         let c = default_chord(InternalCommand::DumpTree).expect("seeded");
         assert!(c.alt && !c.ctrl && !c.shift);
-        assert!(c.key.eq_ignore_ascii_case("l"), "unexpected key: {:?}", c.key);
+        assert!(
+            c.key.eq_ignore_ascii_case("l"),
+            "unexpected key: {:?}",
+            c.key
+        );
     }
 
     #[test]
     fn extract_default_is_ctrl_e() {
         let c = default_chord(InternalCommand::Extract).expect("seeded");
         assert!(c.ctrl && !c.shift && !c.alt);
-        assert!(c.key.eq_ignore_ascii_case("e"), "unexpected key: {:?}", c.key);
+        assert!(
+            c.key.eq_ignore_ascii_case("e"),
+            "unexpected key: {:?}",
+            c.key
+        );
     }
 
     #[test]
@@ -287,13 +323,15 @@ mod tests {
         let actions = default_actions();
         for (i, a) in actions.iter().enumerate() {
             for b in &actions[i + 1..] {
-                if a.chord.ctrl  == b.chord.ctrl
+                if a.chord.ctrl == b.chord.ctrl
                     && a.chord.shift == b.chord.shift
-                    && a.chord.alt   == b.chord.alt
+                    && a.chord.alt == b.chord.alt
                     && a.chord.key.eq_ignore_ascii_case(&b.chord.key)
                 {
-                    panic!("duplicate default chord {:?} on {:?} and {:?}",
-                           a.chord, a.name, b.name);
+                    panic!(
+                        "duplicate default chord {:?} on {:?} and {:?}",
+                        a.chord, a.name, b.name
+                    );
                 }
             }
         }

@@ -16,9 +16,8 @@
 
 use std::sync::Arc;
 
-use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT};
+use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, GetStockObject};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
     NMHDR, PROPSHEETHEADERW_V2, PROPSHEETHEADERW_V2_0, PROPSHEETHEADERW_V2_1,
@@ -27,38 +26,39 @@ use windows::Win32::UI::Controls::{
     PSH_PROPSHEETPAGE, PSN_APPLY, PSP_DLGINDIRECT, PSP_USETITLE, PropertySheetW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BS_AUTOCHECKBOX, BS_PUSHBUTTON, CreateWindowExW, GetWindowLongPtrW, HMENU, SendMessageW,
-    SetWindowLongPtrW, SetWindowTextW, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WM_COMMAND,
-    WM_INITDIALOG, WM_NOTIFY, WM_SETFONT, WS_BORDER, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
-    GetWindowTextLengthW, GetWindowTextW,
+    BS_AUTOCHECKBOX, BS_PUSHBUTTON, CreateWindowExW, GetWindowLongPtrW, GetWindowTextLengthW,
+    GetWindowTextW, HMENU, SendMessageW, SetWindowLongPtrW, SetWindowTextW, WINDOW_EX_STYLE,
+    WINDOW_LONG_PTR_INDEX, WM_COMMAND, WM_INITDIALOG, WM_NOTIFY, WM_SETFONT, WS_BORDER, WS_CHILD,
+    WS_TABSTOP, WS_VISIBLE,
 };
+use windows::core::{PCWSTR, w};
 
 use crate::app::AppState;
 
 // Offsets reserved by `DefDlgProc`. DWLP_MSGRESULT is used to return
 // PSNRET_* from PSN_APPLY handlers; DWLP_USER stores our page Data.
 const DWLP_MSGRESULT: WINDOW_LONG_PTR_INDEX = WINDOW_LONG_PTR_INDEX(0);
-const DWLP_USER:      WINDOW_LONG_PTR_INDEX = WINDOW_LONG_PTR_INDEX(16);
+const DWLP_USER: WINDOW_LONG_PTR_INDEX = WINDOW_LONG_PTR_INDEX(16);
 
 // Control IDs — scoped per page. Property-sheet child dialogs are
 // isolated so IDs can collide across pages without confusion.
-const ID_CHECK_RELATIVE: u16   = 100;
+const ID_CHECK_RELATIVE: u16 = 100;
 const ID_CHECK_NEW_BOTTOM: u16 = 101;
-const ID_CHECK_HIDDEN: u16     = 200;
-const ID_CHECK_SYSTEM: u16     = 201;
-const ID_EDIT_INTERVAL: u16    = 300;
-const ID_CHECK_PROG: u16       = 700;
-const ID_EDIT_TRANSFERS: u16   = 701;
+const ID_CHECK_HIDDEN: u16 = 200;
+const ID_CHECK_SYSTEM: u16 = 201;
+const ID_EDIT_INTERVAL: u16 = 300;
+const ID_CHECK_PROG: u16 = 700;
+const ID_EDIT_TRANSFERS: u16 = 701;
 const ID_CHECK_EXTRACT_DELETE: u16 = 800;
 const ID_CHECK_EXTRACT_FOLDER: u16 = 801;
-const ID_LIST_PLUGINS: u16     = 400;
-const ID_BTN_RELOAD: u16       = 401;
-const ID_LIST_HOTSPOTS: u16    = 500;
-const ID_BTN_HOTSPOT_CLEAR: u16     = 501;
+const ID_LIST_PLUGINS: u16 = 400;
+const ID_BTN_RELOAD: u16 = 401;
+const ID_LIST_HOTSPOTS: u16 = 500;
+const ID_BTN_HOTSPOT_CLEAR: u16 = 501;
 const ID_BTN_HOTSPOT_CLEAR_ALL: u16 = 502;
-const ID_CHECK_COL_SIZE: u16      = 600;
-const ID_CHECK_COL_TYPE: u16      = 601;
-const ID_CHECK_COL_MODIFIED: u16  = 602;
+const ID_CHECK_COL_SIZE: u16 = 600;
+const ID_CHECK_COL_TYPE: u16 = 601;
+const ID_CHECK_COL_MODIFIED: u16 = 602;
 
 /// Open the Options property sheet as a modal. Blocks until user closes.
 pub fn open(parent: HWND, state: Arc<AppState>) -> windows::core::Result<()> {
@@ -68,13 +68,13 @@ pub fn open(parent: HWND, state: Arc<AppState>) -> windows::core::Result<()> {
 
     // Titles as UTF-16, null-terminated. Owned for the life of the call
     // so the PCWSTR pointers we stash stay valid.
-    let title_general:  Vec<u16> = "General\0".encode_utf16().collect();
-    let title_view:     Vec<u16> = "View\0".encode_utf16().collect();
-    let title_columns:  Vec<u16> = "Columns\0".encode_utf16().collect();
-    let title_speech:   Vec<u16> = "Speech\0".encode_utf16().collect();
-    let title_rclone:   Vec<u16> = "Rclone\0".encode_utf16().collect();
-    let title_extract:  Vec<u16> = "Extraction\0".encode_utf16().collect();
-    let title_plugins:  Vec<u16> = "Plugins\0".encode_utf16().collect();
+    let title_general: Vec<u16> = "General\0".encode_utf16().collect();
+    let title_view: Vec<u16> = "View\0".encode_utf16().collect();
+    let title_columns: Vec<u16> = "Columns\0".encode_utf16().collect();
+    let title_speech: Vec<u16> = "Speech\0".encode_utf16().collect();
+    let title_rclone: Vec<u16> = "Rclone\0".encode_utf16().collect();
+    let title_extract: Vec<u16> = "Extraction\0".encode_utf16().collect();
+    let title_plugins: Vec<u16> = "Plugins\0".encode_utf16().collect();
     let title_hotspots: Vec<u16> = "Hotspots\0".encode_utf16().collect();
 
     let caption: Vec<u16> = "Options — navigator\0".encode_utf16().collect();
@@ -86,14 +86,62 @@ pub fn open(parent: HWND, state: Arc<AppState>) -> windows::core::Result<()> {
     let make_lparam = || LPARAM(Box::into_raw(Box::new(state.clone())) as isize);
 
     let mut pages: Vec<PROPSHEETPAGEW> = vec![
-        make_page(&page_template, &title_general,  hinstance, Some(page_general_proc),  make_lparam()),
-        make_page(&page_template, &title_view,     hinstance, Some(page_view_proc),     make_lparam()),
-        make_page(&page_template, &title_columns,  hinstance, Some(page_columns_proc),  make_lparam()),
-        make_page(&page_template, &title_speech,   hinstance, Some(page_speech_proc),   make_lparam()),
-        make_page(&page_template, &title_rclone,   hinstance, Some(page_rclone_proc),   make_lparam()),
-        make_page(&page_template, &title_extract,  hinstance, Some(page_extract_proc),  make_lparam()),
-        make_page(&page_template, &title_plugins,  hinstance, Some(page_plugins_proc),  make_lparam()),
-        make_page(&page_template, &title_hotspots, hinstance, Some(page_hotspots_proc), make_lparam()),
+        make_page(
+            &page_template,
+            &title_general,
+            hinstance,
+            Some(page_general_proc),
+            make_lparam(),
+        ),
+        make_page(
+            &page_template,
+            &title_view,
+            hinstance,
+            Some(page_view_proc),
+            make_lparam(),
+        ),
+        make_page(
+            &page_template,
+            &title_columns,
+            hinstance,
+            Some(page_columns_proc),
+            make_lparam(),
+        ),
+        make_page(
+            &page_template,
+            &title_speech,
+            hinstance,
+            Some(page_speech_proc),
+            make_lparam(),
+        ),
+        make_page(
+            &page_template,
+            &title_rclone,
+            hinstance,
+            Some(page_rclone_proc),
+            make_lparam(),
+        ),
+        make_page(
+            &page_template,
+            &title_extract,
+            hinstance,
+            Some(page_extract_proc),
+            make_lparam(),
+        ),
+        make_page(
+            &page_template,
+            &title_plugins,
+            hinstance,
+            Some(page_plugins_proc),
+            make_lparam(),
+        ),
+        make_page(
+            &page_template,
+            &title_hotspots,
+            hinstance,
+            Some(page_hotspots_proc),
+            make_lparam(),
+        ),
     ];
 
     let mut header = PROPSHEETHEADERW_V2 {
@@ -101,19 +149,29 @@ pub fn open(parent: HWND, state: Arc<AppState>) -> windows::core::Result<()> {
         dwFlags: PSH_PROPSHEETPAGE | PSH_NOAPPLYNOW | PSH_NOCONTEXTHELP,
         hwndParent: parent,
         hInstance: hinstance,
-        Anonymous1: PROPSHEETHEADERW_V2_0 { pszIcon: PCWSTR::null() },
+        Anonymous1: PROPSHEETHEADERW_V2_0 {
+            pszIcon: PCWSTR::null(),
+        },
         pszCaption: PCWSTR(caption.as_ptr()),
         nPages: pages.len() as u32,
         Anonymous2: PROPSHEETHEADERW_V2_1 { nStartPage: 0 },
-        Anonymous3: PROPSHEETHEADERW_V2_2 { ppsp: pages.as_mut_ptr() },
+        Anonymous3: PROPSHEETHEADERW_V2_2 {
+            ppsp: pages.as_mut_ptr(),
+        },
         pfnCallback: None,
-        Anonymous4: PROPSHEETHEADERW_V2_3 { pszbmWatermark: PCWSTR::null() },
+        Anonymous4: PROPSHEETHEADERW_V2_3 {
+            pszbmWatermark: PCWSTR::null(),
+        },
         hplWatermark: windows::Win32::Graphics::Gdi::HPALETTE::default(),
-        Anonymous5: PROPSHEETHEADERW_V2_4 { pszbmHeader: PCWSTR::null() },
+        Anonymous5: PROPSHEETHEADERW_V2_4 {
+            pszbmHeader: PCWSTR::null(),
+        },
     };
 
     let _hook = crate::dialog::AnimDisableHook::install();
-    unsafe { PropertySheetW(&mut header); }
+    unsafe {
+        PropertySheetW(&mut header);
+    }
     Ok(())
 }
 
@@ -131,7 +189,9 @@ fn make_page(
         Anonymous1: PROPSHEETPAGEW_0 {
             pResource: template.as_ptr() as *mut _,
         },
-        Anonymous2: PROPSHEETPAGEW_1 { pszIcon: PCWSTR::null() },
+        Anonymous2: PROPSHEETPAGEW_1 {
+            pszIcon: PCWSTR::null(),
+        },
         pszTitle: PCWSTR(title.as_ptr()),
         pfnDlgProc: proc,
         lParam: lparam,
@@ -140,7 +200,9 @@ fn make_page(
         pszHeaderTitle: PCWSTR::null(),
         pszHeaderSubTitle: PCWSTR::null(),
         hActCtx: windows::Win32::Foundation::HANDLE::default(),
-        Anonymous3: PROPSHEETPAGEW_2 { pszbmHeader: PCWSTR::null() },
+        Anonymous3: PROPSHEETPAGEW_2 {
+            pszbmHeader: PCWSTR::null(),
+        },
     }
 }
 
@@ -159,14 +221,21 @@ unsafe fn take_state_from_init(lp: LPARAM) -> Arc<AppState> {
 fn apply_font_to(h: HWND) {
     unsafe {
         let font = GetStockObject(DEFAULT_GUI_FONT);
-        SendMessageW(h, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+        SendMessageW(
+            h,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
     }
 }
 
 /// PSN_APPLY response: PSNRET_NOERROR (0) = accept, proceed.
 /// Caller must return 1 (TRUE) from the DialogProc after calling this.
 unsafe fn set_apply_ok(hwnd: HWND) {
-    unsafe { SetWindowLongPtrW(hwnd, DWLP_MSGRESULT, 0); }
+    unsafe {
+        SetWindowLongPtrW(hwnd, DWLP_MSGRESULT, 0);
+    }
 }
 
 // --- General page ---------------------------------------------------------
@@ -177,7 +246,12 @@ struct GeneralData {
     check_new_bottom: HWND,
 }
 
-unsafe extern "system" fn page_general_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) -> isize {
+unsafe extern "system" fn page_general_proc(
+    hwnd: HWND,
+    msg: u32,
+    _wp: WPARAM,
+    lp: LPARAM,
+) -> isize {
     match msg {
         WM_INITDIALOG => unsafe {
             let state = take_state_from_init(lp);
@@ -252,7 +326,11 @@ unsafe extern "system" fn page_view_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp: 
             set_check(check_system, g.general.show_system);
             drop(g);
 
-            let data = Box::new(ViewData { state, check_hidden, check_system });
+            let data = Box::new(ViewData {
+                state,
+                check_hidden,
+                check_system,
+            });
             SetWindowLongPtrW(hwnd, DWLP_USER, Box::into_raw(data) as isize);
             1
         },
@@ -269,7 +347,10 @@ unsafe extern "system" fn page_view_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp: 
                         c.general.show_system = system;
                     });
                     let _ = d.state.config.save();
-                    let filter = crate::model::Filter { show_hidden: hidden, show_system: system };
+                    let filter = crate::model::Filter {
+                        show_hidden: hidden,
+                        show_system: system,
+                    };
                     let _ = d.state.model.set_filter(filter);
                     if let Some(cwd) = d.state.model.cwd() {
                         d.state.navigate(cwd);
@@ -301,20 +382,27 @@ struct ColumnsData {
     check_modified: HWND,
 }
 
-unsafe extern "system" fn page_columns_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) -> isize {
+unsafe extern "system" fn page_columns_proc(
+    hwnd: HWND,
+    msg: u32,
+    _wp: WPARAM,
+    lp: LPARAM,
+) -> isize {
     match msg {
         WM_INITDIALOG => unsafe {
             let state = take_state_from_init(lp);
 
-            let lbl = create_label(hwnd,
+            let lbl = create_label(
+                hwnd,
                 "Name column is always shown. Toggle the others:",
-                12, 12, 420);
-            let check_size = create_checkbox(hwnd, "Show &Size column",
-                                             12, 40, ID_CHECK_COL_SIZE);
-            let check_type = create_checkbox(hwnd, "Show &Type column",
-                                             12, 68, ID_CHECK_COL_TYPE);
-            let check_modified = create_checkbox(hwnd, "Show &Modified column",
-                                                 12, 96, ID_CHECK_COL_MODIFIED);
+                12,
+                12,
+                420,
+            );
+            let check_size = create_checkbox(hwnd, "Show &Size column", 12, 40, ID_CHECK_COL_SIZE);
+            let check_type = create_checkbox(hwnd, "Show &Type column", 12, 68, ID_CHECK_COL_TYPE);
+            let check_modified =
+                create_checkbox(hwnd, "Show &Modified column", 12, 96, ID_CHECK_COL_MODIFIED);
             apply_font_to(lbl);
             apply_font_to(check_size);
             apply_font_to(check_type);
@@ -325,7 +413,12 @@ unsafe extern "system" fn page_columns_proc(hwnd: HWND, msg: u32, _wp: WPARAM, l
             set_check(check_type, cols.show_type);
             set_check(check_modified, cols.show_modified);
 
-            let data = Box::new(ColumnsData { state, check_size, check_type, check_modified });
+            let data = Box::new(ColumnsData {
+                state,
+                check_size,
+                check_type,
+                check_modified,
+            });
             SetWindowLongPtrW(hwnd, DWLP_USER, Box::into_raw(data) as isize);
             1
         },
@@ -378,8 +471,13 @@ unsafe extern "system" fn page_speech_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp
         WM_INITDIALOG => unsafe {
             let state = take_state_from_init(lp);
 
-            let label = create_label(hwnd, "Announce progress every (seconds, 0 = off):",
-                                     12, 18, 320);
+            let label = create_label(
+                hwnd,
+                "Announce progress every (seconds, 0 = off):",
+                12,
+                18,
+                320,
+            );
             let edit_interval = create_edit(hwnd, 12, 42, 80, ID_EDIT_INTERVAL);
             apply_font_to(label);
             apply_font_to(edit_interval);
@@ -388,7 +486,10 @@ unsafe extern "system" fn page_speech_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp
             set_text(edit_interval, &g.general.announce_interval_secs.to_string());
             drop(g);
 
-            let data = Box::new(SpeechData { state, edit_interval });
+            let data = Box::new(SpeechData {
+                state,
+                edit_interval,
+            });
             SetWindowLongPtrW(hwnd, DWLP_USER, Box::into_raw(data) as isize);
             1
         },
@@ -399,7 +500,9 @@ unsafe extern "system" fn page_speech_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp
                 if raw != 0 {
                     let d = &mut *(raw as *mut SpeechData);
                     let interval: u32 = get_text(d.edit_interval).parse().unwrap_or(0);
-                    d.state.config.with_mut(|c| c.general.announce_interval_secs = interval);
+                    d.state
+                        .config
+                        .with_mut(|c| c.general.announce_interval_secs = interval);
                     let _ = d.state.config.save();
                 }
                 set_apply_ok(hwnd);
@@ -432,10 +535,20 @@ unsafe extern "system" fn page_rclone_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp
         WM_INITDIALOG => unsafe {
             let state = take_state_from_init(lp);
 
-            let check_prog = create_checkbox(hwnd, "Show &progress window during operations",
-                                             12, 16, ID_CHECK_PROG);
-            let lbl = create_label(hwnd, "&Simultaneous transfers (--transfers, 1–64):",
-                                   12, 54, 320);
+            let check_prog = create_checkbox(
+                hwnd,
+                "Show &progress window during operations",
+                12,
+                16,
+                ID_CHECK_PROG,
+            );
+            let lbl = create_label(
+                hwnd,
+                "&Simultaneous transfers (--transfers, 1–64):",
+                12,
+                54,
+                320,
+            );
             let edit_transfers = create_edit(hwnd, 12, 78, 80, ID_EDIT_TRANSFERS);
             apply_font_to(check_prog);
             apply_font_to(lbl);
@@ -445,7 +558,11 @@ unsafe extern "system" fn page_rclone_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp
             set_check(check_prog, r.progress_window);
             set_text(edit_transfers, &r.transfers_clamped().to_string());
 
-            let data = Box::new(RcloneData { state, check_prog, edit_transfers });
+            let data = Box::new(RcloneData {
+                state,
+                check_prog,
+                edit_transfers,
+            });
             SetWindowLongPtrW(hwnd, DWLP_USER, Box::into_raw(data) as isize);
             1
         },
@@ -496,20 +613,37 @@ struct ExtractData {
     check_folder: HWND,
 }
 
-unsafe extern "system" fn page_extract_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) -> isize {
+unsafe extern "system" fn page_extract_proc(
+    hwnd: HWND,
+    msg: u32,
+    _wp: WPARAM,
+    lp: LPARAM,
+) -> isize {
     match msg {
         WM_INITDIALOG => unsafe {
             let state = take_state_from_init(lp);
 
-            let lbl = create_label(hwnd,
+            let lbl = create_label(
+                hwnd,
                 "Ctrl+E extracts the selected archives via 7z on PATH.",
-                12, 12, 440);
-            let check_delete = create_checkbox(hwnd,
+                12,
+                12,
+                440,
+            );
+            let check_delete = create_checkbox(
+                hwnd,
                 "&Delete archive after successful extraction",
-                12, 40, ID_CHECK_EXTRACT_DELETE);
-            let check_folder = create_checkbox(hwnd,
+                12,
+                40,
+                ID_CHECK_EXTRACT_DELETE,
+            );
+            let check_folder = create_checkbox(
+                hwnd,
                 "Wrap extracted files in a &folder when the archive has\r\nmore than one top-level entry",
-                12, 70, ID_CHECK_EXTRACT_FOLDER);
+                12,
+                70,
+                ID_CHECK_EXTRACT_FOLDER,
+            );
             apply_font_to(lbl);
             apply_font_to(check_delete);
             apply_font_to(check_folder);
@@ -518,7 +652,11 @@ unsafe extern "system" fn page_extract_proc(hwnd: HWND, msg: u32, _wp: WPARAM, l
             set_check(check_delete, e.delete_when_extracted);
             set_check(check_folder, e.create_folder);
 
-            let data = Box::new(ExtractData { state, check_delete, check_folder });
+            let data = Box::new(ExtractData {
+                state,
+                check_delete,
+                check_folder,
+            });
             SetWindowLongPtrW(hwnd, DWLP_USER, Box::into_raw(data) as isize);
             1
         },
@@ -569,13 +707,17 @@ unsafe extern "system" fn page_plugins_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp
             let dir_text = navigator_config::plugin_dir().display().to_string();
             let lbl2 = create_label(hwnd, &dir_text, 12, 32, 440);
             let list_plugins = create_listbox(hwnd, 12, 58, 440, 200, ID_LIST_PLUGINS);
-            let btn_reload = create_button(hwnd, "&Reload plugins", 12, 264, 140, 26, ID_BTN_RELOAD);
+            let btn_reload =
+                create_button(hwnd, "&Reload plugins", 12, 264, 140, 26, ID_BTN_RELOAD);
             apply_font_to(lbl1);
             apply_font_to(lbl2);
             apply_font_to(list_plugins);
             apply_font_to(btn_reload);
 
-            let data = Box::new(PluginsData { state, list_plugins });
+            let data = Box::new(PluginsData {
+                state,
+                list_plugins,
+            });
             let raw = Box::into_raw(data);
             SetWindowLongPtrW(hwnd, DWLP_USER, raw as isize);
             refresh_plugin_list(&*raw);
@@ -584,7 +726,9 @@ unsafe extern "system" fn page_plugins_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp
         WM_COMMAND => unsafe {
             let cmd = (wp.0 & 0xFFFF) as u16;
             let raw = GetWindowLongPtrW(hwnd, DWLP_USER);
-            if raw == 0 { return 0; }
+            if raw == 0 {
+                return 0;
+            }
             let d = &mut *(raw as *mut PluginsData);
             if cmd == ID_BTN_RELOAD {
                 if let Some(reg) = d.state.plugin_registry() {
@@ -618,13 +762,19 @@ unsafe extern "system" fn page_plugins_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp
 
 fn refresh_plugin_list(d: &PluginsData) {
     // LB_RESETCONTENT = 0x0184, LB_ADDSTRING = 0x0180
-    unsafe { SendMessageW(d.list_plugins, 0x0184, Some(WPARAM(0)), Some(LPARAM(0))); }
+    unsafe {
+        SendMessageW(d.list_plugins, 0x0184, Some(WPARAM(0)), Some(LPARAM(0)));
+    }
     if let Some(reg) = d.state.plugin_registry() {
         for name in reg.names() {
             let w: Vec<u16> = name.encode_utf16().chain([0]).collect();
             unsafe {
-                SendMessageW(d.list_plugins, 0x0180,
-                             Some(WPARAM(0)), Some(LPARAM(w.as_ptr() as isize)));
+                SendMessageW(
+                    d.list_plugins,
+                    0x0180,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(w.as_ptr() as isize)),
+                );
             }
         }
     }
@@ -637,27 +787,59 @@ struct HotspotsData {
     list_hotspots: HWND,
 }
 
-unsafe extern "system" fn page_hotspots_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+unsafe extern "system" fn page_hotspots_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> isize {
     match msg {
         WM_INITDIALOG => unsafe {
             let state = take_state_from_init(lp);
 
-            let lbl1 = create_label(hwnd,
+            let lbl1 = create_label(
+                hwnd,
                 "Ctrl+Shift+1..0 saves the selected entry to the matching slot",
-                12, 12, 440);
-            let lbl2 = create_label(hwnd,
+                12,
+                12,
+                440,
+            );
+            let lbl2 = create_label(
+                hwnd,
                 "(overwrites). Ctrl+1..0 jumps to that slot.",
-                12, 30, 440);
+                12,
+                30,
+                440,
+            );
             let list_hotspots = create_listbox(hwnd, 12, 54, 440, 200, ID_LIST_HOTSPOTS);
-            let btn_clear = create_button(hwnd, "&Clear selected",
-                                          12, 262, 140, 26, ID_BTN_HOTSPOT_CLEAR);
-            let btn_clear_all = create_button(hwnd, "Clear &all",
-                                              160, 262, 110, 26, ID_BTN_HOTSPOT_CLEAR_ALL);
-            apply_font_to(lbl1); apply_font_to(lbl2);
+            let btn_clear = create_button(
+                hwnd,
+                "&Clear selected",
+                12,
+                262,
+                140,
+                26,
+                ID_BTN_HOTSPOT_CLEAR,
+            );
+            let btn_clear_all = create_button(
+                hwnd,
+                "Clear &all",
+                160,
+                262,
+                110,
+                26,
+                ID_BTN_HOTSPOT_CLEAR_ALL,
+            );
+            apply_font_to(lbl1);
+            apply_font_to(lbl2);
             apply_font_to(list_hotspots);
-            apply_font_to(btn_clear); apply_font_to(btn_clear_all);
+            apply_font_to(btn_clear);
+            apply_font_to(btn_clear_all);
 
-            let data = Box::new(HotspotsData { state, list_hotspots });
+            let data = Box::new(HotspotsData {
+                state,
+                list_hotspots,
+            });
             let raw = Box::into_raw(data);
             SetWindowLongPtrW(hwnd, DWLP_USER, raw as isize);
             refresh_hotspot_list(&*raw);
@@ -666,7 +848,9 @@ unsafe extern "system" fn page_hotspots_proc(hwnd: HWND, msg: u32, wp: WPARAM, l
         WM_COMMAND => unsafe {
             let cmd = (wp.0 & 0xFFFF) as u16;
             let raw = GetWindowLongPtrW(hwnd, DWLP_USER);
-            if raw == 0 { return 0; }
+            if raw == 0 {
+                return 0;
+            }
             let d = &mut *(raw as *mut HotspotsData);
             match cmd {
                 ID_BTN_HOTSPOT_CLEAR => {
@@ -707,10 +891,10 @@ unsafe extern "system" fn page_hotspots_proc(hwnd: HWND, msg: u32, wp: WPARAM, l
 fn refresh_hotspot_list(d: &HotspotsData) {
     // LB_GETCURSEL = 0x0188, LB_SETCURSEL = 0x0186,
     // LB_RESETCONTENT = 0x0184, LB_ADDSTRING = 0x0180
-    let prev = unsafe {
-        SendMessageW(d.list_hotspots, 0x0188, Some(WPARAM(0)), Some(LPARAM(0))).0
-    };
-    unsafe { SendMessageW(d.list_hotspots, 0x0184, Some(WPARAM(0)), Some(LPARAM(0))); }
+    let prev = unsafe { SendMessageW(d.list_hotspots, 0x0188, Some(WPARAM(0)), Some(LPARAM(0))).0 };
+    unsafe {
+        SendMessageW(d.list_hotspots, 0x0184, Some(WPARAM(0)), Some(LPARAM(0)));
+    }
     let slots = d.state.config.read().hotspots.clone();
     for (i, slot) in slots.iter().enumerate() {
         let label = if slot.is_empty() {
@@ -720,26 +904,36 @@ fn refresh_hotspot_list(d: &HotspotsData) {
         };
         let w: Vec<u16> = label.encode_utf16().chain([0]).collect();
         unsafe {
-            SendMessageW(d.list_hotspots, 0x0180,
-                         Some(WPARAM(0)), Some(LPARAM(w.as_ptr() as isize)));
+            SendMessageW(
+                d.list_hotspots,
+                0x0180,
+                Some(WPARAM(0)),
+                Some(LPARAM(w.as_ptr() as isize)),
+            );
         }
     }
     if prev >= 0 && (prev as usize) < slots.len() {
         unsafe {
-            SendMessageW(d.list_hotspots, 0x0186,
-                         Some(WPARAM(prev as usize)), Some(LPARAM(0)));
+            SendMessageW(
+                d.list_hotspots,
+                0x0186,
+                Some(WPARAM(prev as usize)),
+                Some(LPARAM(0)),
+            );
         }
     }
 }
 
 fn clear_selected_hotspot(d: &HotspotsData) {
-    let idx = unsafe {
-        SendMessageW(d.list_hotspots, 0x0188, Some(WPARAM(0)), Some(LPARAM(0))).0
-    };
-    if idx < 0 { return; }
+    let idx = unsafe { SendMessageW(d.list_hotspots, 0x0188, Some(WPARAM(0)), Some(LPARAM(0))).0 };
+    if idx < 0 {
+        return;
+    }
     let idx = idx as usize;
     d.state.config.with_mut(|c| {
-        if idx < c.hotspots.len() { c.hotspots[idx].clear(); }
+        if idx < c.hotspots.len() {
+            c.hotspots[idx].clear();
+        }
     });
     let _ = d.state.config.save();
     refresh_hotspot_list(d);
@@ -747,7 +941,9 @@ fn clear_selected_hotspot(d: &HotspotsData) {
 
 fn clear_all_hotspots(d: &HotspotsData) {
     d.state.config.with_mut(|c| {
-        for slot in c.hotspots.iter_mut() { slot.clear(); }
+        for slot in c.hotspots.iter_mut() {
+            slot.clear();
+        }
     });
     let _ = d.state.config.save();
     refresh_hotspot_list(d);
@@ -765,12 +961,16 @@ fn create_checkbox(parent: HWND, text: &str, x: i32, y: i32, id: u16) -> HWND {
             windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
                 WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32,
             ),
-            x, y, 420, 22,
+            x,
+            y,
+            420,
+            22,
             Some(parent),
             Some(HMENU(id as isize as *mut std::ffi::c_void)),
             Some(GetModuleHandleW(None).unwrap().into()),
             None,
-        ).unwrap()
+        )
+        .unwrap()
     }
 }
 
@@ -782,11 +982,16 @@ fn create_label(parent: HWND, text: &str, x: i32, y: i32, w: i32) -> HWND {
             w!("STATIC"),
             PCWSTR(tw.as_ptr()),
             windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
-            x, y, w, 20,
-            Some(parent), None,
+            x,
+            y,
+            w,
+            20,
+            Some(parent),
+            None,
             Some(GetModuleHandleW(None).unwrap().into()),
             None,
-        ).unwrap()
+        )
+        .unwrap()
     }
 }
 
@@ -799,31 +1004,38 @@ fn create_edit(parent: HWND, x: i32, y: i32, w: i32, id: u16) -> HWND {
             windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
                 WS_CHILD.0 | WS_VISIBLE.0 | WS_BORDER.0 | WS_TABSTOP.0,
             ),
-            x, y, w, 22,
+            x,
+            y,
+            w,
+            22,
             Some(parent),
             Some(HMENU(id as isize as *mut std::ffi::c_void)),
             Some(GetModuleHandleW(None).unwrap().into()),
             None,
-        ).unwrap()
+        )
+        .unwrap()
     }
 }
 
 fn create_listbox(parent: HWND, x: i32, y: i32, w: i32, h: i32, id: u16) -> HWND {
     // LBS_HASSTRINGS = 0x0040, LBS_NOTIFY = 0x0001, WS_VSCROLL = 0x00200000
-    let style = WS_CHILD.0 | WS_VISIBLE.0 | WS_BORDER.0 | WS_TABSTOP.0
-        | 0x00200000 | 0x0041;
+    let style = WS_CHILD.0 | WS_VISIBLE.0 | WS_BORDER.0 | WS_TABSTOP.0 | 0x00200000 | 0x0041;
     unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             w!("LISTBOX"),
             w!(""),
             windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(style),
-            x, y, w, h,
+            x,
+            y,
+            w,
+            h,
             Some(parent),
             Some(HMENU(id as isize as *mut std::ffi::c_void)),
             Some(GetModuleHandleW(None).unwrap().into()),
             None,
-        ).unwrap()
+        )
+        .unwrap()
     }
 }
 
@@ -837,12 +1049,16 @@ fn create_button(parent: HWND, text: &str, x: i32, y: i32, w: i32, h: i32, id: u
             windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
                 WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
             ),
-            x, y, w, h,
+            x,
+            y,
+            w,
+            h,
             Some(parent),
             Some(HMENU(id as isize as *mut std::ffi::c_void)),
             Some(GetModuleHandleW(None).unwrap().into()),
             None,
-        ).unwrap()
+        )
+        .unwrap()
     }
 }
 
@@ -851,29 +1067,38 @@ fn create_button(parent: HWND, text: &str, x: i32, y: i32, w: i32, h: i32, id: u
 fn set_check(hwnd: HWND, on: bool) {
     // BM_SETCHECK = 0x00F1
     unsafe {
-        SendMessageW(hwnd, 0x00F1, Some(WPARAM(if on { 1 } else { 0 })), Some(LPARAM(0)));
+        SendMessageW(
+            hwnd,
+            0x00F1,
+            Some(WPARAM(if on { 1 } else { 0 })),
+            Some(LPARAM(0)),
+        );
     }
 }
 
 fn get_check(hwnd: HWND) -> bool {
     // BM_GETCHECK = 0x00F0, BST_CHECKED = 1
-    unsafe {
-        SendMessageW(hwnd, 0x00F0, Some(WPARAM(0)), Some(LPARAM(0))).0 == 1
-    }
+    unsafe { SendMessageW(hwnd, 0x00F0, Some(WPARAM(0)), Some(LPARAM(0))).0 == 1 }
 }
 
 fn set_text(hwnd: HWND, s: &str) {
     let w: Vec<u16> = s.encode_utf16().chain([0]).collect();
-    unsafe { let _ = SetWindowTextW(hwnd, PCWSTR(w.as_ptr())); }
+    unsafe {
+        let _ = SetWindowTextW(hwnd, PCWSTR(w.as_ptr()));
+    }
 }
 
 fn get_text(hwnd: HWND) -> String {
     unsafe {
         let len = GetWindowTextLengthW(hwnd);
-        if len <= 0 { return String::new(); }
+        if len <= 0 {
+            return String::new();
+        }
         let mut buf = vec![0u16; (len + 1) as usize];
         let got = GetWindowTextW(hwnd, &mut buf);
-        if got <= 0 { return String::new(); }
+        if got <= 0 {
+            return String::new();
+        }
         String::from_utf16_lossy(&buf[..got as usize])
     }
 }

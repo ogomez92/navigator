@@ -31,7 +31,11 @@ pub fn expand(template: &str, target: &Path, is_dir: bool) -> String {
 /// Expand every arg in `action.args` against `target`. Returns owned
 /// strings so the caller can push them into `std::process::Command`.
 pub fn expand_args(action: &ShortcutAction, target: &Path, is_dir: bool) -> Vec<String> {
-    action.args.iter().map(|a| expand(a, target, is_dir)).collect()
+    action
+        .args
+        .iter()
+        .map(|a| expand(a, target, is_dir))
+        .collect()
 }
 
 /// Launch the configured program. Probes `target` with `Path::is_dir` to

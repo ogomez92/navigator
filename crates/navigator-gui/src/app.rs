@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::thread;
 
-use crossbeam_channel::{unbounded, Sender};
+use crossbeam_channel::{Sender, unbounded};
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use tracing::{error, warn};
@@ -14,7 +14,7 @@ use navigator_config::ConfigHandle;
 use navigator_core::NavPath;
 use navigator_fs::read_dir;
 use navigator_plugin_api::host::HostCallbacks;
-use navigator_rclone::{op::OpEvent, Operation, OverwritePolicy, RcloneDriver};
+use navigator_rclone::{Operation, OverwritePolicy, RcloneDriver, op::OpEvent};
 
 use crate::plugins::{Host as PluginHost, PluginRegistry};
 use crate::remote_cache::RemoteCache;
@@ -23,8 +23,8 @@ use crate::history::History;
 use crate::model::{Filter, Model};
 use crate::speech::SpeechSink;
 use crate::window::{
-    create as create_window, run_message_loop, HwndSend,
-    WMAPP_DIR_ERROR, WMAPP_DIR_LISTED, WMAPP_SEARCH_RESULTS,
+    HwndSend, WMAPP_DIR_ERROR, WMAPP_DIR_LISTED, WMAPP_SEARCH_RESULTS, create as create_window,
+    run_message_loop,
 };
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -48,7 +48,11 @@ impl AppConfig {
 
 enum ScanCmd {
     List(NavPath, HwndSend),
-    Search { root: NavPath, query: String, hwnd: HwndSend },
+    Search {
+        root: NavPath,
+        query: String,
+        hwnd: HwndSend,
+    },
     #[allow(dead_code)]
     Shutdown,
 }
@@ -209,7 +213,9 @@ impl AppState {
             .name("navigator-plugin-nav".into())
             .spawn(move || {
                 while let Ok(p) = nav_rx.recv() {
-                    let Some(s) = weak.upgrade() else { break; };
+                    let Some(s) = weak.upgrade() else {
+                        break;
+                    };
                     s.navigate(p);
                 }
             })
@@ -232,7 +238,9 @@ impl AppState {
     /// the single row, which forces the control to re-query that row via
     /// `LVN_GETDISPINFO`.
     pub fn invalidate_row(&self, vis_idx: usize) {
-        let Some(h) = self.hwnd() else { return; };
+        let Some(h) = self.hwnd() else {
+            return;
+        };
         // LVM_REDRAWITEMS = 0x1015. wParam = first, lParam = last.
         // ListView handle is a child of the main window; we post to the
         // main hwnd which routes to the listview via its registered id.
@@ -259,10 +267,17 @@ impl AppState {
             *self.watcher.lock() = None;
             return;
         }
-        let Some(hwnd) = self.hwnd() else { return; };
+        let Some(hwnd) = self.hwnd() else {
+            return;
+        };
         match crate::watcher::watch(path.clone(), hwnd) {
-            Ok(w) => { *self.watcher.lock() = Some(w); }
-            Err(e) => { warn!("file watcher failed: {e}"); *self.watcher.lock() = None; }
+            Ok(w) => {
+                *self.watcher.lock() = Some(w);
+            }
+            Err(e) => {
+                warn!("file watcher failed: {e}");
+                *self.watcher.lock() = None;
+            }
         }
     }
 
@@ -270,8 +285,12 @@ impl AppState {
     pub fn on_watch_event(&self, root: NavPath, ev: crate::watcher::WatchEvent) {
         // Only consume events for the currently-displayed directory; a
         // stale event from a previous cwd should not mutate the new view.
-        if self.model.cwd().as_ref() != Some(&root) { return; }
-        if self.model.is_search_mode() { return; }
+        if self.model.cwd().as_ref() != Some(&root) {
+            return;
+        }
+        if self.model.is_search_mode() {
+            return;
+        }
 
         let append_mode = self.config.read().general.new_items_at_bottom;
 
@@ -299,7 +318,9 @@ impl AppState {
                 }
             }
             crate::watcher::WatchEvent::Renamed { from, to } => {
-                if let Some(f) = from { self.model.remove_by_name(&f); }
+                if let Some(f) = from {
+                    self.model.remove_by_name(&f);
+                }
                 if let Some(t) = to {
                     if let Some(e) = single_entry(&root, &t) {
                         if append_mode {
@@ -320,13 +341,22 @@ impl AppState {
 
     /// Run a shortcut action against the currently focused / selected entry.
     pub fn run_action(&self, action: &navigator_config::ShortcutAction) {
-        tracing::info!("run_action: {:?} cmd={:?} args={:?}", action.name, action.command, action.args);
+        tracing::info!(
+            "run_action: {:?} cmd={:?} args={:?}",
+            action.name,
+            action.command,
+            action.args
+        );
         let mut paths = self.model.selected_paths();
         tracing::info!("run_action: {} selected path(s)", paths.len());
         if paths.is_empty() {
             // Fall back to the focused row if there is no selection.
             let sel = self.model.selection_snapshot();
-            tracing::info!("run_action: selection snapshot focus={:?} len={}", sel.focus(), sel.len());
+            tracing::info!(
+                "run_action: selection snapshot focus={:?} len={}",
+                sel.focus(),
+                sel.len()
+            );
             if let (Some(idx), Some(cwd)) = (sel.focus(), self.model.cwd()) {
                 if let Some(e) = self.model.get(idx) {
                     let p = cwd.join(&e.name);
@@ -340,27 +370,47 @@ impl AppState {
             self.say("nothing selected", false);
             return;
         }
-        let targets: &[NavPath] = if action.single { &paths[..1] } else { &paths[..] };
+        let targets: &[NavPath] = if action.single {
+            &paths[..1]
+        } else {
+            &paths[..]
+        };
         for p in targets {
-            tracing::info!("run_action: spawning {:?} for target {:?}", action.command, p.to_string());
+            tracing::info!(
+                "run_action: spawning {:?} for target {:?}",
+                action.command,
+                p.to_string()
+            );
             match crate::actions::spawn_action(action, p) {
                 Ok(()) => tracing::info!("run_action: spawn OK"),
                 Err(e) => {
                     error!("action {:?} failed: {}", action.name, e);
-                    crate::dialogs::show_error(self.hwnd(), "Action failed", &format!("{}: {}", action.name, e));
+                    crate::dialogs::show_error(
+                        self.hwnd(),
+                        "Action failed",
+                        &format!("{}: {}", action.name, e),
+                    );
                 }
             }
         }
     }
 
-    pub fn set_hwnd(&self, hwnd: HWND) { *self.hwnd.lock() = Some(HwndSend(hwnd)); }
-    fn hwnd(&self) -> Option<HwndSend> { *self.hwnd.lock() }
+    pub fn set_hwnd(&self, hwnd: HWND) {
+        *self.hwnd.lock() = Some(HwndSend(hwnd));
+    }
+    fn hwnd(&self) -> Option<HwndSend> {
+        *self.hwnd.lock()
+    }
 
     /// Public accessor for the main-window HWND. Modules that schedule
     /// UI-thread work (accelerator rebuild, error dialogs) need it.
-    pub fn main_hwnd(&self) -> Option<HWND> { self.hwnd().map(|h| h.0) }
+    pub fn main_hwnd(&self) -> Option<HWND> {
+        self.hwnd().map(|h| h.0)
+    }
 
-    pub fn say(&self, text: &str, interrupt: bool) { self.speech.say(text, interrupt); }
+    pub fn say(&self, text: &str, interrupt: bool) {
+        self.speech.say(text, interrupt);
+    }
 
     pub fn navigate(&self, path: NavPath) {
         let Some(hwnd) = self.hwnd() else {
@@ -462,7 +512,10 @@ impl AppState {
     /// the virtual "This PC" view. Reuses the same `pending_focus` slot
     /// as `navigate_up`, which the dir-listed handler consumes.
     pub fn jump_to(&self, target: NavPath) {
-        if target.is_this_pc() { self.navigate(target); return; }
+        if target.is_this_pc() {
+            self.navigate(target);
+            return;
+        }
         let parent = target.parent().unwrap_or_else(NavPath::this_pc);
         *self.pending_focus.lock() = Some(target);
         self.navigate(parent);
@@ -509,16 +562,30 @@ impl AppState {
         let paths = self.model.selected_paths();
         let target = match paths.len() {
             1 => paths.into_iter().next().unwrap(),
-            0 => { self.say("nothing selected, cannot set hotspot", false); return; }
-            n => { self.say(&format!("{} items selected, hotspot needs exactly one", n), false); return; }
+            0 => {
+                self.say("nothing selected, cannot set hotspot", false);
+                return;
+            }
+            n => {
+                self.say(
+                    &format!("{} items selected, hotspot needs exactly one", n),
+                    false,
+                );
+                return;
+            }
         };
 
         let display = target.to_string();
         self.config.with_mut(|c| {
-            if idx < c.hotspots.len() { c.hotspots[idx] = display.clone(); }
+            if idx < c.hotspots.len() {
+                c.hotspots[idx] = display.clone();
+            }
         });
         let _ = self.config.save();
-        self.say(&format!("hotspot {} set to {}", slot, target.file_name()), false);
+        self.say(
+            &format!("hotspot {} set to {}", slot, target.file_name()),
+            false,
+        );
     }
 
     pub fn navigate_up(&self) {
@@ -565,7 +632,9 @@ impl AppState {
     /// columns from current config. Used after the Options → Columns
     /// page commits a change.
     pub fn reconfigure_listview_columns(&self) {
-        let Some(h) = self.hwnd() else { return; };
+        let Some(h) = self.hwnd() else {
+            return;
+        };
         unsafe {
             let _ = PostMessageW(
                 Some(h.0),
@@ -582,11 +651,16 @@ impl AppState {
         let mut filter = self.model.filter();
         filter.show_hidden = !filter.show_hidden;
         let count = self.model.set_filter(filter);
-        self.config.with_mut(|c| c.general.show_hidden = filter.show_hidden);
+        self.config
+            .with_mut(|c| c.general.show_hidden = filter.show_hidden);
         let _ = self.config.save();
         self.refresh_count_on_control(count);
         self.say(
-            if filter.show_hidden { "showing hidden files" } else { "hiding hidden files" },
+            if filter.show_hidden {
+                "showing hidden files"
+            } else {
+                "hiding hidden files"
+            },
             false,
         );
     }
@@ -597,13 +671,19 @@ impl AppState {
         self.model.set_sort(s);
         self.config.with_mut(|c| c.general.sort_mode = mode);
         let _ = self.config.save();
-        self.say(&format!("sort by {}", match mode {
-            navigator_config::SortMode::Name => "name",
-            navigator_config::SortMode::Size => "size",
-            navigator_config::SortMode::Type => "type",
-            navigator_config::SortMode::Modified => "date modified",
-            navigator_config::SortMode::Created => "date created",
-        }), false);
+        self.say(
+            &format!(
+                "sort by {}",
+                match mode {
+                    navigator_config::SortMode::Name => "name",
+                    navigator_config::SortMode::Size => "size",
+                    navigator_config::SortMode::Type => "type",
+                    navigator_config::SortMode::Modified => "date modified",
+                    navigator_config::SortMode::Created => "date created",
+                }
+            ),
+            false,
+        );
         self.refresh();
     }
 
@@ -611,9 +691,17 @@ impl AppState {
         let mut s = self.model.sort();
         s.descending = !s.descending;
         self.model.set_sort(s);
-        self.config.with_mut(|c| c.general.sort_descending = s.descending);
+        self.config
+            .with_mut(|c| c.general.sort_descending = s.descending);
         let _ = self.config.save();
-        self.say(if s.descending { "descending" } else { "ascending" }, false);
+        self.say(
+            if s.descending {
+                "descending"
+            } else {
+                "ascending"
+            },
+            false,
+        );
         self.refresh();
     }
 
@@ -621,7 +709,9 @@ impl AppState {
     /// substring match on file/directory names). Runs on the scan worker
     /// thread; results land back via WMAPP_SEARCH_RESULTS.
     pub fn start_search(&self, root: NavPath, query: String) {
-        let Some(hwnd) = self.hwnd() else { return; };
+        let Some(hwnd) = self.hwnd() else {
+            return;
+        };
         let _ = self.scan_tx.send(ScanCmd::Search { root, query, hwnd });
         self.say("searching", false);
     }
@@ -630,11 +720,16 @@ impl AppState {
         let mut filter = self.model.filter();
         filter.show_system = !filter.show_system;
         let count = self.model.set_filter(filter);
-        self.config.with_mut(|c| c.general.show_system = filter.show_system);
+        self.config
+            .with_mut(|c| c.general.show_system = filter.show_system);
         let _ = self.config.save();
         self.refresh_count_on_control(count);
         self.say(
-            if filter.show_system { "showing system files" } else { "hiding system files" },
+            if filter.show_system {
+                "showing system files"
+            } else {
+                "hiding system files"
+            },
             false,
         );
     }
@@ -644,7 +739,9 @@ impl AppState {
     fn refresh_count_on_control(&self, _count: usize) {
         // Simplest path: just re-emit the current scan by navigating to it
         // again. Cheap because `read_dir` at the cwd is already hot cache.
-        if let Some(cwd) = self.model.cwd() { self.navigate(cwd); }
+        if let Some(cwd) = self.model.cwd() {
+            self.navigate(cwd);
+        }
     }
 
     pub fn open_file(&self, path: NavPath) {
@@ -661,12 +758,16 @@ impl AppState {
     /// `RemoteCache` arms its watcher so post-open edits can prompt an
     /// upload back.
     fn open_remote_file(&self, remote: NavPath) {
-        let Some((name, sub)) = remote.remote_parts() else { return; };
+        let Some((name, sub)) = remote.remote_parts() else {
+            return;
+        };
         if sub.is_empty() {
             self.say("can't open a remote root as a file", true);
             return;
         }
-        let Some(hwnd) = self.hwnd() else { return; };
+        let Some(hwnd) = self.hwnd() else {
+            return;
+        };
 
         let staged = self.remote_cache.stage_path_for(&name, &sub);
         let Ok(staged_nav) = NavPath::new(staged.clone()) else {
@@ -687,7 +788,10 @@ impl AppState {
         std::thread::Builder::new()
             .name("navigator-remote-open".into())
             .spawn(move || {
-                let op = Operation::CopyTo { src: remote_for_thread.clone(), dst: staged_nav };
+                let op = Operation::CopyTo {
+                    src: remote_for_thread.clone(),
+                    dst: staged_nav,
+                };
                 let handle = match rclone.spawn(op) {
                     Ok(h) => h,
                     Err(e) => {
@@ -700,19 +804,32 @@ impl AppState {
                 };
                 let mut success = false;
                 for ev in handle.events.iter() {
-                    if let OpEvent::Done { success: ok, stderr_tail } = ev {
+                    if let OpEvent::Done {
+                        success: ok,
+                        stderr_tail,
+                    } = ev
+                    {
                         success = ok;
                         if !ok {
                             let tail = stderr_tail.lines().next_back().unwrap_or("").to_string();
                             let _ = speech.send(crate::speech::Utterance {
-                                text: format!("download failed: {}", if tail.is_empty() { "see log".into() } else { tail }),
+                                text: format!(
+                                    "download failed: {}",
+                                    if tail.is_empty() {
+                                        "see log".into()
+                                    } else {
+                                        tail
+                                    }
+                                ),
                                 interrupt: true,
                             });
                         }
                         break;
                     }
                 }
-                if !success { return; }
+                if !success {
+                    return;
+                }
 
                 cache.register(staged.clone(), remote_for_thread.clone(), hwnd);
                 let _ = speech.send(crate::speech::Utterance {
@@ -749,12 +866,13 @@ impl AppState {
                     false,
                 );
             }
-            UndoAction::Paste { created, originals, cut_mode } => {
+            UndoAction::Paste {
+                created,
+                originals,
+                cut_mode,
+            } => {
                 self.say(
-                    &format!(
-                        "undo: reverting paste of {} items",
-                        created.len(),
-                    ),
+                    &format!("undo: reverting paste of {} items", created.len(),),
                     false,
                 );
                 let state = self.clone_for_worker();
@@ -779,7 +897,10 @@ impl AppState {
 
     pub fn op_copy(&self) {
         let paths = self.model.selected_paths();
-        if paths.is_empty() { self.say("nothing selected", false); return; }
+        if paths.is_empty() {
+            self.say("nothing selected", false);
+            return;
+        }
         let n = paths.len();
         let sources: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
         let prev = crate::clipboard::load_clip();
@@ -800,7 +921,10 @@ impl AppState {
 
     pub fn op_cut(&self) {
         let paths = self.model.selected_paths();
-        if paths.is_empty() { self.say("nothing selected", false); return; }
+        if paths.is_empty() {
+            self.say("nothing selected", false);
+            return;
+        }
         let n = paths.len();
         let sources: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
         let prev = crate::clipboard::load_clip();
@@ -826,7 +950,10 @@ impl AppState {
     /// no sensible semantics.
     pub fn op_append_clipboard(&self, cut_mode: bool) {
         let incoming = self.model.selected_paths();
-        if incoming.is_empty() { self.say("nothing selected", false); return; }
+        if incoming.is_empty() {
+            self.say("nothing selected", false);
+            return;
+        }
 
         let mut clip = crate::clipboard::load_clip();
         let prev = clip.clone();
@@ -841,7 +968,11 @@ impl AppState {
             };
             crate::clipboard::save_clip(&clip);
             crate::clipboard::push_history(crate::clipboard::HistoryEntry {
-                kind: if cut_mode { "cut".into() } else { "copy".into() },
+                kind: if cut_mode {
+                    "cut".into()
+                } else {
+                    "copy".into()
+                },
                 sources: incoming_s,
                 dest: None,
                 ts: crate::clipboard::now_ts(),
@@ -872,7 +1003,11 @@ impl AppState {
         crate::clipboard::save_clip(&clip);
         if added > 0 {
             crate::clipboard::push_history(crate::clipboard::HistoryEntry {
-                kind: if cut_mode { "append-cut".into() } else { "append-copy".into() },
+                kind: if cut_mode {
+                    "append-cut".into()
+                } else {
+                    "append-copy".into()
+                },
                 sources: added_paths,
                 dest: None,
                 ts: crate::clipboard::now_ts(),
@@ -891,16 +1026,26 @@ impl AppState {
     }
 
     pub fn op_paste(&self) {
-        let Some(dest) = self.model.cwd() else { return; };
+        let Some(dest) = self.model.cwd() else {
+            return;
+        };
         let clip = crate::clipboard::load_clip();
-        if clip.sources.is_empty() { self.say("clipboard empty", false); return; }
+        if clip.sources.is_empty() {
+            self.say("clipboard empty", false);
+            return;
+        }
 
         // Rehydrate string paths to NavPaths; skip any that are no longer
         // absolute (manually-edited file, mount unplugged, etc.).
-        let sources: Vec<NavPath> = clip.sources.iter()
+        let sources: Vec<NavPath> = clip
+            .sources
+            .iter()
             .filter_map(|s| NavPath::new(PathBuf::from(s)).ok())
             .collect();
-        if sources.is_empty() { self.say("clipboard paths invalid", false); return; }
+        if sources.is_empty() {
+            self.say("clipboard paths invalid", false);
+            return;
+        }
 
         crate::clipboard::push_history(crate::clipboard::HistoryEntry {
             kind: "paste".into(),
@@ -913,9 +1058,7 @@ impl AppState {
         // paste even if it's still in flight. `run_batch` may skip
         // individual items on user "Skip" — the undo attempt will just
         // no-op on those missing paths.
-        let created: Vec<NavPath> = sources.iter()
-            .map(|s| dest.join(s.file_name()))
-            .collect();
+        let created: Vec<NavPath> = sources.iter().map(|s| dest.join(s.file_name())).collect();
         self.push_undo(UndoAction::Paste {
             created,
             originals: sources.clone(),
@@ -935,7 +1078,10 @@ impl AppState {
 
     pub fn op_delete(&self) {
         let paths = self.model.selected_paths();
-        if paths.is_empty() { self.say("nothing selected", false); return; }
+        if paths.is_empty() {
+            self.say("nothing selected", false);
+            return;
+        }
         crate::clipboard::push_history(crate::clipboard::HistoryEntry {
             kind: "delete".into(),
             sources: paths.iter().map(|p| p.to_string()).collect(),
@@ -981,7 +1127,10 @@ impl AppState {
         let mut pairs: Vec<(NavPath, NavPath)> = Vec::with_capacity(local.len());
         for p in &local {
             let Some(trash_dir) = make_trash_dir_on_volume_of(p) else {
-                self.say(&format!("failed to create trash dir for {}", p.file_name()), true);
+                self.say(
+                    &format!("failed to create trash dir for {}", p.file_name()),
+                    true,
+                );
                 continue;
             };
             let trash_path = trash_dir.join(p.file_name());
@@ -991,7 +1140,9 @@ impl AppState {
             self.say("delete targets resolved to nothing", true);
             return;
         }
-        self.push_undo(UndoAction::Delete { pairs: pairs.clone() });
+        self.push_undo(UndoAction::Delete {
+            pairs: pairs.clone(),
+        });
 
         let state = self.clone_for_worker();
         std::thread::Builder::new()
@@ -1016,9 +1167,13 @@ impl AppState {
         let mut entries: Vec<(PathBuf, String, u64)> = Vec::new();
         let mut total: u64 = 0;
         for d in drives {
-            let Some(root_str) = navigator_fs::drive_path_from_display(&d.name) else { continue; };
+            let Some(root_str) = navigator_fs::drive_path_from_display(&d.name) else {
+                continue;
+            };
             let trash = PathBuf::from(&root_str).join(".trash");
-            if !trash.exists() { continue; }
+            if !trash.exists() {
+                continue;
+            }
             let nav = match NavPath::new(&trash) {
                 Ok(n) => n,
                 Err(_) => continue,
@@ -1119,7 +1274,9 @@ impl AppState {
                 let mut ok_count = 0usize;
                 let mut fail_count = 0usize;
                 for t in &targets {
-                    let op = Operation::Delete { targets: vec![t.clone()] };
+                    let op = Operation::Delete {
+                        targets: vec![t.clone()],
+                    };
                     let handle = match rclone.spawn(op) {
                         Ok(h) => h,
                         Err(e) => {
@@ -1133,7 +1290,11 @@ impl AppState {
                     };
                     for ev in handle.events.iter() {
                         if let OpEvent::Done { success, .. } = ev {
-                            if success { ok_count += 1; } else { fail_count += 1; }
+                            if success {
+                                ok_count += 1;
+                            } else {
+                                fail_count += 1;
+                            }
                             break;
                         }
                     }
@@ -1148,7 +1309,9 @@ impl AppState {
                 });
                 if let Some(state) = state_weak.upgrade() {
                     if let (Some(cwd), Some(parent)) = (state.model.cwd(), parent_hint) {
-                        if cwd == parent { state.refresh(); }
+                        if cwd == parent {
+                            state.refresh();
+                        }
                     }
                 }
             })
@@ -1165,7 +1328,9 @@ impl AppState {
         let cwd = self.model.cwd()?;
         let sel = self.model.selection_snapshot();
         let total = self.model.len();
-        if total == 0 || sel.is_empty() { return None; }
+        if total == 0 || sel.is_empty() {
+            return None;
+        }
 
         let selected: std::collections::HashSet<usize> = sel.iter().collect();
         let min_sel = selected.iter().min().copied()?;
@@ -1199,16 +1364,14 @@ impl AppState {
             self.say("history entry no longer exists", false);
             return;
         };
-        let (present, missing): (Vec<String>, Vec<String>) = entry.sources
+        let (present, missing): (Vec<String>, Vec<String>) = entry
+            .sources
             .iter()
             .cloned()
             .partition(|p| std::path::Path::new(p).exists());
         if present.is_empty() {
             self.say(
-                &format!(
-                    "all {} paths missing; clipboard unchanged",
-                    missing.len(),
-                ),
+                &format!("all {} paths missing; clipboard unchanged", missing.len(),),
                 false,
             );
             return;
@@ -1222,12 +1385,16 @@ impl AppState {
         });
         self.push_undo(UndoAction::ClipChange { prev });
         if missing.is_empty() {
-            self.say(&format!("{} items restored to clipboard", present.len()), false);
+            self.say(
+                &format!("{} items restored to clipboard", present.len()),
+                false,
+            );
         } else {
             self.say(
                 &format!(
                     "{} items restored, {} missing skipped",
-                    present.len(), missing.len(),
+                    present.len(),
+                    missing.len(),
                 ),
                 false,
             );
@@ -1240,11 +1407,17 @@ impl AppState {
     fn clone_for_worker(&self) -> WorkerCtx {
         let (progress_on, announce_interval_secs, transfers) = {
             let g = self.config.read();
-            (g.rclone.progress_window, g.general.announce_interval_secs, g.rclone.transfers_clamped())
+            (
+                g.rclone.progress_window,
+                g.general.announce_interval_secs,
+                g.rclone.transfers_clamped(),
+            )
         };
         let progress = if progress_on {
             self.hwnd().and_then(|h| crate::progress::open(h.0).ok())
-        } else { None };
+        } else {
+            None
+        };
         // Rebuild the driver each spawn with the current `--transfers`
         // so a config change inside Options takes effect on the next op
         // without needing to restart the app.
@@ -1270,7 +1443,8 @@ impl AppState {
             self.say("nothing selected", false);
             return;
         }
-        let text = paths.iter()
+        let text = paths
+            .iter()
             .map(|p| {
                 let s = p.to_string();
                 if s.chars().any(|c| c.is_whitespace()) {
@@ -1295,6 +1469,54 @@ impl AppState {
             Err(e) => {
                 self.say(&format!("clipboard failed: {}", e), true);
             }
+        }
+    }
+
+    /// Spawn a fresh navigator instance pointed at the *containing folder*
+    /// of the focused entry, then announce. Used by Ctrl+Enter — handy in
+    /// search results where each row may live in a different subdirectory.
+    /// Remote paths translate back to `name:sub` form via `rclone_arg` so
+    /// the new instance picks the path up via the same syntax the address
+    /// bar accepts.
+    pub fn op_open_containing_new_window(&self) {
+        let sel = self.model.selection_snapshot();
+        let Some(idx) = sel.focus() else {
+            self.say("nothing focused", false);
+            return;
+        };
+        let Some(entry) = self.model.get(idx) else {
+            return;
+        };
+        let Some(cwd) = self.model.cwd() else {
+            return;
+        };
+        if cwd.is_this_pc() || cwd.is_remotes_root() {
+            self.say("no containing folder here", false);
+            return;
+        }
+        let full = cwd.join(&entry.name);
+        let Some(parent) = full.parent() else {
+            self.say("no parent folder", false);
+            return;
+        };
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                self.say(&format!("locate exe failed: {}", e), true);
+                return;
+            }
+        };
+        let arg = if parent.is_remote() {
+            match parent.rclone_arg() {
+                Some(s) => s,
+                None => parent.to_string(),
+            }
+        } else {
+            parent.to_string()
+        };
+        match std::process::Command::new(&exe).arg(&arg).spawn() {
+            Ok(_) => self.say("opened in new window", false),
+            Err(e) => self.say(&format!("new window failed: {}", e), true),
         }
     }
 
@@ -1346,10 +1568,8 @@ impl AppState {
             self.say("nothing selected", false);
             return;
         }
-        let local: Vec<navigator_core::NavPath> = selection
-            .into_iter()
-            .filter(|p| !p.is_remote())
-            .collect();
+        let local: Vec<navigator_core::NavPath> =
+            selection.into_iter().filter(|p| !p.is_remote()).collect();
         let extractable = crate::extract::filter_extractable(&local);
         if extractable.is_empty() {
             self.say("no extractable archives selected", true);
@@ -1358,7 +1578,10 @@ impl AppState {
         let seven_zip = match crate::extract::find_7z() {
             Some(p) => p,
             None => {
-                self.say("7z not found on PATH; install 7-Zip to extract archives", true);
+                self.say(
+                    "7z not found on PATH; install 7-Zip to extract archives",
+                    true,
+                );
                 return;
             }
         };
@@ -1377,15 +1600,21 @@ impl AppState {
     /// come from a worker thread so a giant tree doesn't freeze the UI;
     /// the viewer only opens once the scan finishes.
     pub fn op_show_properties(&self) {
-        let Some(cwd) = self.model.cwd() else { return; };
+        let Some(cwd) = self.model.cwd() else {
+            return;
+        };
         let sel = self.model.selection_snapshot();
         let Some(idx) = sel.focus() else {
             self.say("no item focused", false);
             return;
         };
-        let Some(entry) = self.model.get(idx) else { return; };
+        let Some(entry) = self.model.get(idx) else {
+            return;
+        };
         let path = cwd.join(&entry.name);
-        let Some(hwnd) = self.hwnd() else { return; };
+        let Some(hwnd) = self.hwnd() else {
+            return;
+        };
 
         let is_dir = entry.is_dir();
         let title = format!("Properties — {}", entry.name);
@@ -1431,7 +1660,9 @@ impl AppState {
     /// if a file is focused) and show the TOML tree dump in the viewer.
     /// Runs on a worker thread for the same reason as properties.
     pub fn op_dump_tree(&self) {
-        let Some(cwd) = self.model.cwd() else { return; };
+        let Some(cwd) = self.model.cwd() else {
+            return;
+        };
         let sel = self.model.selection_snapshot();
         // Prefer the focused entry if it's a directory; otherwise dump
         // the current folder itself.
@@ -1445,9 +1676,18 @@ impl AppState {
             self.say("can't dump This PC", true);
             return;
         }
-        let Some(hwnd) = self.hwnd() else { return; };
+        let Some(hwnd) = self.hwnd() else {
+            return;
+        };
         let label = target.file_name().to_string();
-        let title = format!("Tree — {}", if label.is_empty() { target.to_string() } else { label });
+        let title = format!(
+            "Tree — {}",
+            if label.is_empty() {
+                target.to_string()
+            } else {
+                label
+            }
+        );
         self.say("dumping tree…", false);
         std::thread::Builder::new()
             .name("navigator-dump-tree".into())
@@ -1462,7 +1702,9 @@ impl AppState {
     /// `pending_focus` so the caret lands on the renamed row after the
     /// post-op refresh — without it the listing rebuild defaults to row 0.
     pub fn op_rename(&self, old_name: &str, new_name: &str) {
-        let Some(cwd) = self.model.cwd() else { return; };
+        let Some(cwd) = self.model.cwd() else {
+            return;
+        };
         let src = cwd.join(old_name);
         let dst = cwd.join(new_name);
         self.set_pending_focus(dst.clone());
@@ -1484,7 +1726,9 @@ impl AppState {
             self.say("invalid folder name", true);
             return;
         }
-        let Some(cwd) = self.model.cwd() else { return; };
+        let Some(cwd) = self.model.cwd() else {
+            return;
+        };
         if cwd.is_this_pc() || cwd.is_remotes_root() {
             self.say("cannot create folder here", true);
             return;
@@ -1530,7 +1774,10 @@ impl AppState {
         std::thread::Builder::new()
             .name("navigator-remote-upload".into())
             .spawn(move || {
-                let op = Operation::CopyTo { src: staged_nav, dst: remote.clone() };
+                let op = Operation::CopyTo {
+                    src: staged_nav,
+                    dst: remote.clone(),
+                };
                 let handle = match rclone.spawn(op) {
                     Ok(h) => h,
                     Err(e) => {
@@ -1545,7 +1792,11 @@ impl AppState {
                 let mut success = false;
                 let mut tail = String::new();
                 for ev in handle.events.iter() {
-                    if let OpEvent::Done { success: ok, stderr_tail } = ev {
+                    if let OpEvent::Done {
+                        success: ok,
+                        stderr_tail,
+                    } = ev
+                    {
                         success = ok;
                         tail = stderr_tail;
                         break;
@@ -1578,7 +1829,14 @@ impl AppState {
                     cache.finish_prompt(&staged, None);
                     let last = tail.lines().next_back().unwrap_or("").to_string();
                     let _ = speech.send(crate::speech::Utterance {
-                        text: format!("upload failed: {}", if last.is_empty() { "see log".into() } else { last }),
+                        text: format!(
+                            "upload failed: {}",
+                            if last.is_empty() {
+                                "see log".into()
+                            } else {
+                                last
+                            }
+                        ),
                         interrupt: true,
                     });
                 }
@@ -1593,8 +1851,8 @@ impl AppState {
 /// require explicit Yes. Defaults to No.
 fn confirm_remote_delete(parent: Option<HWND>, targets: &[NavPath]) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, MessageBoxW, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND,
-        MB_YESNO, IDYES,
+        GetForegroundWindow, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_YESNO,
+        MessageBoxW,
     };
     use windows::core::PCWSTR;
 
@@ -1622,14 +1880,17 @@ fn confirm_remote_delete(parent: Option<HWND>, targets: &[NavPath]) -> bool {
         .map(|h| unsafe { GetForegroundWindow() } == h)
         .unwrap_or(false);
     let mut flags = MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2;
-    if is_foreground { flags |= MB_SETFOREGROUND; }
+    if is_foreground {
+        flags |= MB_SETFOREGROUND;
+    }
     let rc = unsafe {
         MessageBoxW(
             parent,
             PCWSTR(body_w.as_ptr()),
             PCWSTR(title_w.as_ptr()),
             flags,
-        ).0
+        )
+        .0
     };
     rc == IDYES.0
 }
@@ -1639,25 +1900,31 @@ fn confirm_remote_delete(parent: Option<HWND>, targets: &[NavPath]) -> bool {
 /// only the trash-walking pass knows about.
 fn confirm_empty_trash(parent: Option<HWND>, body: &str) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, MessageBoxW, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND,
-        MB_YESNO, IDYES,
+        GetForegroundWindow, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_YESNO,
+        MessageBoxW,
     };
     use windows::core::PCWSTR;
 
-    let title_w: Vec<u16> = "Empty .trash on all drives?".encode_utf16().chain([0]).collect();
+    let title_w: Vec<u16> = "Empty .trash on all drives?"
+        .encode_utf16()
+        .chain([0])
+        .collect();
     let body_w: Vec<u16> = body.encode_utf16().chain([0]).collect();
     let is_foreground = parent
         .map(|h| unsafe { GetForegroundWindow() } == h)
         .unwrap_or(false);
     let mut flags = MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2;
-    if is_foreground { flags |= MB_SETFOREGROUND; }
+    if is_foreground {
+        flags |= MB_SETFOREGROUND;
+    }
     let rc = unsafe {
         MessageBoxW(
             parent,
             PCWSTR(body_w.as_ptr()),
             PCWSTR(title_w.as_ptr()),
             flags,
-        ).0
+        )
+        .0
     };
     rc == IDYES.0
 }
@@ -1666,15 +1933,17 @@ fn confirm_empty_trash(parent: Option<HWND>, body: &str) -> bool {
 /// for both local files and files downloaded out of rclone remotes.
 fn shell_open(path: &std::path::Path) {
     use std::os::windows::ffi::OsStrExt;
-    use windows::core::{w, PCWSTR};
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{PCWSTR, w};
 
     let path_w: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
     let dir_w: Option<Vec<u16>> = path
         .parent()
         .map(|p| p.as_os_str().encode_wide().chain([0]).collect());
-    let dir_ptr = dir_w.as_ref().map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr()));
+    let dir_ptr = dir_w
+        .as_ref()
+        .map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr()));
     unsafe {
         let _ = ShellExecuteW(
             None,
@@ -1723,7 +1992,10 @@ struct WorkerCtx {
 
 impl WorkerCtx {
     fn say(&self, text: impl Into<String>, interrupt: bool) {
-        let _ = self.speech.try_send(crate::speech::Utterance { text: text.into(), interrupt });
+        let _ = self.speech.try_send(crate::speech::Utterance {
+            text: text.into(),
+            interrupt,
+        });
     }
 
     fn refresh(&self) {
@@ -1739,7 +2011,7 @@ impl WorkerCtx {
     }
 
     fn run_batch(self, sources: Vec<NavPath>, dest_dir: NavPath, cut: bool) {
-        use crate::preflight::{prompt_item, unique_numbered_path, BatchDecision, ItemChoice};
+        use crate::preflight::{BatchDecision, ItemChoice, prompt_item, unique_numbered_path};
 
         let total = sources.len();
         let mut failed = 0u32;
@@ -1754,7 +2026,8 @@ impl WorkerCtx {
         // we still ask per-conflict.
         let mut sticky: Option<ItemChoice> = None;
         // Count how many conflicts remain so the dialog can show progress.
-        let mut remaining_conflicts: usize = sources.iter()
+        let mut remaining_conflicts: usize = sources
+            .iter()
             .filter(|s| dest_dir.join(s.file_name()).as_path().exists())
             .count();
 
@@ -1770,7 +2043,9 @@ impl WorkerCtx {
             } else {
                 let BatchDecision { choice, sticky: s } =
                     prompt_item(self.hwnd, &src, &dst, remaining_conflicts);
-                if s { sticky = Some(choice); }
+                if s {
+                    sticky = Some(choice);
+                }
                 remaining_conflicts = remaining_conflicts.saturating_sub(1);
                 choice
             };
@@ -1845,8 +2120,16 @@ impl WorkerCtx {
             (0, 0, 0) => format!("done — {} items", total),
             (0, 0, r) => format!("done — {} items, {} renamed", total, r),
             (0, s, 0) => format!("done — {} items, {} skipped", total - s as usize, s),
-            (0, s, r) => format!("done — {} items, {} skipped, {} renamed", total - s as usize, s, r),
-            (f, s, _) => format!("finished with {} failures, {} skipped, out of {}", f, s, total),
+            (0, s, r) => format!(
+                "done — {} items, {} skipped, {} renamed",
+                total - s as usize,
+                s,
+                r
+            ),
+            (f, s, _) => format!(
+                "finished with {} failures, {} skipped, out of {}",
+                f, s, total
+            ),
         };
         self.say(msg, failed > 0);
         self.refresh();
@@ -1857,12 +2140,7 @@ impl WorkerCtx {
     /// paths are skipped silently — the paste may have been partially
     /// rejected (user clicked Skip) or another process may have already
     /// cleaned things up. All results fold into a single summary.
-    fn run_revert_paste(
-        self,
-        created: Vec<NavPath>,
-        originals: Vec<NavPath>,
-        cut_mode: bool,
-    ) {
+    fn run_revert_paste(self, created: Vec<NavPath>, originals: Vec<NavPath>, cut_mode: bool) {
         let total = created.len();
         let mut failed = 0u32;
         let mut skipped = 0u32;
@@ -1872,19 +2150,36 @@ impl WorkerCtx {
                 continue;
             }
             let op = if cut_mode {
-                Operation::Rename { src: c.clone(), dst: originals[i].clone() }
+                Operation::Rename {
+                    src: c.clone(),
+                    dst: originals[i].clone(),
+                }
             } else {
-                Operation::Delete { targets: vec![c.clone()] }
+                Operation::Delete {
+                    targets: vec![c.clone()],
+                }
             };
-            self.say(format!("undo {} of {}: {}", i + 1, total, c.file_name()), false);
-            if !self.run_one(op) { failed += 1; }
+            self.say(
+                format!("undo {} of {}: {}", i + 1, total, c.file_name()),
+                false,
+            );
+            if !self.run_one(op) {
+                failed += 1;
+            }
         }
         let msg = if failed == 0 && skipped == 0 {
             format!("undo done — {} items", total)
         } else if failed == 0 {
-            format!("undo done — {} items, {} missing skipped", total - skipped as usize, skipped)
+            format!(
+                "undo done — {} items, {} missing skipped",
+                total - skipped as usize,
+                skipped
+            )
         } else {
-            format!("undo finished with {} failures, {} skipped, out of {}", failed, skipped, total)
+            format!(
+                "undo finished with {} failures, {} skipped, out of {}",
+                failed, skipped, total
+            )
         };
         self.say(msg, failed > 0);
         self.refresh();
@@ -1897,9 +2192,17 @@ impl WorkerCtx {
         let total = pairs.len();
         let mut failed = 0u32;
         for (i, (trash, original)) in pairs.into_iter().enumerate() {
-            self.say(format!("deleting {} of {}: {}", i + 1, total, original.file_name()), false);
-            let op = Operation::Rename { src: original, dst: trash };
-            if !self.run_one(op) { failed += 1; }
+            self.say(
+                format!("deleting {} of {}: {}", i + 1, total, original.file_name()),
+                false,
+            );
+            let op = Operation::Rename {
+                src: original,
+                dst: trash,
+            };
+            if !self.run_one(op) {
+                failed += 1;
+            }
         }
         let msg = if failed == 0 {
             format!("deleted {} items (undoable)", total)
@@ -1931,8 +2234,14 @@ impl WorkerCtx {
                 skipped += 1;
                 continue;
             }
-            self.say(format!("restoring {} of {}: {}", i + 1, total, original.file_name()), false);
-            if !self.run_one(Operation::Rename { src: trash, dst: original.clone() }) {
+            self.say(
+                format!("restoring {} of {}: {}", i + 1, total, original.file_name()),
+                false,
+            );
+            if !self.run_one(Operation::Rename {
+                src: trash,
+                dst: original.clone(),
+            }) {
                 failed += 1;
             } else if first_restored.is_none() {
                 first_restored = Some(original);
@@ -1941,9 +2250,16 @@ impl WorkerCtx {
         let msg = if failed == 0 && skipped == 0 {
             format!("restored {} items", total)
         } else if failed == 0 {
-            format!("restored {} items, {} skipped", total - skipped as usize, skipped)
+            format!(
+                "restored {} items, {} skipped",
+                total - skipped as usize,
+                skipped
+            )
         } else {
-            format!("restore finished with {} failures, {} skipped, out of {}", failed, skipped, total)
+            format!(
+                "restore finished with {} failures, {} skipped, out of {}",
+                failed, skipped, total
+            )
         };
         self.say(msg, failed > 0);
         // Arm pending_focus so the post-listing hook lands the caret on
@@ -1982,13 +2298,19 @@ impl WorkerCtx {
         let interval = if self.announce_interval_secs == 0 {
             None
         } else {
-            Some(std::time::Duration::from_secs(self.announce_interval_secs as u64))
+            Some(std::time::Duration::from_secs(
+                self.announce_interval_secs as u64,
+            ))
         };
         let mut last_spoken = std::time::Instant::now();
 
         for ev in handle.events.iter() {
             match ev {
-                navigator_rclone::op::OpEvent::Progress { bytes_done, bytes_total, current } => {
+                navigator_rclone::op::OpEvent::Progress {
+                    bytes_done,
+                    bytes_total,
+                    current,
+                } => {
                     if let Some(p) = progress.as_ref() {
                         p.post_status(current.as_deref().unwrap_or(""), bytes_done, bytes_total);
                     }
@@ -1999,8 +2321,9 @@ impl WorkerCtx {
                             let msg = if bytes_total > 0 {
                                 let pct = (bytes_done as f64 / bytes_total as f64 * 100.0) as u32;
                                 match current.as_deref() {
-                                    Some(name) if !name.is_empty() =>
-                                        format!("{} percent, {}", pct, name),
+                                    Some(name) if !name.is_empty() => {
+                                        format!("{} percent, {}", pct, name)
+                                    }
                                     _ => format!("{} percent", pct),
                                 }
                             } else {
@@ -2011,7 +2334,8 @@ impl WorkerCtx {
                             };
                             if !msg.is_empty() {
                                 let _ = self.speech.try_send(crate::speech::Utterance {
-                                    text: msg, interrupt: false,
+                                    text: msg,
+                                    interrupt: false,
                                 });
                             }
                         }
@@ -2026,9 +2350,15 @@ impl WorkerCtx {
                         ));
                     }
                 }
-                navigator_rclone::op::OpEvent::Done { success, stderr_tail } => {
+                navigator_rclone::op::OpEvent::Done {
+                    success,
+                    stderr_tail,
+                } => {
                     if success {
-                        if let Some(p) = progress.as_ref() { p.post_done(true); }
+                        prune_empty_src_dirs(&op_for_retry);
+                        if let Some(p) = progress.as_ref() {
+                            p.post_done(true);
+                        }
                         return true;
                     }
                     // Failed. If the tail looks like a Windows ACL
@@ -2051,10 +2381,12 @@ impl WorkerCtx {
                     // the cause. Probe runs only on failure, so the
                     // happy path doesn't write a probe per op.
                     let needs_elevation = navigator_rclone::op::local_dest_dir(&op_for_retry)
-                        .map(|d| matches!(
-                            probe_write_access(&d).err().map(|e| e.kind()),
-                            Some(std::io::ErrorKind::PermissionDenied)
-                        ))
+                        .map(|d| {
+                            matches!(
+                                probe_write_access(&d).err().map(|e| e.kind()),
+                                Some(std::io::ErrorKind::PermissionDenied)
+                            )
+                        })
                         .unwrap_or(false);
                     if needs_elevation {
                         let _ = self.speech.try_send(crate::speech::Utterance {
@@ -2063,19 +2395,39 @@ impl WorkerCtx {
                         });
                         match crate::elevated::run(&self.rclone, &op_for_retry) {
                             Ok(out) if out.success => {
-                                if let Some(p) = progress.as_ref() { p.post_done(true); }
+                                prune_empty_src_dirs(&op_for_retry);
+                                if let Some(p) = progress.as_ref() {
+                                    p.post_done(true);
+                                }
                                 return true;
                             }
                             Ok(out) => {
-                                if let Some(p) = progress.as_ref() { p.post_done(false); }
-                                let elev_tail = out.log_tail.lines().rev().take(10)
-                                    .collect::<Vec<_>>().into_iter().rev()
-                                    .collect::<Vec<_>>().join("\n");
-                                let body = if elev_tail.is_empty() { tail.clone() } else { elev_tail };
+                                if let Some(p) = progress.as_ref() {
+                                    p.post_done(false);
+                                }
+                                let elev_tail = out
+                                    .log_tail
+                                    .lines()
+                                    .rev()
+                                    .take(10)
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .rev()
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                let body = if elev_tail.is_empty() {
+                                    tail.clone()
+                                } else {
+                                    elev_tail
+                                };
                                 crate::dialogs::show_error(
                                     self.hwnd,
                                     "File operation failed (even as administrator)",
-                                    if body.is_empty() { "rclone reported an error" } else { &body },
+                                    if body.is_empty() {
+                                        "rclone reported an error"
+                                    } else {
+                                        &body
+                                    },
                                 );
                                 return false;
                             }
@@ -2089,11 +2441,17 @@ impl WorkerCtx {
                         }
                     }
 
-                    if let Some(p) = progress.as_ref() { p.post_done(false); }
+                    if let Some(p) = progress.as_ref() {
+                        p.post_done(false);
+                    }
                     crate::dialogs::show_error(
                         self.hwnd,
                         "File operation failed",
-                        if tail.is_empty() { "rclone reported an error" } else { &tail },
+                        if tail.is_empty() {
+                            "rclone reported an error"
+                        } else {
+                            &tail
+                        },
                     );
                     return false;
                 }
@@ -2115,11 +2473,7 @@ fn probe_write_access(dir: &std::path::Path) -> std::io::Result<()> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let probe = dir.join(format!(
-        ".navigator-probe-{}-{}",
-        std::process::id(),
-        nanos,
-    ));
+    let probe = dir.join(format!(".navigator-probe-{}-{}", std::process::id(), nanos,));
     let f = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -2149,12 +2503,15 @@ fn single_entry(root: &NavPath, name: &str) -> Option<navigator_core::Entry> {
 ///   4. `SetClipboardData(CF_UNICODETEXT, hmem)` — ownership of hmem passes
 ///      to the system; *we must not* GlobalFree it on success.
 ///   5. `CloseClipboard`.
-fn set_clipboard_text(hwnd: Option<windows::Win32::Foundation::HWND>, text: &str) -> std::io::Result<()> {
+fn set_clipboard_text(
+    hwnd: Option<windows::Win32::Foundation::HWND>,
+    text: &str,
+) -> std::io::Result<()> {
     use windows::Win32::Foundation::{GlobalFree, HANDLE};
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
-    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
     use windows::Win32::System::Ole::CF_UNICODETEXT;
 
     let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -2210,10 +2567,9 @@ fn set_clipboard_hdrop(
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Foundation::{GlobalFree, HANDLE};
     use windows::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW,
-        SetClipboardData,
+        CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
     };
-    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
     use windows::Win32::System::Ole::CF_HDROP;
     use windows::Win32::UI::Shell::DROPFILES;
     use windows::core::PCWSTR;
@@ -2334,9 +2690,8 @@ fn scan_worker(rx: crossbeam_channel::Receiver<ScanCmd>, rclone: RcloneDriver) {
                             .collect(),
                         Err(e) => {
                             error!("rclone listremotes: {}", e);
-                            let payload = Box::into_raw(
-                                Box::new((path.clone(), e.to_string())),
-                            ) as isize;
+                            let payload =
+                                Box::into_raw(Box::new((path.clone(), e.to_string()))) as isize;
                             unsafe {
                                 let _ = PostMessageW(
                                     Some(hwnd.0),
@@ -2354,9 +2709,8 @@ fn scan_worker(rx: crossbeam_channel::Receiver<ScanCmd>, rclone: RcloneDriver) {
                         Ok(e) => e,
                         Err(e) => {
                             error!("rclone lsjson {}: {}", target, e);
-                            let payload = Box::into_raw(
-                                Box::new((path.clone(), e.to_string())),
-                            ) as isize;
+                            let payload =
+                                Box::into_raw(Box::new((path.clone(), e.to_string()))) as isize;
                             unsafe {
                                 let _ = PostMessageW(
                                     Some(hwnd.0),
@@ -2383,9 +2737,8 @@ fn scan_worker(rx: crossbeam_channel::Receiver<ScanCmd>, rclone: RcloneDriver) {
                             // Surface the failure to the UI so the user
                             // sees an error dialog instead of a silent
                             // "0 items" listing.
-                            let payload = Box::into_raw(
-                                Box::new((path.clone(), e.to_string())),
-                            ) as isize;
+                            let payload =
+                                Box::into_raw(Box::new((path.clone(), e.to_string()))) as isize;
                             unsafe {
                                 let _ = PostMessageW(
                                     Some(hwnd.0),
@@ -2400,12 +2753,8 @@ fn scan_worker(rx: crossbeam_channel::Receiver<ScanCmd>, rclone: RcloneDriver) {
                 };
                 let payload = Box::into_raw(Box::new((path, entries))) as isize;
                 unsafe {
-                    let _ = PostMessageW(
-                        Some(hwnd.0),
-                        WMAPP_DIR_LISTED,
-                        WPARAM(0),
-                        LPARAM(payload),
-                    );
+                    let _ =
+                        PostMessageW(Some(hwnd.0), WMAPP_DIR_LISTED, WPARAM(0), LPARAM(payload));
                 }
             }
             ScanCmd::Search { root, query, hwnd } => {
@@ -2429,10 +2778,138 @@ fn scan_worker(rx: crossbeam_channel::Receiver<ScanCmd>, rclone: RcloneDriver) {
     }
 }
 
+/// Recursively delete empty subdirectories under `path`, then `path`
+/// itself if it ends up empty. No-op on non-directory or missing paths.
+/// Returns true when `path` was successfully removed.
+fn remove_empty_tree(path: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for e in entries.flatten() {
+        let pe = e.path();
+        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let _ = remove_empty_tree(&pe);
+        }
+    }
+    std::fs::remove_dir(path).is_ok()
+}
+
+/// Post-success cleanup for `Move` / `Rename` ops on local sources.
+/// `rclone moveto` on a directory degrades to per-file copy+delete on
+/// cross-volume / cross-backend moves and leaves the emptied source
+/// tree behind. Walk the tree and prune empty dirs. No-op for files,
+/// remote sources, or other op kinds.
+fn prune_empty_src_dirs(op: &Operation) {
+    let srcs: Vec<&NavPath> = match op {
+        Operation::Move { sources, .. } => sources.iter().collect(),
+        Operation::Rename { src, .. } => vec![src],
+        _ => return,
+    };
+    for s in srcs {
+        if s.is_remote() {
+            continue;
+        }
+        let p = s.as_path();
+        if p.is_dir() {
+            let _ = remove_empty_tree(p);
+        }
+    }
+}
+
 pub fn run(cfg: AppConfig) -> windows::core::Result<i32> {
     let state = AppState::new(&cfg);
     state.bootstrap_plugins();
     let window = create_window(state.clone())?;
     let rc = run_message_loop(window.hwnd);
     Ok(rc)
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn empty_dir_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("empty");
+        fs::create_dir(&target).unwrap();
+        assert!(remove_empty_tree(&target));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn nested_empty_tree_fully_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("a");
+        fs::create_dir_all(root.join("b").join("c")).unwrap();
+        fs::create_dir(root.join("d")).unwrap();
+        assert!(remove_empty_tree(&root));
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn tree_with_files_is_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("a");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub").join("keep.txt"), b"x").unwrap();
+        fs::create_dir(root.join("emptysib")).unwrap();
+        assert!(!remove_empty_tree(&root));
+        assert!(
+            root.join("sub").join("keep.txt").exists(),
+            "files must survive cleanup"
+        );
+        assert!(
+            !root.join("emptysib").exists(),
+            "empty siblings still pruned bottom-up"
+        );
+    }
+
+    #[test]
+    fn missing_path_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bogus = tmp.path().join("does_not_exist");
+        assert!(!remove_empty_tree(&bogus));
+    }
+
+    #[test]
+    fn prune_skips_file_src() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("file.txt");
+        fs::write(&src, b"x").unwrap();
+        let dst = tmp.path().join("renamed.txt");
+        let op = Operation::Rename {
+            src: NavPath::new(&src).unwrap(),
+            dst: NavPath::new(&dst).unwrap(),
+        };
+        prune_empty_src_dirs(&op);
+        assert!(src.exists(), "file source must be untouched");
+    }
+
+    #[test]
+    fn prune_removes_empty_dir_src() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("emptydir");
+        fs::create_dir_all(src.join("inner")).unwrap();
+        let dst = tmp.path().join("moved");
+        let op = Operation::Rename {
+            src: NavPath::new(&src).unwrap(),
+            dst: NavPath::new(&dst).unwrap(),
+        };
+        prune_empty_src_dirs(&op);
+        assert!(!src.exists(), "empty src tree must be pruned");
+    }
+
+    #[test]
+    fn prune_ignores_unrelated_ops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("survivor");
+        fs::create_dir(&dir).unwrap();
+        let op = Operation::Delete {
+            targets: vec![NavPath::new(&dir).unwrap()],
+        };
+        prune_empty_src_dirs(&op);
+        assert!(dir.exists(), "Delete op must not trigger src cleanup");
+    }
 }

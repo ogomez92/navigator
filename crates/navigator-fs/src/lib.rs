@@ -23,19 +23,18 @@ use windows_sys::Win32::Storage::FileSystem::{
 // constants live under `System_WindowsProgramming` — a feature we'd
 // otherwise pull in for five integers.
 const DRIVE_REMOVABLE: u32 = 2;
-const DRIVE_FIXED: u32     = 3;
-const DRIVE_REMOTE: u32    = 4;
-const DRIVE_CDROM: u32     = 5;
-const DRIVE_RAMDISK: u32   = 6;
+const DRIVE_FIXED: u32 = 3;
+const DRIVE_REMOTE: u32 = 4;
+const DRIVE_CDROM: u32 = 5;
+const DRIVE_RAMDISK: u32 = 6;
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_ATTRIBUTE_SYSTEM, FindClose, FindFirstFileExW, FindNextFileW, WIN32_FIND_DATAW,
-    FindExInfoBasic, FindExSearchNameMatch, FIND_FIRST_EX_LARGE_FETCH,
+    FILE_ATTRIBUTE_SYSTEM, FIND_FIRST_EX_LARGE_FETCH, FindClose, FindExInfoBasic,
+    FindExSearchNameMatch, FindFirstFileExW, FindNextFileW, WIN32_FIND_DATAW,
 };
 
 pub fn read_dir(path: &NavPath) -> Result<Vec<Entry>> {
-    read_dir_impl(path.as_path())
-        .map_err(|e| Error::io(path.as_path(), e))
+    read_dir_impl(path.as_path()).map_err(|e| Error::io(path.as_path(), e))
 }
 
 /// Enumerate visible file shares on `host` via `NetShareEnum` (level 1,
@@ -61,7 +60,9 @@ pub fn list_shares(host: &str) -> Vec<Entry> {
     };
 
     let mut out: Vec<Entry> = Vec::new();
-    if host.is_empty() { return out; }
+    if host.is_empty() {
+        return out;
+    }
 
     // UNC hosts must be passed as wide UNC (`\\host`) to NetShareEnum per
     // MSDN examples — a bare `host` works in practice on modern Windows
@@ -101,11 +102,17 @@ pub fn list_shares(host: &str) -> Vec<Entry> {
         let kind = info.shi1_type;
         // High bit (`STYPE_SPECIAL`) tags admin + IPC shares. Printers
         // are `STYPE_PRINTQ` (= 1). Only keep disk shares.
-        if (kind & STYPE_SPECIAL) != 0 { continue; }
-        if (kind & 0xFF) != STYPE_DISKTREE { continue; }
+        if (kind & STYPE_SPECIAL) != 0 {
+            continue;
+        }
+        if (kind & 0xFF) != STYPE_DISKTREE {
+            continue;
+        }
 
         let name = unsafe { pwstr_to_string(info.shi1_netname) };
-        if name.is_empty() { continue; }
+        if name.is_empty() {
+            continue;
+        }
         out.push(Entry {
             name,
             kind: EntryKind::Directory,
@@ -118,20 +125,30 @@ pub fn list_shares(host: &str) -> Vec<Entry> {
         });
     }
 
-    unsafe { NetApiBufferFree(buf as *mut _); }
-    out.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+    unsafe {
+        NetApiBufferFree(buf as *mut _);
+    }
+    out.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+    });
     out
 }
 
 /// Read a null-terminated UTF-16 buffer into an owned `String`. Copes
 /// with a null pointer by returning an empty string.
 unsafe fn pwstr_to_string(p: *const u16) -> String {
-    if p.is_null() { return String::new(); }
+    if p.is_null() {
+        return String::new();
+    }
     let mut len = 0usize;
     unsafe {
         while *p.add(len) != 0 {
             len += 1;
-            if len > 4096 { break; }
+            if len > 4096 {
+                break;
+            }
         }
         let slice = std::slice::from_raw_parts(p, len);
         String::from_utf16_lossy(slice)
@@ -154,15 +171,21 @@ pub fn list_drives() -> Vec<Entry> {
     // touch to tolerate weird configurations.
     let mut buf = [0u16; 512];
     let written = unsafe { GetLogicalDriveStringsW(buf.len() as u32, buf.as_mut_ptr()) };
-    if written == 0 { return out; }
+    if written == 0 {
+        return out;
+    }
 
     // The buffer is a double-null-terminated sequence of null-terminated
     // strings. Walk it by scanning runs of non-zero u16.
     let mut i = 0usize;
     while i < written as usize {
         let start = i;
-        while i < buf.len() && buf[i] != 0 { i += 1; }
-        if i == start { break; }
+        while i < buf.len() && buf[i] != 0 {
+            i += 1;
+        }
+        if i == start {
+            break;
+        }
         let drive_wide = &buf[start..i];
         i += 1; // skip the terminator for next iteration
 
@@ -194,12 +217,12 @@ pub fn list_drives() -> Vec<Entry> {
 
         let drive_type = unsafe { GetDriveTypeW(drive_c.as_ptr()) };
         let kind_word = match drive_type {
-            DRIVE_FIXED     => "Local Disk",
+            DRIVE_FIXED => "Local Disk",
             DRIVE_REMOVABLE => "Removable Disk",
-            DRIVE_CDROM     => "CD Drive",
-            DRIVE_REMOTE    => "Network Drive",
-            DRIVE_RAMDISK   => "RAM Disk",
-            _               => "Drive",
+            DRIVE_CDROM => "CD Drive",
+            DRIVE_REMOTE => "Network Drive",
+            DRIVE_RAMDISK => "RAM Disk",
+            _ => "Drive",
         };
         let display = if label.is_empty() {
             format!("{} ({})", kind_word, path_str.trim_end_matches('\\'))
@@ -227,7 +250,9 @@ pub fn list_drives() -> Vec<Entry> {
 pub fn drive_path_from_display(display: &str) -> Option<String> {
     let open = display.rfind('(')?;
     let close = display.rfind(')')?;
-    if close <= open { return None; }
+    if close <= open {
+        return None;
+    }
     let inside = &display[open + 1..close];
     // Restore trailing separator so the path is an absolute drive root.
     if inside.ends_with(':') {
@@ -237,21 +262,33 @@ pub fn drive_path_from_display(display: &str) -> Option<String> {
     }
 }
 
-/// Recursively search `root` for entries whose filename contains `needle`
-/// (ASCII case-insensitive). The returned entries have `name` set to the
+/// Recursively search `root` for entries whose filename matches `query`
+/// (ASCII case-insensitive). Returned entries have `name` set to the
 /// path *relative* to `root`, using `\\` as separator — so the GUI can
 /// open them via `root.join(&name)` without knowing the subdirectory.
 ///
+/// Matching strategy is inferred from the query shape:
+///   * Wildcards `*` / `?` present  → glob match against the full
+///     filename (anchored both ends). `*.png`, `foo?.txt`, `*report*`.
+///   * Leading `.` and no wildcards → extension filter. `.png` matches
+///     any file whose extension equals `png`.
+///   * Otherwise                    → ASCII case-insensitive substring,
+///     same behaviour as the original implementation.
+///
 /// `max_results` bounds memory for huge trees; callers typically cap at a
 /// few thousand matches.
-pub fn search_recursive(root: &NavPath, needle: &str, max_results: usize) -> Vec<Entry> {
-    let needle_lower = needle.to_ascii_lowercase();
+pub fn search_recursive(root: &NavPath, query: &str, max_results: usize) -> Vec<Entry> {
     let mut out: Vec<Entry> = Vec::new();
-    if needle_lower.is_empty() { return out; }
+    if query.is_empty() {
+        return out;
+    }
+    let matcher = Matcher::new(query);
 
     let mut stack: Vec<std::path::PathBuf> = vec![root.as_path().to_path_buf()];
     while let Some(dir) = stack.pop() {
-        if out.len() >= max_results { break; }
+        if out.len() >= max_results {
+            break;
+        }
         let entries = match read_dir_impl(&dir) {
             Ok(e) => e,
             Err(_) => continue, // unreadable sub-tree; skip
@@ -262,7 +299,7 @@ pub fn search_recursive(root: &NavPath, needle: &str, max_results: usize) -> Vec
             if matches!(entry.kind, navigator_core::EntryKind::Directory) {
                 stack.push(dir.join(&entry.name));
             }
-            if entry.name.to_ascii_lowercase().contains(&needle_lower) {
+            if matcher.matches(&entry.name) {
                 // Rewrite `name` to the path relative to `root`, so the
                 // GUI can display + open it without a separate column.
                 let full = dir.join(&entry.name);
@@ -271,11 +308,124 @@ pub fn search_recursive(root: &NavPath, needle: &str, max_results: usize) -> Vec
                     Err(_) => entry.name.clone(),
                 };
                 out.push(Entry { name: rel, ..entry });
-                if out.len() >= max_results { break; }
+                if out.len() >= max_results {
+                    break;
+                }
             }
         }
     }
     out
+}
+
+/// Filename matcher inferred from the user's query string.
+enum Matcher {
+    Substring(String),
+    Extension(String),
+    Glob(Vec<GlobToken>),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GlobToken {
+    /// `*` — match any (possibly empty) run of characters.
+    Star,
+    /// `?` — match exactly one character.
+    Any,
+    /// Literal lowercased character.
+    Char(char),
+}
+
+impl Matcher {
+    fn new(query: &str) -> Self {
+        let lower = query.to_ascii_lowercase();
+        let has_glob = lower.chars().any(|c| c == '*' || c == '?');
+        if has_glob {
+            return Matcher::Glob(parse_glob(&lower));
+        }
+        // `.png`, `.tar.gz` — extension-only filter.
+        if let Some(ext) = lower.strip_prefix('.') {
+            if !ext.is_empty() && !ext.contains('.') {
+                return Matcher::Extension(ext.to_string());
+            }
+        }
+        Matcher::Substring(lower)
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        match self {
+            Matcher::Substring(s) => lower.contains(s.as_str()),
+            Matcher::Extension(ext) => std::path::Path::new(&lower)
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|e| e == ext.as_str())
+                .unwrap_or(false),
+            Matcher::Glob(tokens) => glob_match(tokens, &lower),
+        }
+    }
+}
+
+fn parse_glob(pattern: &str) -> Vec<GlobToken> {
+    let mut out = Vec::with_capacity(pattern.len());
+    let mut last_star = false;
+    for c in pattern.chars() {
+        match c {
+            '*' => {
+                // Collapse runs of `*` so the matcher's worst case stays
+                // linear in pattern length.
+                if !last_star {
+                    out.push(GlobToken::Star);
+                    last_star = true;
+                }
+            }
+            '?' => {
+                out.push(GlobToken::Any);
+                last_star = false;
+            }
+            other => {
+                out.push(GlobToken::Char(other));
+                last_star = false;
+            }
+        }
+    }
+    out
+}
+
+/// Iterative glob matcher with `*` backtracking. Linear in `text.len()`
+/// when the pattern has no `*`; otherwise O(p*t) worst case.
+fn glob_match(pattern: &[GlobToken], text: &str) -> bool {
+    let bytes: Vec<char> = text.chars().collect();
+    let mut pi = 0usize;
+    let mut ti = 0usize;
+    let mut star: Option<(usize, usize)> = None;
+    while ti < bytes.len() {
+        match pattern.get(pi) {
+            Some(GlobToken::Char(c)) if *c == bytes[ti] => {
+                pi += 1;
+                ti += 1;
+            }
+            Some(GlobToken::Any) => {
+                pi += 1;
+                ti += 1;
+            }
+            Some(GlobToken::Star) => {
+                star = Some((pi, ti));
+                pi += 1;
+            }
+            _ => {
+                if let Some((sp, st)) = star {
+                    pi = sp + 1;
+                    ti = st + 1;
+                    star = Some((sp, ti));
+                } else {
+                    return false;
+                }
+            }
+        }
+    }
+    while matches!(pattern.get(pi), Some(GlobToken::Star)) {
+        pi += 1;
+    }
+    pi == pattern.len()
 }
 
 fn read_dir_impl(dir: &Path) -> std::io::Result<Vec<Entry>> {
@@ -350,7 +500,16 @@ fn entry_from_find_data(d: &WIN32_FIND_DATAW) -> Option<Entry> {
     );
     let hidden = attrs & FILE_ATTRIBUTE_HIDDEN != 0;
     let system = attrs & FILE_ATTRIBUTE_SYSTEM != 0;
-    Some(Entry { name, kind, size, modified, created, attrs, hidden, system })
+    Some(Entry {
+        name,
+        kind,
+        size,
+        modified,
+        created,
+        attrs,
+        hidden,
+        system,
+    })
 }
 
 fn read_wstr(buf: &[u16]) -> String {
@@ -368,7 +527,9 @@ fn to_long_path(p: &Path) -> Vec<u16> {
         return raw;
     }
     let mut out: Vec<u16> = Vec::with_capacity(raw.len() + 4);
-    for c in r"\\?\".encode_utf16() { out.push(c); }
+    for c in r"\\?\".encode_utf16() {
+        out.push(c);
+    }
     out.extend_from_slice(&raw);
     out
 }
@@ -376,4 +537,60 @@ fn to_long_path(p: &Path) -> Vec<u16> {
 fn starts_with_long_prefix(s: &[u16]) -> bool {
     let pre: Vec<u16> = r"\\?\".encode_utf16().collect();
     s.len() >= pre.len() && s[..pre.len()] == pre[..]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn substring_query_matches_anywhere_case_insensitive() {
+        let m = Matcher::new("Report");
+        assert!(m.matches("annual_report.txt"));
+        assert!(m.matches("REPORTS"));
+        assert!(!m.matches("notes.md"));
+    }
+
+    #[test]
+    fn extension_query_matches_only_that_extension() {
+        let m = Matcher::new(".png");
+        assert!(m.matches("logo.PNG"));
+        assert!(m.matches("a.b.png"));
+        assert!(!m.matches("png.txt"));
+        assert!(!m.matches("readme"));
+    }
+
+    #[test]
+    fn glob_star_matches_extension_pattern() {
+        let m = Matcher::new("*.png");
+        assert!(m.matches("logo.png"));
+        assert!(m.matches("a.b.png"));
+        assert!(!m.matches("png"));
+        assert!(!m.matches("logo.pngx"));
+    }
+
+    #[test]
+    fn glob_question_matches_single_char() {
+        let m = Matcher::new("v?.txt");
+        assert!(m.matches("v1.txt"));
+        assert!(m.matches("vA.txt"));
+        assert!(!m.matches("v.txt"));
+        assert!(!m.matches("v12.txt"));
+    }
+
+    #[test]
+    fn glob_internal_star_matches_filler() {
+        let m = Matcher::new("a*z.log");
+        assert!(m.matches("az.log"));
+        assert!(m.matches("amiddleZ.log"));
+        assert!(!m.matches("amiddle.log"));
+    }
+
+    #[test]
+    fn dotted_query_with_inner_dot_falls_back_to_substring() {
+        let m = Matcher::new(".tar.gz");
+        // Two dots → treat as substring, not extension filter.
+        assert!(m.matches("backup.tar.gz"));
+        assert!(!m.matches("readme.gz"));
+    }
 }

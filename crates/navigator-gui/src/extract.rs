@@ -28,24 +28,23 @@ use crate::speech::Utterance;
 /// failure as a normal extract error instead of pre-filtering it out.
 pub const EXTRACTABLE_EXTENSIONS: &[&str] = &[
     // Native 7-Zip + the common general-purpose archives.
-    "7z", "zip", "rar", "tar", "gz", "tgz", "bz2", "tbz2", "tbz",
-    "xz", "txz", "lzma", "tlz", "lz", "lz4", "zst", "zstd", "tzst",
-    // Microsoft / installer formats.
+    "7z", "zip", "rar", "tar", "gz", "tgz", "bz2", "tbz2", "tbz", "xz", "txz", "lzma", "tlz", "lz",
+    "lz4", "zst", "zstd", "tzst", // Microsoft / installer formats.
     "cab", "msi", "msm", "msp", "wim", "swm", "esd", "exe",
     // Legacy Unix / minor archivers.
-    "arj", "lzh", "lha", "z", "taz", "rpm", "deb", "cpio", "ar",
-    "xar", "pkg", "cpgz", "chm", "epub", "apk", "jar", "war", "ear",
-    "xpi", "ipa", "ppmd",
+    "arj", "lzh", "lha", "z", "taz", "rpm", "deb", "cpio", "ar", "xar", "pkg", "cpgz", "chm",
+    "epub", "apk", "jar", "war", "ear", "xpi", "ipa", "ppmd",
     // Disk images / filesystems 7-Zip exposes as archives.
-    "iso", "img", "dmg", "hfs", "ntfs", "fat", "vhd", "vhdx",
-    "vmdk", "vdi", "qcow", "qcow2", "udf", "squashfs", "cramfs",
-    "ext", "ext2", "ext3", "ext4", "apm", "mbr", "gpt",
+    "iso", "img", "dmg", "hfs", "ntfs", "fat", "vhd", "vhdx", "vmdk", "vdi", "qcow", "qcow2", "udf",
+    "squashfs", "cramfs", "ext", "ext2", "ext3", "ext4", "apm", "mbr", "gpt",
 ];
 
 /// True if `path` has an extension recognised by [`EXTRACTABLE_EXTENSIONS`].
 /// Case-insensitive on the extension; the path itself is not touched.
 pub fn is_extractable(path: &Path) -> bool {
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else { return false; };
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
     let lower = ext.to_ascii_lowercase();
     EXTRACTABLE_EXTENSIONS.iter().any(|e| *e == lower.as_str())
 }
@@ -76,14 +75,20 @@ pub fn parse_top_level_count(stdout: &str) -> (usize, Option<String>) {
     let mut tops: BTreeSet<String> = BTreeSet::new();
     for raw in stdout.lines() {
         let line = raw.trim_start();
-        let Some(rest) = line.strip_prefix("Path = ") else { continue; };
+        let Some(rest) = line.strip_prefix("Path = ") else {
+            continue;
+        };
         let first = rest.trim().split(['/', '\\']).next().unwrap_or("");
         if !first.is_empty() {
             tops.insert(first.to_string());
         }
     }
     let n = tops.len();
-    let only = if n == 1 { tops.into_iter().next() } else { None };
+    let only = if n == 1 {
+        tops.into_iter().next()
+    } else {
+        None
+    };
     (n, only)
 }
 
@@ -99,7 +104,9 @@ pub fn archive_stem(archive: &Path) -> String {
         .to_string();
     loop {
         let p = Path::new(&name);
-        if !is_extractable(p) { break; }
+        if !is_extractable(p) {
+            break;
+        }
         match p.file_stem().and_then(|s| s.to_str()) {
             Some(s) if !s.is_empty() && s != name => name = s.to_string(),
             _ => break,
@@ -161,7 +168,11 @@ pub fn unique_dest(candidate: PathBuf) -> PathBuf {
 
 /// Filter `paths` down to those with an extension 7z handles.
 pub fn filter_extractable(paths: &[NavPath]) -> Vec<NavPath> {
-    paths.iter().filter(|p| is_extractable(p.as_path())).cloned().collect()
+    paths
+        .iter()
+        .filter(|p| is_extractable(p.as_path()))
+        .cloned()
+        .collect()
 }
 
 /// Extract every entry in `sources` using `seven_zip`. Reports progress
@@ -211,7 +222,11 @@ pub fn run_extract(
         // Only dedupe when we're creating a wrapper folder; extracting
         // straight into the cwd would otherwise spawn endless dupes.
         let wrapping = raw_dest != parent;
-        let dest = if wrapping { unique_dest(raw_dest) } else { raw_dest };
+        let dest = if wrapping {
+            unique_dest(raw_dest)
+        } else {
+            raw_dest
+        };
 
         if wrapping {
             if let Err(e) = std::fs::create_dir_all(&dest) {
@@ -273,7 +288,10 @@ pub fn run_extract(
     } else {
         format!("extracted {} of {}, {} failed", ok, total, failed)
     };
-    let _ = speech.try_send(Utterance { text: summary, interrupt: failed > 0 });
+    let _ = speech.try_send(Utterance {
+        text: summary,
+        interrupt: failed > 0,
+    });
 }
 
 fn list_top_level_count(seven_zip: &Path, archive: &Path) -> std::io::Result<usize> {
@@ -433,8 +451,13 @@ Size = 0
         let result = unique_dest(base.clone());
         assert_ne!(result, base);
         assert!(
-            result.file_name().unwrap().to_string_lossy().ends_with("(1)"),
-            "expected suffix ` (1)`, got {:?}", result,
+            result
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("(1)"),
+            "expected suffix ` (1)`, got {:?}",
+            result,
         );
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -52,7 +52,11 @@ impl NavPath {
             let name = &s[..colon];
             let rest = &s[colon + 1..];
             let looks_like_drive = name.len() == 1
-                && name.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false);
+                && name
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_alphabetic())
+                    .unwrap_or(false);
             let valid_name = !name.is_empty()
                 && name
                     .chars()
@@ -106,9 +110,7 @@ impl NavPath {
         // `is_unc_host_only` and enumerates the host's network shares
         // (NetShareEnum) instead of calling `read_dir`.
         if is_unc {
-            let trimmed: String = s.chars()
-                .map(|c| if c == '/' { '\\' } else { c })
-                .collect();
+            let trimmed: String = s.chars().map(|c| if c == '/' { '\\' } else { c }).collect();
             let body = trimmed.trim_start_matches('\\').trim_end_matches('\\');
             if !body.is_empty() && !body.contains('\\') {
                 // Exactly one non-empty segment after the `\\` prefix =
@@ -125,8 +127,11 @@ impl NavPath {
     /// always fails with `ERROR_BAD_NETPATH`.
     pub fn is_unc_host_only(&self) -> bool {
         let s = self.0.to_string_lossy();
-        if !(s.starts_with(r"\\") || s.starts_with("//")) { return false; }
-        let body: String = s.chars()
+        if !(s.starts_with(r"\\") || s.starts_with("//")) {
+            return false;
+        }
+        let body: String = s
+            .chars()
             .map(|c| if c == '/' { '\\' } else { c })
             .collect::<String>()
             .trim_start_matches('\\')
@@ -138,9 +143,12 @@ impl NavPath {
     /// The host portion of a host-only UNC path (`\\host` → `"host"`).
     /// Returns `None` for non-UNC or fully-qualified shares.
     pub fn unc_host(&self) -> Option<String> {
-        if !self.is_unc_host_only() { return None; }
+        if !self.is_unc_host_only() {
+            return None;
+        }
         let s = self.0.to_string_lossy();
-        let body: String = s.chars()
+        let body: String = s
+            .chars()
             .map(|c| if c == '/' { '\\' } else { c })
             .collect::<String>()
             .trim_start_matches('\\')
@@ -150,14 +158,18 @@ impl NavPath {
     }
 
     /// Virtual root showing all connected drives + network locations.
-    pub fn this_pc() -> Self { Self(PathBuf::from(THIS_PC_SENTINEL)) }
+    pub fn this_pc() -> Self {
+        Self(PathBuf::from(THIS_PC_SENTINEL))
+    }
 
     pub fn is_this_pc(&self) -> bool {
         self.0.as_os_str() == THIS_PC_SENTINEL
     }
 
     /// Virtual root listing every configured rclone remote.
-    pub fn remotes_root() -> Self { Self(PathBuf::from(REMOTES_ROOT_SENTINEL)) }
+    pub fn remotes_root() -> Self {
+        Self(PathBuf::from(REMOTES_ROOT_SENTINEL))
+    }
 
     pub fn is_remotes_root(&self) -> bool {
         self.0.as_os_str() == REMOTES_ROOT_SENTINEL
@@ -254,15 +266,23 @@ impl NavPath {
         }
     }
 
-    pub fn as_path(&self) -> &Path { &self.0 }
-    pub fn into_inner(self) -> PathBuf { self.0 }
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+    pub fn into_inner(self) -> PathBuf {
+        self.0
+    }
 
     /// Parent folder, or `None` if already at a filesystem root (or at the
     /// This PC virtual root). The caller decides whether to treat `None`
     /// as "stop" or as "go to This PC".
     pub fn parent(&self) -> Option<Self> {
-        if self.is_this_pc() { return None; }
-        if self.is_remotes_root() { return None; }
+        if self.is_this_pc() {
+            return None;
+        }
+        if self.is_remotes_root() {
+            return None;
+        }
         if self.is_remote() {
             // At a remote root, step out to the Remotes listing; inside a
             // remote, trim one sub-path component. Using the raw string
@@ -286,7 +306,10 @@ impl NavPath {
             out.push_str(&tail[..idx]);
             return Some(Self(PathBuf::from(out)));
         }
-        self.0.parent().filter(|p| !p.as_os_str().is_empty()).map(|p| Self(p.to_path_buf()))
+        self.0
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| Self(p.to_path_buf()))
     }
 
     /// Join a child name (no separators in `name`).
@@ -300,12 +323,17 @@ impl NavPath {
     }
 
     pub fn file_name(&self) -> &str {
-        self.0.file_name().and_then(|s| s.to_str()).unwrap_or_default()
+        self.0
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
     }
 }
 
 impl AsRef<Path> for NavPath {
-    fn as_ref(&self) -> &Path { &self.0 }
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
 }
 
 impl std::fmt::Display for NavPath {
@@ -323,7 +351,10 @@ mod tests {
         let p = NavPath::remote("gdrive", "photos/2024");
         assert!(p.is_remote());
         assert!(!p.is_remote_root());
-        assert_eq!(p.remote_parts(), Some(("gdrive".into(), "photos/2024".into())));
+        assert_eq!(
+            p.remote_parts(),
+            Some(("gdrive".into(), "photos/2024".into()))
+        );
         assert_eq!(p.rclone_arg().as_deref(), Some("gdrive:photos/2024"));
         assert_eq!(p.file_name(), "2024");
     }

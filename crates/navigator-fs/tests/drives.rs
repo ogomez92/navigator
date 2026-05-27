@@ -28,8 +28,14 @@ fn every_drive_entry_is_directory_kind() {
 
 #[test]
 fn drive_display_roundtrips_to_path() {
-    assert_eq!(drive_path_from_display("Local Disk (C:)"), Some(r"C:\".to_string()));
-    assert_eq!(drive_path_from_display("System (D:)"),     Some(r"D:\".to_string()));
+    assert_eq!(
+        drive_path_from_display("Local Disk (C:)"),
+        Some(r"C:\".to_string())
+    );
+    assert_eq!(
+        drive_path_from_display("System (D:)"),
+        Some(r"D:\".to_string())
+    );
 }
 
 #[test]

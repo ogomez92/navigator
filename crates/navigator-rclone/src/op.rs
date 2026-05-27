@@ -31,21 +31,39 @@ pub enum OverwritePolicy {
 
 #[derive(Debug, Clone)]
 pub enum Operation {
-    Copy { sources: Vec<NavPath>, dest_dir: NavPath, policy: OverwritePolicy },
-    Move { sources: Vec<NavPath>, dest_dir: NavPath, policy: OverwritePolicy },
+    Copy {
+        sources: Vec<NavPath>,
+        dest_dir: NavPath,
+        policy: OverwritePolicy,
+    },
+    Move {
+        sources: Vec<NavPath>,
+        dest_dir: NavPath,
+        policy: OverwritePolicy,
+    },
     /// Single-source rename to an exact destination path. Used by F2 and
     /// anywhere we need the target filename to differ from the source.
-    Rename { src: NavPath, dst: NavPath },
+    Rename {
+        src: NavPath,
+        dst: NavPath,
+    },
     /// Single-source copy to an exact destination path. Used when the
     /// preflight "Append number" choice gives a copy a new target name
     /// — the caller has already resolved the final filename, so rclone
     /// just runs `copyto` against that path.
-    CopyTo { src: NavPath, dst: NavPath },
-    Delete { targets: Vec<NavPath> },
+    CopyTo {
+        src: NavPath,
+        dst: NavPath,
+    },
+    Delete {
+        targets: Vec<NavPath>,
+    },
     /// Create a directory. `rclone mkdir` succeeds when the target already
     /// exists on most backends; callers that want strict "must be new"
     /// semantics check ahead of time.
-    Mkdir { dir: NavPath },
+    Mkdir {
+        dir: NavPath,
+    },
 }
 
 /// Paths that would be overwritten by a copy/move. Returned from
@@ -60,8 +78,15 @@ pub struct PreflightReport {
 #[derive(Debug, Clone)]
 pub enum OpEvent {
     Log(LogEvent),
-    Progress { bytes_done: u64, bytes_total: u64, current: Option<String> },
-    Done { success: bool, stderr_tail: String },
+    Progress {
+        bytes_done: u64,
+        bytes_total: u64,
+        current: Option<String>,
+    },
+    Done {
+        success: bool,
+        stderr_tail: String,
+    },
 }
 
 /// Handle returned by [`RcloneDriver::spawn`]. Dropping it does *not* kill
@@ -100,10 +125,16 @@ pub const DEFAULT_TRANSFERS: u32 = 8;
 impl RcloneDriver {
     /// Look up `rclone` on PATH. Caller can override by passing a custom path.
     pub fn from_path() -> Self {
-        Self { exe: PathBuf::from("rclone"), transfers: DEFAULT_TRANSFERS }
+        Self {
+            exe: PathBuf::from("rclone"),
+            transfers: DEFAULT_TRANSFERS,
+        }
     }
     pub fn with_exe(exe: impl Into<PathBuf>) -> Self {
-        Self { exe: exe.into(), transfers: DEFAULT_TRANSFERS }
+        Self {
+            exe: exe.into(),
+            transfers: DEFAULT_TRANSFERS,
+        }
     }
 
     /// Override the `--transfers N` value used for every spawned op.
@@ -116,13 +147,17 @@ impl RcloneDriver {
 
     /// Current `--transfers` value. Exposed so tests + UI can round-trip
     /// the value without reaching into private state.
-    pub fn transfers(&self) -> u32 { self.transfers }
+    pub fn transfers(&self) -> u32 {
+        self.transfers
+    }
 
     /// Path to the `rclone` executable (or just `"rclone"` when relying
     /// on PATH lookup). Exposed so the GUI can rebuild a full argv for
     /// out-of-band invocations like the UAC-elevated retry path, which
     /// can't go through `spawn` because `ShellExecuteEx` doesn't pipe.
-    pub fn exe(&self) -> &Path { &self.exe }
+    pub fn exe(&self) -> &Path {
+        &self.exe
+    }
 
     /// Run the operation under `--dry-run` and collect destinations that
     /// would be overwritten. Blocks until rclone finishes.
@@ -220,10 +255,18 @@ impl RcloneDriver {
                 tail.push_str(&line);
                 tail.push('\n');
             }
-            let _ = tx.send(OpEvent::Done { success, stderr_tail: tail });
+            let _ = tx.send(OpEvent::Done {
+                success,
+                stderr_tail: tail,
+            });
         });
 
-        Ok(OpHandle { id, events: rx, child: child_slot, cancelled })
+        Ok(OpHandle {
+            id,
+            events: rx,
+            child: child_slot,
+            cancelled,
+        })
     }
 
     fn base_command(&self) -> Command {
@@ -249,11 +292,15 @@ impl RcloneDriver {
     pub fn base_args(&self) -> Vec<String> {
         vec![
             "--use-json-log".into(),
-            "--log-level".into(), "INFO".into(),
-            "--stats".into(), "1s".into(),
-            "--stats-log-level".into(), "NOTICE".into(),
+            "--log-level".into(),
+            "INFO".into(),
+            "--stats".into(),
+            "1s".into(),
+            "--stats-log-level".into(),
+            "NOTICE".into(),
             "--stats-one-line".into(),
-            "--transfers".into(), self.transfers.to_string(),
+            "--transfers".into(),
+            self.transfers.to_string(),
         ]
     }
 
@@ -288,7 +335,9 @@ impl RcloneDriver {
             .lines()
             .filter_map(|l| {
                 let l = l.trim();
-                if l.is_empty() { return None; }
+                if l.is_empty() {
+                    return None;
+                }
                 Some(l.trim_end_matches(':').to_string())
             })
             .collect())
@@ -314,9 +363,17 @@ impl RcloneDriver {
         Ok(items
             .into_iter()
             .map(|i| Entry {
-                kind: if i.is_dir { EntryKind::Directory } else { EntryKind::File },
+                kind: if i.is_dir {
+                    EntryKind::Directory
+                } else {
+                    EntryKind::File
+                },
                 size: if i.size < 0 { 0 } else { i.size as u64 },
-                modified: i.mod_time.as_deref().and_then(parse_rfc3339_filetime).unwrap_or_default(),
+                modified: i
+                    .mod_time
+                    .as_deref()
+                    .and_then(parse_rfc3339_filetime)
+                    .unwrap_or_default(),
                 created: FileTime::default(),
                 attrs: 0,
                 hidden: false,
@@ -347,7 +404,12 @@ impl RcloneDriver {
         }
         // `--stat` emits a single JSON object; some rclone versions still
         // wrap it in an array. Tolerate both.
-        let trimmed = out.stdout.iter().take_while(|b| **b != 0).copied().collect::<Vec<u8>>();
+        let trimmed = out
+            .stdout
+            .iter()
+            .take_while(|b| **b != 0)
+            .copied()
+            .collect::<Vec<u8>>();
         let v: Value = match serde_json::from_slice(&trimmed) {
             Ok(v) => v,
             Err(e) => return Err(std::io::Error::other(format!("stat parse: {}", e))),
@@ -357,7 +419,9 @@ impl RcloneDriver {
             Value::Object(_) => Some(v),
             _ => None,
         };
-        let Some(item) = obj else { return Ok(None); };
+        let Some(item) = obj else {
+            return Ok(None);
+        };
         let item: LsItemFull = serde_json::from_value(item)
             .map_err(|e| std::io::Error::other(format!("stat parse: {}", e)))?;
         Ok(Some(RemoteStat::from_full(item)))
@@ -492,18 +556,30 @@ struct LsItem {
 fn parse_rfc3339_filetime(s: &str) -> Option<FileTime> {
     // Expect at minimum `YYYY-MM-DDTHH:MM:SS`.
     let bytes = s.as_bytes();
-    if bytes.len() < 19 { return None; }
+    if bytes.len() < 19 {
+        return None;
+    }
     let year: i32 = std::str::from_utf8(&bytes[0..4]).ok()?.parse().ok()?;
-    if bytes[4] != b'-' { return None; }
+    if bytes[4] != b'-' {
+        return None;
+    }
     let month: u32 = std::str::from_utf8(&bytes[5..7]).ok()?.parse().ok()?;
-    if bytes[7] != b'-' { return None; }
+    if bytes[7] != b'-' {
+        return None;
+    }
     let day: u32 = std::str::from_utf8(&bytes[8..10]).ok()?.parse().ok()?;
     // Accept `T` or ` ` as the date/time separator (rclone uses `T`).
-    if !(bytes[10] == b'T' || bytes[10] == b' ') { return None; }
+    if !(bytes[10] == b'T' || bytes[10] == b' ') {
+        return None;
+    }
     let hour: u32 = std::str::from_utf8(&bytes[11..13]).ok()?.parse().ok()?;
-    if bytes[13] != b':' { return None; }
+    if bytes[13] != b':' {
+        return None;
+    }
     let minute: u32 = std::str::from_utf8(&bytes[14..16]).ok()?.parse().ok()?;
-    if bytes[16] != b':' { return None; }
+    if bytes[16] != b':' {
+        return None;
+    }
     let second: u32 = std::str::from_utf8(&bytes[17..19]).ok()?.parse().ok()?;
 
     let days = days_from_civil(year, month, day);
@@ -511,7 +587,9 @@ fn parse_rfc3339_filetime(s: &str) -> Option<FileTime> {
     let ticks = unix_secs
         .saturating_mul(10_000_000)
         .saturating_add(FileTime::UNIX_EPOCH_TICKS as i64);
-    if ticks < 0 { return None; }
+    if ticks < 0 {
+        return None;
+    }
     Some(FileTime(ticks as u64))
 }
 
@@ -567,24 +645,32 @@ pub fn local_dest_dir(op: &Operation) -> Option<std::path::PathBuf> {
     let nav = match op {
         Operation::Copy { dest_dir, .. } => dest_dir,
         Operation::Move { dest_dir, .. } => dest_dir,
-        Operation::Rename { dst, .. } => return dst
-            .as_path()
-            .parent()
-            .filter(|_| !dst.is_remote())
-            .map(|p| p.to_path_buf()),
-        Operation::CopyTo { dst, .. } => return dst
-            .as_path()
-            .parent()
-            .filter(|_| !dst.is_remote())
-            .map(|p| p.to_path_buf()),
-        Operation::Mkdir { dir } => return dir
-            .as_path()
-            .parent()
-            .filter(|_| !dir.is_remote())
-            .map(|p| p.to_path_buf()),
+        Operation::Rename { dst, .. } => {
+            return dst
+                .as_path()
+                .parent()
+                .filter(|_| !dst.is_remote())
+                .map(|p| p.to_path_buf());
+        }
+        Operation::CopyTo { dst, .. } => {
+            return dst
+                .as_path()
+                .parent()
+                .filter(|_| !dst.is_remote())
+                .map(|p| p.to_path_buf());
+        }
+        Operation::Mkdir { dir } => {
+            return dir
+                .as_path()
+                .parent()
+                .filter(|_| !dir.is_remote())
+                .map(|p| p.to_path_buf());
+        }
         Operation::Delete { .. } => return None,
     };
-    if nav.is_remote() { return None; }
+    if nav.is_remote() {
+        return None;
+    }
     Some(nav.as_path().to_path_buf())
 }
 
@@ -594,9 +680,15 @@ pub fn local_dest_dir(op: &Operation) -> Option<std::path::PathBuf> {
 /// stdout / stderr).
 pub fn op_args(op: &Operation, dry_run: bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    if dry_run { out.push("--dry-run".into()); }
+    if dry_run {
+        out.push("--dry-run".into());
+    }
     match op {
-        Operation::Copy { sources, dest_dir, policy } => {
+        Operation::Copy {
+            sources,
+            dest_dir,
+            policy,
+        } => {
             apply_policy_to(&mut out, *policy);
             if let Some(src) = sources.first() {
                 let dest = dest_dir.join(src.file_name());
@@ -605,7 +697,11 @@ pub fn op_args(op: &Operation, dry_run: bool) -> Vec<String> {
                 out.push(nav_arg(&dest));
             }
         }
-        Operation::Move { sources, dest_dir, policy } => {
+        Operation::Move {
+            sources,
+            dest_dir,
+            policy,
+        } => {
             apply_policy_to(&mut out, *policy);
             if let Some(src) = sources.first() {
                 let dest = dest_dir.join(src.file_name());
@@ -615,9 +711,6 @@ pub fn op_args(op: &Operation, dry_run: bool) -> Vec<String> {
             }
         }
         Operation::Rename { src, dst } => {
-            // `moveto` with exact paths renames atomically on the same volume
-            // and falls back to copy+delete across volumes — rclone handles
-            // both under one command.
             out.push("moveto".into());
             out.push(nav_arg(src));
             out.push(nav_arg(dst));

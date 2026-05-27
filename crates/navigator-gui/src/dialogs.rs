@@ -6,10 +6,10 @@
 
 use std::iter::once;
 
-use windows::core::PCWSTR;
 use windows::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNOCANCEL, IDCANCEL, IDNO, IDYES,
+    IDCANCEL, IDNO, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNOCANCEL, MessageBoxW,
 };
+use windows::core::PCWSTR;
 
 use navigator_core::NavPath;
 
@@ -34,12 +34,18 @@ pub fn ask_overwrite(parent: Option<HwndSend>, conflicts: &[NavPath]) -> Option<
          Yes = overwrite all\n\
          No = skip all\n\
          Cancel = cancel the operation",
-        conflicts.len(), list,
+        conflicts.len(),
+        list,
     );
-    let rc = msgbox(parent, "Files already exist", &msg, MB_YESNOCANCEL | MB_ICONWARNING);
+    let rc = msgbox(
+        parent,
+        "Files already exist",
+        &msg,
+        MB_YESNOCANCEL | MB_ICONWARNING,
+    );
     match rc {
-        x if x == IDYES.0    => Some(ConflictChoice::Overwrite),
-        x if x == IDNO.0     => Some(ConflictChoice::Skip),
+        x if x == IDYES.0 => Some(ConflictChoice::Overwrite),
+        x if x == IDNO.0 => Some(ConflictChoice::Skip),
         x if x == IDCANCEL.0 => Some(ConflictChoice::Cancel),
         _ => None,
     }
@@ -59,7 +65,9 @@ pub fn show_info(parent: Option<HwndSend>, title: &str, body: &str) {
 fn preview_list(paths: &[NavPath], max: usize) -> String {
     let mut out = String::new();
     for (i, p) in paths.iter().take(max).enumerate() {
-        if i > 0 { out.push('\n'); }
+        if i > 0 {
+            out.push('\n');
+        }
         out.push_str(&p.to_string());
     }
     if paths.len() > max {
@@ -83,7 +91,7 @@ fn msgbox(
             PCWSTR(body_w.as_ptr()),
             PCWSTR(title_w.as_ptr()),
             style,
-        ).0
+        )
+        .0
     }
 }
-

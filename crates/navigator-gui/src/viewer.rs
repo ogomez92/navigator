@@ -21,21 +21,21 @@ use std::ffi::c_void;
 
 use once_cell::sync::OnceCell;
 
-use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT};
+use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, GetStockObject};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BS_PUSHBUTTON, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    GetClientRect, GetWindowLongPtrW, HCURSOR, HMENU, IDC_ARROW, LoadCursorW, MoveWindow,
-    RegisterClassExW, SendMessageW, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
-    SW_SHOW, WINDOW_EX_STYLE, WM_COMMAND, WM_CLOSE, WM_DESTROY, WM_SETFONT, WM_SIZE,
-    WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SIZEBOX,
-    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, GWLP_USERDATA, CS_HREDRAW, CS_VREDRAW,
+    BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
+    DestroyWindow, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HCURSOR, HMENU, IDC_ARROW,
+    LoadCursorW, MoveWindow, RegisterClassExW, SW_SHOW, SendMessageW, SetWindowLongPtrW,
+    SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_SETFONT,
+    WM_SIZE, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SIZEBOX, WS_SYSMENU,
+    WS_TABSTOP, WS_VISIBLE,
 };
+use windows::core::{PCWSTR, w};
 
-const IDC_EDIT:      u16 = 401;
+const IDC_EDIT: u16 = 401;
 const IDC_BTN_CLOSE: u16 = 402;
 
 const CLASS: PCWSTR = w!("NavigatorTextViewer");
@@ -88,14 +88,20 @@ fn ensure_window(parent: HWND) -> windows::core::Result<HWND> {
             CLASS,
             w!("Viewer"),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_SIZEBOX,
-            CW_USEDEFAULT, CW_USEDEFAULT, 720, 520,
-            Some(parent), None,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            720,
+            520,
+            Some(parent),
+            None,
             Some(hinstance.into()),
             None,
         )?
     };
     let data = Box::new(build_children(hwnd));
-    unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(data) as isize); }
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(data) as isize);
+    }
     *cell.lock().unwrap() = Some(hwnd.0 as isize);
     // Initial layout pass so the edit fills the client area before first
     // paint (CreateWindowExW uses the initial size; WM_SIZE fires on any
@@ -106,7 +112,7 @@ fn ensure_window(parent: HWND) -> windows::core::Result<HWND> {
 
 fn bring_to_foreground(hwnd: HWND, focus_target: HWND) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        SetForegroundWindow, SetWindowPos, HWND_TOP, SWP_NOMOVE, SWP_NOSIZE,
+        HWND_TOP, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetWindowPos,
     };
     unsafe {
         let _ = SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
@@ -120,7 +126,9 @@ fn bring_to_foreground(hwnd: HWND, focus_target: HWND) {
 
 fn ensure_class() -> windows::core::Result<()> {
     static REG: OnceCell<()> = OnceCell::new();
-    if REG.get().is_some() { return Ok(()); }
+    if REG.get().is_some() {
+        return Ok(());
+    }
     let hinstance = unsafe { GetModuleHandleW(None)? };
     unsafe {
         let wc = WNDCLASSEXW {
@@ -143,7 +151,12 @@ fn ensure_class() -> windows::core::Result<()> {
 fn build_children(parent: HWND) -> Data {
     let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
     let apply_font = |h: HWND| unsafe {
-        SendMessageW(h, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+        SendMessageW(
+            h,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
     };
 
     let edit = mkmulti(parent, 10, 10, 700, 440, IDC_EDIT);
@@ -161,9 +174,13 @@ fn build_children(parent: HWND) -> Data {
 }
 
 fn layout(hwnd: HWND) {
-    let Some(d) = (unsafe { data(hwnd) }) else { return; };
+    let Some(d) = (unsafe { data(hwnd) }) else {
+        return;
+    };
     let mut rc = windows::Win32::Foundation::RECT::default();
-    if unsafe { GetClientRect(hwnd, &raw mut rc) }.is_err() { return; }
+    if unsafe { GetClientRect(hwnd, &raw mut rc) }.is_err() {
+        return;
+    }
     let w = (rc.right - rc.left).max(0);
     let h = (rc.bottom - rc.top).max(0);
     let pad = 10;
@@ -176,27 +193,41 @@ fn layout(hwnd: HWND) {
             d.btn_close,
             (w - btn_w - pad).max(pad),
             pad + edit_h + pad,
-            btn_w, btn_h, true,
+            btn_w,
+            btn_h,
+            true,
         );
     }
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
-        WM_SIZE => { layout(hwnd); LRESULT(0) }
+        WM_SIZE => {
+            layout(hwnd);
+            LRESULT(0)
+        }
         WM_COMMAND => unsafe {
             let cmd = (wp.0 & 0xFFFF) as u16;
             match cmd {
-                IDC_BTN_CLOSE => { let _ = DestroyWindow(hwnd); }
+                IDC_BTN_CLOSE => {
+                    let _ = DestroyWindow(hwnd);
+                }
                 // IDOK (1) — Enter on the default button path. Close too.
-                1 => { let _ = DestroyWindow(hwnd); }
+                1 => {
+                    let _ = DestroyWindow(hwnd);
+                }
                 // IDCANCEL (2) — Esc.
-                2 => { let _ = DestroyWindow(hwnd); }
+                2 => {
+                    let _ = DestroyWindow(hwnd);
+                }
                 _ => {}
             }
             LRESULT(0)
         },
-        WM_CLOSE => unsafe { let _ = DestroyWindow(hwnd); LRESULT(0) },
+        WM_CLOSE => unsafe {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        },
         WM_DESTROY => unsafe {
             let raw = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
             if raw != 0 {
@@ -214,12 +245,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
 
 unsafe fn data<'a>(hwnd: HWND) -> Option<&'a mut Data> {
     let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
-    if raw == 0 { None } else { Some(unsafe { &mut *(raw as *mut Data) }) }
+    if raw == 0 {
+        None
+    } else {
+        Some(unsafe { &mut *(raw as *mut Data) })
+    }
 }
 
 fn set_title(hwnd: HWND, s: &str) {
     let w: Vec<u16> = s.encode_utf16().chain([0]).collect();
-    unsafe { let _ = SetWindowTextW(hwnd, PCWSTR(w.as_ptr())); }
+    unsafe {
+        let _ = SetWindowTextW(hwnd, PCWSTR(w.as_ptr()));
+    }
 }
 
 fn set_edit_text(edit: HWND, s: &str) {
@@ -235,24 +272,38 @@ fn set_edit_text(edit: HWND, s: &str) {
         prev = c;
     }
     let w: Vec<u16> = buf.encode_utf16().chain([0]).collect();
-    unsafe { let _ = SetWindowTextW(edit, PCWSTR(w.as_ptr())); }
+    unsafe {
+        let _ = SetWindowTextW(edit, PCWSTR(w.as_ptr()));
+    }
 }
 
 fn mkmulti(parent: HWND, x: i32, y: i32, w: i32, h: i32, id: u16) -> HWND {
-    let style = WS_CHILD.0 | WS_VISIBLE.0 | WS_BORDER.0 | WS_VSCROLL | WS_HSCROLL
-        | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | WS_TABSTOP.0;
+    let style = WS_CHILD.0
+        | WS_VISIBLE.0
+        | WS_BORDER.0
+        | WS_VSCROLL
+        | WS_HSCROLL
+        | ES_MULTILINE
+        | ES_READONLY
+        | ES_AUTOVSCROLL
+        | ES_AUTOHSCROLL
+        | WS_TABSTOP.0;
     unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             w!("EDIT"),
             w!(""),
             windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(style),
-            x, y, w, h,
+            x,
+            y,
+            w,
+            h,
             Some(parent),
             Some(HMENU(id as isize as *mut c_void)),
             Some(GetModuleHandleW(None).unwrap().into()),
             None,
-        ).unwrap()
+        )
+        .unwrap()
     }
 }
 
@@ -266,18 +317,22 @@ fn mkbutton(parent: HWND, text: &str, x: i32, y: i32, w: i32, h: i32, id: u16) -
             windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
                 WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
             ),
-            x, y, w, h,
+            x,
+            y,
+            w,
+            h,
             Some(parent),
             Some(HMENU(id as isize as *mut c_void)),
             Some(GetModuleHandleW(None).unwrap().into()),
             None,
-        ).unwrap()
+        )
+        .unwrap()
     }
 }
 
-const WS_VSCROLL: u32     = 0x00200000;
-const WS_HSCROLL: u32     = 0x00100000;
-const ES_MULTILINE: u32   = 0x0004;
-const ES_READONLY: u32    = 0x0800;
+const WS_VSCROLL: u32 = 0x00200000;
+const WS_HSCROLL: u32 = 0x00100000;
+const ES_MULTILINE: u32 = 0x0004;
+const ES_READONLY: u32 = 0x0800;
 const ES_AUTOVSCROLL: u32 = 0x0040;
 const ES_AUTOHSCROLL: u32 = 0x0080;

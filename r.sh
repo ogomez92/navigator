@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build release and copy navigator.exe to the personal bin dir as x.exe.
-# Usage: scripts/release.sh
+# Usage: ./r.sh from Git Bash/WSL, or .\r.cmd from PowerShell/cmd.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")" && pwd)

@@ -9,12 +9,15 @@ fn defaults_bind_common_editor_ops() {
     // A fresh install ships with the well-known editor chords wired up.
     let has_copy = c.shortcuts.iter().any(|a| {
         a.internal == Some(InternalCommand::Copy)
-            && a.chord.ctrl && !a.chord.shift && !a.chord.alt
+            && a.chord.ctrl
+            && !a.chord.shift
+            && !a.chord.alt
             && a.chord.key.eq_ignore_ascii_case("c")
     });
-    let has_paste = c.shortcuts.iter().any(|a| {
-        a.internal == Some(InternalCommand::Paste) && a.chord.ctrl
-    });
+    let has_paste = c
+        .shortcuts
+        .iter()
+        .any(|a| a.internal == Some(InternalCommand::Paste) && a.chord.ctrl);
     let has_rename = c.shortcuts.iter().any(|a| {
         a.internal == Some(InternalCommand::Rename) && a.chord.key.eq_ignore_ascii_case("f2")
     });
@@ -82,7 +85,9 @@ fn toml_roundtrip_preserves_shortcuts() {
     original.shortcuts.push(ShortcutAction {
         name: "Custom".into(),
         chord: ShortcutChord {
-            ctrl: true, shift: true, alt: false,
+            ctrl: true,
+            shift: true,
+            alt: false,
             key: "F9".into(),
         },
         internal: None,
@@ -96,11 +101,17 @@ fn toml_roundtrip_preserves_shortcuts() {
 
     // Also verify the new internal field round-trips. This was a silent
     // data-loss risk when InternalCommand was added.
-    assert!(reparsed.shortcuts.iter().any(|a|
-        a.name == "Copy" && a.internal == Some(navigator_config::InternalCommand::Copy)
-    ));
+    assert!(
+        reparsed.shortcuts.iter().any(
+            |a| a.name == "Copy" && a.internal == Some(navigator_config::InternalCommand::Copy)
+        )
+    );
 
-    let found = reparsed.shortcuts.iter().find(|a| a.name == "Custom").unwrap();
+    let found = reparsed
+        .shortcuts
+        .iter()
+        .find(|a| a.name == "Custom")
+        .unwrap();
     assert!(found.chord.ctrl && found.chord.shift && !found.chord.alt);
     assert_eq!(found.chord.key, "F9");
     assert_eq!(found.command, "my.exe");

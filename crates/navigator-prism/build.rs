@@ -24,7 +24,11 @@ fn main() {
         .unwrap_or_else(|| PathBuf::from(r"D:\code\libs\prism\prism-windows-x64"));
 
     let profile = env::var("PROFILE").unwrap_or_else(|_| "release".into());
-    let flavor  = if profile == "debug" { "debug" } else { "release" };
+    let flavor = if profile == "debug" {
+        "debug"
+    } else {
+        "release"
+    };
 
     let (lib_dir, link_kind): (PathBuf, &str) = if cfg!(feature = "static") {
         (base.join("static").join(flavor).join("lib"), "static")
@@ -42,13 +46,20 @@ fn main() {
     // For dynamic linking, stage prism.dll alongside the target binary so the
     // process can find it without touching PATH.
     if link_kind == "dylib" {
-        let bin_src = base.join("dynamic").join(flavor).join("bin").join("prism.dll");
+        let bin_src = base
+            .join("dynamic")
+            .join(flavor)
+            .join("bin")
+            .join("prism.dll");
         if bin_src.is_file() {
             if let Some(out_dir) = target_bin_dir() {
                 let dst = out_dir.join("prism.dll");
                 let _ = fs::create_dir_all(&out_dir);
                 if let Err(e) = fs::copy(&bin_src, &dst) {
-                    println!("cargo:warning=failed to copy prism.dll to {}: {e}", dst.display());
+                    println!(
+                        "cargo:warning=failed to copy prism.dll to {}: {e}",
+                        dst.display()
+                    );
                 }
             }
         } else {

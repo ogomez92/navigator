@@ -64,7 +64,10 @@ fn exe_dir() -> PathBuf {
 }
 
 pub fn now_ts() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub fn load_clip() -> ClipFile {
@@ -91,7 +94,9 @@ pub fn load_history() -> Vec<HistoryEntry> {
 pub fn push_history(entry: HistoryEntry) {
     let mut entries = load_history();
     entries.insert(0, entry);
-    if entries.len() > MAX_HISTORY { entries.truncate(MAX_HISTORY); }
+    if entries.len() > MAX_HISTORY {
+        entries.truncate(MAX_HISTORY);
+    }
     if let Ok(s) = serde_json::to_string_pretty(&entries) {
         let _ = std::fs::write(history_path(), s);
     }
@@ -107,13 +112,13 @@ pub fn entry_details(e: &HistoryEntry) -> String {
     const HEAD: usize = 50;
     let n = e.sources.len();
     let verb = match e.kind.as_str() {
-        "copy"        => "Copy",
-        "cut"         => "Cut",
+        "copy" => "Copy",
+        "cut" => "Cut",
         "append-copy" => "Append to copy clipboard",
-        "append-cut"  => "Append to cut clipboard",
-        "paste"       => "Paste",
-        "delete"      => "Delete",
-        other         => other,
+        "append-cut" => "Append to cut clipboard",
+        "paste" => "Paste",
+        "delete" => "Delete",
+        other => other,
     };
 
     let mut s = String::new();
@@ -135,9 +140,9 @@ pub fn entry_details(e: &HistoryEntry) -> String {
     }
 
     let header = match e.kind.as_str() {
-        "paste"  => "\nSources:\n",
+        "paste" => "\nSources:\n",
         "delete" => "\nDeleted:\n",
-        _        => "\nPaths:\n",
+        _ => "\nPaths:\n",
     };
     s.push_str(header);
     for p in e.sources.iter().take(HEAD) {
@@ -157,10 +162,13 @@ pub fn entry_details(e: &HistoryEntry) -> String {
 fn distinct_parents(paths: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for p in paths {
-        let parent = std::path::Path::new(p).parent()
+        let parent = std::path::Path::new(p)
+            .parent()
             .map(|x| x.to_string_lossy().to_string())
             .unwrap_or_default();
-        if parent.is_empty() { continue; }
+        if parent.is_empty() {
+            continue;
+        }
         if !out.iter().any(|x| x == &parent) {
             out.push(parent);
         }
@@ -171,8 +179,12 @@ fn distinct_parents(paths: &[String]) -> Vec<String> {
 fn format_ts(ts: u64) -> String {
     // Convert Unix seconds → FILETIME (100-ns since 1601) so we reuse
     // the existing formatter without pulling in chrono.
-    if ts == 0 { return "—".to_string(); }
-    let ticks = ts.saturating_mul(10_000_000).saturating_add(116_444_736_000_000_000);
+    if ts == 0 {
+        return "—".to_string();
+    }
+    let ticks = ts
+        .saturating_mul(10_000_000)
+        .saturating_add(116_444_736_000_000_000);
     let out = crate::listview::format_filetime(ticks);
     if out.is_empty() { ts.to_string() } else { out }
 }
@@ -180,14 +192,22 @@ fn format_ts(ts: u64) -> String {
 /// Short human-readable label for an entry. Used to populate menu items.
 pub fn entry_label(e: &HistoryEntry) -> String {
     let n = e.sources.len();
-    let first = e.sources.first()
+    let first = e
+        .sources
+        .first()
         .and_then(|p| std::path::Path::new(p).file_name())
         .and_then(|s| s.to_str())
         .unwrap_or("?");
-    let suffix = if n > 1 { format!(" (+{} more)", n - 1) } else { String::new() };
+    let suffix = if n > 1 {
+        format!(" (+{} more)", n - 1)
+    } else {
+        String::new()
+    };
     match e.kind.as_str() {
         "paste" => {
-            let dest = e.dest.as_deref()
+            let dest = e
+                .dest
+                .as_deref()
                 .and_then(|p| std::path::Path::new(p).file_name())
                 .and_then(|s| s.to_str())
                 .unwrap_or("?");
@@ -196,9 +216,9 @@ pub fn entry_label(e: &HistoryEntry) -> String {
         other => {
             let verb = match other {
                 "copy" => "Copy",
-                "cut"  => "Cut",
+                "cut" => "Cut",
                 "append-copy" => "Append copy",
-                "append-cut"  => "Append cut",
+                "append-cut" => "Append cut",
                 "delete" => "Delete",
                 _ => other,
             };
@@ -227,7 +247,10 @@ mod tests {
         assert!(s.contains("Operation: Copy"));
         assert!(s.contains("Items:     3"));
         assert!(s.contains(r"C:\proj\file0.txt"));
-        assert!(s.contains("From:      C:\\proj"), "common parent missing:\n{s}");
+        assert!(
+            s.contains("From:      C:\\proj"),
+            "common parent missing:\n{s}"
+        );
         assert!(!s.contains("Dest:"));
     }
 
@@ -268,7 +291,10 @@ mod tests {
         };
         let s = entry_details(&e);
         assert!(s.contains("Items:     120"));
-        assert!(s.contains("… 70 more not shown"), "truncation tail missing:\n{s}");
+        assert!(
+            s.contains("… 70 more not shown"),
+            "truncation tail missing:\n{s}"
+        );
         // First few listed, last few elided.
         assert!(s.contains(r"C:\proj\file0.txt"));
         assert!(!s.contains(r"C:\proj\file119.txt"));
@@ -283,8 +309,10 @@ mod tests {
             ts: 0,
         };
         let s = entry_details(&e);
-        assert!(s.contains(r"From:      C:\a, D:\b"),
-            "expected both roots comma-separated, got:\n{s}");
+        assert!(
+            s.contains(r"From:      C:\a, D:\b"),
+            "expected both roots comma-separated, got:\n{s}"
+        );
     }
 
     #[test]

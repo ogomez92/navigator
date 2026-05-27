@@ -33,19 +33,25 @@ Run:
 
     cargo run --release
 
+Personal install:
+
+    .\r.cmd      # PowerShell / cmd
+    ./r.sh       # Git Bash / WSL
+
 ## CLI
 
     navigator [OPTIONS] [PATH]
 
 | Arg / flag              | Effect                                                           |
 |-------------------------|------------------------------------------------------------------|
-| `<PATH>`                | Local path (`C:\foo`) or rclone remote (`mac:downloads`)         |
+| `<PATH>`                | Local path (`C:\foo`, `.`) or rclone remote (`mac:downloads`)    |
 | `-r`, `--remote <SPEC>` | Open an rclone remote. `SPEC` is `name` or `name:sub/path`       |
 | `-h`, `--help`          | Print usage                                                      |
 
 Examples:
 
     navigator
+    navigator .
     navigator C:\Users\me\Downloads
     navigator -r mac:Downloads/incoming
     navigator -r gdrive                    # bare name = remote root

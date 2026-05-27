@@ -36,15 +36,16 @@ impl Host {
 impl HostCallbacks for Host {
     fn speak(&self, text: &str, interrupt: bool) {
         let _ = self.speak_tx.try_send(crate::speech::Utterance {
-            text: text.to_string(), interrupt,
+            text: text.to_string(),
+            interrupt,
         });
     }
 
     fn log(&self, level: LogLevel, msg: &str) {
         match level {
             LogLevel::Error => tracing::error!(target: "plugin", "{msg}"),
-            LogLevel::Warn  => tracing::warn! (target: "plugin", "{msg}"),
-            LogLevel::Info  => tracing::info! (target: "plugin", "{msg}"),
+            LogLevel::Warn => tracing::warn! (target: "plugin", "{msg}"),
+            LogLevel::Info => tracing::info! (target: "plugin", "{msg}"),
             LogLevel::Debug => tracing::debug!(target: "plugin", "{msg}"),
             LogLevel::Trace => tracing::trace!(target: "plugin", "{msg}"),
         }
@@ -82,7 +83,9 @@ impl PluginRegistry {
     /// not fail the call — a broken plugin should not prevent the rest
     /// from loading.
     pub fn load_from_dir(&self, dir: &std::path::Path) {
-        if !dir.is_dir() { return; }
+        if !dir.is_dir() {
+            return;
+        }
         let loader = PluginLoader::new(self.host_api_clone());
         for result in loader.load_directory(dir) {
             match result {
@@ -90,7 +93,12 @@ impl PluginRegistry {
                     let info = p.info();
                     let name = unsafe { info.name.as_str() };
                     let version = unsafe { info.version.as_str() };
-                    info!("loaded plugin: {} v{} from {}", name, version, p.path.display());
+                    info!(
+                        "loaded plugin: {} v{} from {}",
+                        name,
+                        version,
+                        p.path.display()
+                    );
                     self.plugins.lock().push(p);
                 }
                 Err(e) => warn!("plugin load failed: {e}"),
@@ -111,18 +119,26 @@ impl PluginRegistry {
     }
 
     pub fn dispatch_navigated(&self, path: &str) {
-        for p in self.plugins.lock().iter() { p.on_navigated(path); }
+        for p in self.plugins.lock().iter() {
+            p.on_navigated(path);
+        }
     }
 
     pub fn dispatch_focused(&self, path: &str, name: &str, idx: usize) {
-        for p in self.plugins.lock().iter() { p.on_focused(path, name, idx); }
+        for p in self.plugins.lock().iter() {
+            p.on_focused(path, name, idx);
+        }
     }
 
     pub fn names(&self) -> Vec<String> {
-        self.plugins.lock().iter().map(|p| {
-            let info = p.info();
-            unsafe { info.name.as_str() }.to_string()
-        }).collect()
+        self.plugins
+            .lock()
+            .iter()
+            .map(|p| {
+                let info = p.info();
+                unsafe { info.name.as_str() }.to_string()
+            })
+            .collect()
     }
 }
 

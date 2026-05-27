@@ -17,9 +17,17 @@ pub use shortcuts::{HOTSPOT_COUNT, InternalCommand, ShortcutAction, ShortcutChor
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("io at {path}: {source}")]
-    Io { path: PathBuf, #[source] source: std::io::Error },
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("parse {path}: {source}")]
-    Parse { path: PathBuf, #[source] source: toml::de::Error },
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
     #[error("serialize: {0}")]
     Serialize(#[from] toml::ser::Error),
     #[error("cannot resolve exe directory: {0}")]
@@ -159,7 +167,10 @@ pub struct Extraction {
 
 impl Default for Extraction {
     fn default() -> Self {
-        Self { delete_when_extracted: true, create_folder: true }
+        Self {
+            delete_when_extracted: true,
+            create_folder: true,
+        }
     }
 }
 
@@ -176,7 +187,11 @@ pub struct Columns {
 
 impl Default for Columns {
     fn default() -> Self {
-        Self { show_size: true, show_type: true, show_modified: true }
+        Self {
+            show_size: true,
+            show_type: true,
+            show_modified: true,
+        }
     }
 }
 
@@ -192,7 +207,9 @@ pub enum SortMode {
 }
 
 impl Default for SortMode {
-    fn default() -> Self { SortMode::Name }
+    fn default() -> Self {
+        SortMode::Name
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -224,7 +241,11 @@ impl ConfigHandle {
             Ok(text) => match toml::from_str::<Config>(&text) {
                 Ok(cfg) => cfg,
                 Err(e) => {
-                    warn!("config parse error at {}: {}; using defaults", path.display(), e);
+                    warn!(
+                        "config parse error at {}: {}; using defaults",
+                        path.display(),
+                        e
+                    );
                     Config::default()
                 }
             },
@@ -234,11 +255,18 @@ impl ConfigHandle {
                 Config::default()
             }
             Err(e) => {
-                warn!("config read error at {}: {}; using defaults", path.display(), e);
+                warn!(
+                    "config read error at {}: {}; using defaults",
+                    path.display(),
+                    e
+                );
                 Config::default()
             }
         };
-        let handle = Self { inner: Arc::new(RwLock::new(inner)), path };
+        let handle = Self {
+            inner: Arc::new(RwLock::new(inner)),
+            path,
+        };
         // First run: write a default config.toml next to the exe so the
         // user can discover the file, hand-edit it, or just confirm where
         // settings live. Failure here is logged but non-fatal — the app
@@ -251,9 +279,13 @@ impl ConfigHandle {
         handle
     }
 
-    pub fn path(&self) -> &Path { &self.path }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 
-    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, Config> { self.inner.read() }
+    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, Config> {
+        self.inner.read()
+    }
 
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut Config) -> R) -> R {
         let mut g = self.inner.write();
@@ -265,15 +297,19 @@ impl ConfigHandle {
         if let Some(parent) = self.path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        std::fs::write(&self.path, text)
-            .map_err(|e| ConfigError::Io { path: self.path.clone(), source: e })
+        std::fs::write(&self.path, text).map_err(|e| ConfigError::Io {
+            path: self.path.clone(),
+            source: e,
+        })
     }
 
     pub fn push_recent(&self, path: &str, max: usize) {
         self.with_mut(|cfg| {
             cfg.recent_paths.retain(|p| p != path);
             cfg.recent_paths.insert(0, path.to_string());
-            if cfg.recent_paths.len() > max { cfg.recent_paths.truncate(max); }
+            if cfg.recent_paths.len() > max {
+                cfg.recent_paths.truncate(max);
+            }
         });
     }
 }
@@ -287,11 +323,14 @@ pub fn exe_dir() -> Result<PathBuf> {
 /// Config file path. Falls back to current working directory if exe path
 /// resolution fails — the caller still gets a usable handle.
 pub fn config_path_or_default() -> PathBuf {
-    exe_dir().unwrap_or_else(|_| PathBuf::from(".")).join("config.toml")
+    exe_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("config.toml")
 }
 
 /// Directory plugins are loaded from.
 pub fn plugin_dir() -> PathBuf {
-    exe_dir().unwrap_or_else(|_| PathBuf::from(".")).join("plugins")
+    exe_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("plugins")
 }
-

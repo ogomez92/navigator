@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::thread;
 
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use parking_lot::Mutex;
 use tracing::warn;
 
@@ -40,17 +40,26 @@ impl SpeechSink {
             .spawn(move || speech_loop(prism_for_worker, rx))
             .expect("spawn speech worker");
 
-        Self { tx, _worker: worker, _prism: prism }
+        Self {
+            tx,
+            _worker: worker,
+            _prism: prism,
+        }
     }
 
     /// Raw sender clone for worker threads that need a long-lived handle.
-    pub fn handle(&self) -> Sender<Utterance> { self.tx.clone() }
+    pub fn handle(&self) -> Sender<Utterance> {
+        self.tx.clone()
+    }
 
     /// Enqueue an utterance. If the queue is full we retry once — by the
     /// time the caller races the worker the latter typically has drained a
     /// slot. Still full after the retry: drop with a warning.
     pub fn say(&self, text: impl Into<String>, interrupt: bool) {
-        let u = Utterance { text: text.into(), interrupt };
+        let u = Utterance {
+            text: text.into(),
+            interrupt,
+        };
         match self.tx.try_send(u) {
             Ok(()) => {}
             Err(TrySendError::Full(back)) => {

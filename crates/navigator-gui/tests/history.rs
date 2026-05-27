@@ -6,7 +6,9 @@
 use navigator_core::NavPath;
 use navigator_gui::history::History;
 
-fn p(s: &str) -> NavPath { NavPath::new(s).unwrap() }
+fn p(s: &str) -> NavPath {
+    NavPath::new(s).unwrap()
+}
 
 #[test]
 fn empty_history_cannot_move() {
@@ -33,9 +35,9 @@ fn back_and_forward_round_trip() {
     h.push(p(r"C:\c"));
     assert_eq!(h.current(), Some(&p(r"C:\c")));
 
-    assert_eq!(h.back(),    Some(&p(r"C:\b")));
-    assert_eq!(h.back(),    Some(&p(r"C:\a")));
-    assert_eq!(h.back(),    None); // clamped
+    assert_eq!(h.back(), Some(&p(r"C:\b")));
+    assert_eq!(h.back(), Some(&p(r"C:\a")));
+    assert_eq!(h.back(), None); // clamped
     assert_eq!(h.current(), Some(&p(r"C:\a")));
 
     assert_eq!(h.forward(), Some(&p(r"C:\b")));
@@ -49,8 +51,8 @@ fn push_after_back_truncates_forward() {
     h.push(p(r"C:\a"));
     h.push(p(r"C:\b"));
     h.push(p(r"C:\c"));
-    h.back();                  // at b
-    h.push(p(r"C:\x"));        // new timeline from b
+    h.back(); // at b
+    h.push(p(r"C:\x")); // new timeline from b
     // Forward stack discarded.
     assert_eq!(h.current(), Some(&p(r"C:\x")));
     assert!(!h.can_forward());

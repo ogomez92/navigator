@@ -9,9 +9,7 @@
 #![cfg(windows)]
 
 use navigator_config::ShortcutChord;
-use windows::Win32::UI::WindowsAndMessaging::{
-    ACCEL_VIRT_FLAGS, FALT, FCONTROL, FSHIFT, FVIRTKEY,
-};
+use windows::Win32::UI::WindowsAndMessaging::{ACCEL_VIRT_FLAGS, FALT, FCONTROL, FSHIFT, FVIRTKEY};
 
 /// Parse a key name into a Virtual-Key code. Accepts:
 ///
@@ -25,7 +23,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// Returns `None` for anything else — callers treat that as "no accelerator".
 pub fn parse_vk(s: &str) -> Option<u16> {
     let s = s.trim();
-    if s.is_empty() { return None; }
+    if s.is_empty() {
+        return None;
+    }
     let bytes = s.as_bytes();
     if bytes.len() == 1 {
         let b = bytes[0].to_ascii_uppercase();
@@ -49,25 +49,26 @@ pub fn parse_vk(s: &str) -> Option<u16> {
 /// rather than a match so the editor UI can enumerate the valid names.
 fn named_vk(s: &str) -> Option<u16> {
     const NAMED: &[(&str, u16)] = &[
-        ("Up",         0x26),
-        ("Down",       0x28),
-        ("Left",       0x25),
-        ("Right",      0x27),
-        ("Home",       0x24),
-        ("End",        0x23),
-        ("PageUp",     0x21),
-        ("PageDown",   0x22),
-        ("Insert",     0x2D),
-        ("Delete",     0x2E),
-        ("Tab",        0x09),
-        ("Space",      0x20),
-        ("Escape",     0x1B),
-        ("Esc",        0x1B),
-        ("Enter",      0x0D),
-        ("Return",     0x0D),
-        ("Backspace",  0x08),
+        ("Up", 0x26),
+        ("Down", 0x28),
+        ("Left", 0x25),
+        ("Right", 0x27),
+        ("Home", 0x24),
+        ("End", 0x23),
+        ("PageUp", 0x21),
+        ("PageDown", 0x22),
+        ("Insert", 0x2D),
+        ("Delete", 0x2E),
+        ("Tab", 0x09),
+        ("Space", 0x20),
+        ("Escape", 0x1B),
+        ("Esc", 0x1B),
+        ("Enter", 0x0D),
+        ("Return", 0x0D),
+        ("Backspace", 0x08),
     ];
-    NAMED.iter()
+    NAMED
+        .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(s))
         .map(|(_, vk)| *vk)
 }
@@ -77,8 +78,14 @@ fn named_vk(s: &str) -> Option<u16> {
 pub fn chord_to_accel(chord: &ShortcutChord) -> Option<(u16, ACCEL_VIRT_FLAGS)> {
     let vk = parse_vk(&chord.key)?;
     let mut mods = FVIRTKEY;
-    if chord.ctrl  { mods = mods | FCONTROL; }
-    if chord.shift { mods = mods | FSHIFT; }
-    if chord.alt   { mods = mods | FALT; }
+    if chord.ctrl {
+        mods = mods | FCONTROL;
+    }
+    if chord.shift {
+        mods = mods | FSHIFT;
+    }
+    if chord.alt {
+        mods = mods | FALT;
+    }
     Some((vk, mods))
 }

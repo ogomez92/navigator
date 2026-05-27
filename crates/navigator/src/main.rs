@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 use navigator_core::NavPath;
-use navigator_gui::{run, AppConfig};
+use navigator_gui::{AppConfig, run};
 
 fn main() -> anyhow_lite::Result<()> {
     init_tracing();
@@ -18,7 +18,10 @@ fn main() -> anyhow_lite::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let initial_path = match parse_args(&args) {
         ParsedArgs::Path(p) => p,
-        ParsedArgs::Help => { print_usage(); return Ok(()); }
+        ParsedArgs::Help => {
+            print_usage();
+            return Ok(());
+        }
         ParsedArgs::BadArg(msg) => {
             eprintln!("navigator: {}\n", msg);
             print_usage();
@@ -40,7 +43,7 @@ enum ParsedArgs {
 
 /// Parse CLI args. Recognised forms:
 ///   navigator                               — default drive root
-///   navigator <path>                        — local path or `remote:sub`
+///   navigator <path>                        — absolute/relative local path or `remote:sub`
 ///   navigator -r <remote[:sub]>             — explicit remote (name-only OK)
 ///   navigator --remote <remote[:sub]>       — long form of -r
 ///   navigator -h | --help                   — usage
@@ -59,17 +62,38 @@ fn parse_args(args: &[String]) -> ParsedArgs {
             };
             // Bare `mac` becomes `mac:` so `-r mac` drops at the remote
             // root; `mac:sub/path` already parses correctly.
-            let spec = if v.contains(':') { v.clone() } else { format!("{}:", v) };
+            let spec = if v.contains(':') {
+                v.clone()
+            } else {
+                format!("{}:", v)
+            };
             match NavPath::new(PathBuf::from(&spec)) {
                 Ok(p) => ParsedArgs::Path(p),
                 Err(e) => ParsedArgs::BadArg(format!("invalid remote {:?}: {}", spec, e)),
             }
         }
-        _ => match NavPath::new(PathBuf::from(first)) {
+        _ => match parse_path_arg(first) {
             Ok(p) => ParsedArgs::Path(p),
             Err(_) => ParsedArgs::Path(NavPath::default_root()),
         },
     }
+}
+
+fn parse_path_arg(raw: &str) -> navigator_core::Result<NavPath> {
+    let path = PathBuf::from(raw);
+    match NavPath::new(path.clone()) {
+        Ok(p) => Ok(p),
+        Err(_) if should_resolve_relative(raw, &path) => {
+            let abs = std::path::absolute(&path)
+                .map_err(|source| navigator_core::Error::io(path.clone(), source))?;
+            NavPath::new(abs)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn should_resolve_relative(raw: &str, path: &std::path::Path) -> bool {
+    !path.is_absolute() && !raw.contains(':')
 }
 
 #[cfg(test)]
@@ -90,14 +114,19 @@ mod tests {
     #[test]
     fn no_args_is_default_root() {
         let r = parse_args(&[]);
-        let ParsedArgs::Path(p) = r else { panic!("expected Path") };
+        let ParsedArgs::Path(p) = r else {
+            panic!("expected Path")
+        };
         assert_eq!(p, NavPath::default_root());
     }
 
     #[test]
     fn help_short_and_long() {
         assert!(matches!(parse_args(&strings(&["-h"])), ParsedArgs::Help));
-        assert!(matches!(parse_args(&strings(&["--help"])), ParsedArgs::Help));
+        assert!(matches!(
+            parse_args(&strings(&["--help"])),
+            ParsedArgs::Help
+        ));
     }
 
     #[test]
@@ -122,7 +151,10 @@ mod tests {
 
     #[test]
     fn remote_flag_missing_value_is_error() {
-        assert!(matches!(parse_args(&strings(&["-r"])), ParsedArgs::BadArg(_)));
+        assert!(matches!(
+            parse_args(&strings(&["-r"])),
+            ParsedArgs::BadArg(_)
+        ));
     }
 
     #[test]
@@ -134,8 +166,37 @@ mod tests {
     #[test]
     fn bare_absolute_local_path() {
         let r = parse_args(&strings(&[r"C:\Users"]));
-        let ParsedArgs::Path(p) = r else { panic!("expected Path") };
+        let ParsedArgs::Path(p) = r else {
+            panic!("expected Path")
+        };
         assert!(!p.is_remote());
+    }
+
+    #[test]
+    fn relative_dot_resolves_from_current_dir() {
+        let r = parse_args(&strings(&["."]));
+        let ParsedArgs::Path(p) = r else {
+            panic!("expected Path")
+        };
+        assert_eq!(p.as_path(), std::path::absolute(".").unwrap());
+    }
+
+    #[test]
+    fn relative_child_resolves_from_current_dir() {
+        let r = parse_args(&strings(&["src"]));
+        let ParsedArgs::Path(p) = r else {
+            panic!("expected Path")
+        };
+        assert_eq!(p.as_path(), std::path::absolute("src").unwrap());
+    }
+
+    #[test]
+    fn drive_relative_path_is_not_treated_as_cli_relative() {
+        let r = parse_args(&strings(&["C:foo"]));
+        let ParsedArgs::Path(p) = r else {
+            panic!("expected Path")
+        };
+        assert_eq!(p, NavPath::default_root());
     }
 }
 
@@ -147,7 +208,7 @@ fn print_usage() {
             navigator [OPTIONS] [PATH]\n\
          \n\
          ARGS:\n    \
-            <PATH>                Local path (C:\\foo) or rclone remote (mac:downloads)\n\
+            <PATH>                Local path (C:\\foo, .) or rclone remote (mac:downloads)\n\
          \n\
          OPTIONS:\n    \
             -r, --remote <SPEC>   Open an rclone remote. SPEC is `name` or `name:sub/path`\n    \
@@ -155,6 +216,7 @@ fn print_usage() {
          \n\
          EXAMPLES:\n    \
             navigator\n    \
+            navigator .\n    \
             navigator C:\\Users\\me\\Downloads\n    \
             navigator -r mac:Downloads/incoming\n    \
             navigator -r gdrive\n    \
@@ -163,8 +225,8 @@ fn print_usage() {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_env("NAVIGATOR_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_from_env("NAVIGATOR_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -175,8 +237,14 @@ fn init_tracing() {
 mod anyhow_lite {
     #[derive(Debug)]
     pub struct Error(pub String);
-    impl std::fmt::Display for Error { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) } }
+    impl std::fmt::Display for Error {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
     impl std::error::Error for Error {}
     pub type Result<T> = std::result::Result<T, Error>;
-    pub fn anyhow(s: impl Into<String>) -> Error { Error(s.into()) }
+    pub fn anyhow(s: impl Into<String>) -> Error {
+        Error(s.into())
+    }
 }

@@ -40,12 +40,20 @@ pub struct LogEvent {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[allow(non_snake_case)]
 pub struct Stats {
-    #[serde(default)] pub bytes: u64,
-    #[serde(default)] pub totalBytes: u64,
-    #[serde(default)] pub transfers: u64,
-    #[serde(default)] pub totalTransfers: u64,
-    #[serde(default)] pub speed: f64,
-    #[serde(default)] pub eta: Option<u64>,
-    #[serde(default)] pub elapsedTime: f64,
-    #[serde(default)] pub errors: u64,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub totalBytes: u64,
+    #[serde(default)]
+    pub transfers: u64,
+    #[serde(default)]
+    pub totalTransfers: u64,
+    #[serde(default)]
+    pub speed: f64,
+    #[serde(default)]
+    pub eta: Option<u64>,
+    #[serde(default)]
+    pub elapsedTime: f64,
+    #[serde(default)]
+    pub errors: u64,
 }

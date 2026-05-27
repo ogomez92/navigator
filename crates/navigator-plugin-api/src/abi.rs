@@ -15,13 +15,20 @@ pub struct Str {
 }
 
 impl Str {
-    pub fn from(s: &str) -> Self { Self { ptr: s.as_ptr(), len: s.len() } }
+    pub fn from(s: &str) -> Self {
+        Self {
+            ptr: s.as_ptr(),
+            len: s.len(),
+        }
+    }
 
     /// # Safety
     /// `ptr..ptr+len` must be a valid UTF-8 byte range, valid for reads for
     /// the lifetime of the returned reference.
     pub unsafe fn as_str<'a>(&self) -> &'a str {
-        if self.ptr.is_null() || self.len == 0 { return ""; }
+        if self.ptr.is_null() || self.len == 0 {
+            return "";
+        }
         let slice = unsafe { std::slice::from_raw_parts(self.ptr, self.len) };
         std::str::from_utf8(slice).unwrap_or("")
     }
@@ -47,7 +54,7 @@ pub struct HostApi {
     pub host: *mut c_void,
 
     pub speak: unsafe extern "C" fn(host: *mut c_void, text: Str, interrupt: bool),
-    pub log:   unsafe extern "C" fn(host: *mut c_void, level: u8, msg: Str),
+    pub log: unsafe extern "C" fn(host: *mut c_void, level: u8, msg: Str),
     pub navigate: unsafe extern "C" fn(host: *mut c_void, path: Str),
 }
 
@@ -67,7 +74,7 @@ pub struct Plugin {
     pub on_navigated: unsafe extern "C" fn(plugin: *mut c_void, path: Str),
 
     /// Optional hook called when the focus changes in the listing.
-    pub on_focused:   unsafe extern "C" fn(plugin: *mut c_void, path: Str, name: Str, index: usize),
+    pub on_focused: unsafe extern "C" fn(plugin: *mut c_void, path: Str, name: Str, index: usize),
 
     /// Called once as the plugin is being unloaded. Plugin must drop its
     /// context here; host then closes the DLL.

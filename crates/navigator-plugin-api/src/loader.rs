@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use libloading::{Library, Symbol};
 
-use crate::abi::{HostApi, Plugin, PluginEntry, ABI_VERSION};
+use crate::abi::{ABI_VERSION, HostApi, Plugin, PluginEntry};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
@@ -16,7 +16,11 @@ pub enum PluginError {
     #[error("{path} entry returned non-zero code {code}")]
     EntryFailed { path: PathBuf, code: i32 },
     #[error("{path} ABI mismatch: plugin={plugin}, host={host}")]
-    AbiMismatch { path: PathBuf, plugin: u32, host: u32 },
+    AbiMismatch {
+        path: PathBuf,
+        plugin: u32,
+        host: u32,
+    },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -60,7 +64,9 @@ pub struct PluginLoader {
 }
 
 impl PluginLoader {
-    pub fn new(host_api: HostApi) -> Self { Self { host_api } }
+    pub fn new(host_api: HostApi) -> Self {
+        Self { host_api }
+    }
 
     /// Load every `.dll` found directly under `dir`.
     pub fn load_directory(&self, dir: &Path) -> Vec<Result<LoadedPlugin, PluginError>> {
@@ -81,8 +87,8 @@ impl PluginLoader {
     pub fn load_one(&self, path: &Path) -> Result<LoadedPlugin, PluginError> {
         // Safety: loading arbitrary DLLs is inherently unsafe (they run
         // constructor code). Callers must only point at trusted plugin dirs.
-        let lib = unsafe { Library::new(path) }
-            .map_err(|e| PluginError::Load(path.to_path_buf(), e))?;
+        let lib =
+            unsafe { Library::new(path) }.map_err(|e| PluginError::Load(path.to_path_buf(), e))?;
 
         let entry: Symbol<PluginEntry> = unsafe { lib.get(crate::ENTRY_SYMBOL) }
             .map_err(|e| PluginError::MissingEntry(path.to_path_buf(), e))?;
@@ -93,7 +99,10 @@ impl PluginLoader {
         let mut vtable_uninit: std::mem::MaybeUninit<Plugin> = std::mem::MaybeUninit::uninit();
         let rc = unsafe { entry(&self.host_api, vtable_uninit.as_mut_ptr()) };
         if rc != 0 {
-            return Err(PluginError::EntryFailed { path: path.to_path_buf(), code: rc });
+            return Err(PluginError::EntryFailed {
+                path: path.to_path_buf(),
+                code: rc,
+            });
         }
         let vtable = unsafe { vtable_uninit.assume_init() };
         if vtable.abi_version != ABI_VERSION {
@@ -105,6 +114,10 @@ impl PluginLoader {
         }
         // Drop the symbol before moving `lib` into the result.
         drop(entry);
-        Ok(LoadedPlugin { path: path.to_path_buf(), vtable, _lib: lib })
+        Ok(LoadedPlugin {
+            path: path.to_path_buf(),
+            vtable,
+            _lib: lib,
+        })
     }
 }

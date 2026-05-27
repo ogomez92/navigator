@@ -10,11 +10,11 @@
 
 use std::iter::once;
 
-use windows::core::{BOOL, PCWSTR};
 use windows::Win32::UI::Controls::{
-    TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
-    TASKDIALOG_BUTTON, TASKDIALOG_FLAGS, TDCBF_CANCEL_BUTTON, TDF_POSITION_RELATIVE_TO_WINDOW,
+    TASKDIALOG_BUTTON, TASKDIALOG_FLAGS, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
+    TDCBF_CANCEL_BUTTON, TDF_POSITION_RELATIVE_TO_WINDOW, TaskDialogIndirect,
 };
+use windows::core::{BOOL, PCWSTR};
 
 use navigator_core::NavPath;
 
@@ -41,8 +41,8 @@ pub struct BatchDecision {
 }
 
 const ID_OVERWRITE: i32 = 1001;
-const ID_SKIP: i32      = 1002;
-const ID_RENAME: i32    = 1003;
+const ID_SKIP: i32 = 1002;
+const ID_RENAME: i32 = 1003;
 
 /// Ask the user about a single conflict. Returns a [`BatchDecision`].
 pub fn prompt_item(
@@ -51,11 +51,14 @@ pub fn prompt_item(
     dst: &NavPath,
     remaining: usize,
 ) -> BatchDecision {
-    let title_w: Vec<u16> = "File already exists".encode_utf16().chain(once(0)).collect();
-    let heading_w: Vec<u16> = format!(
-        "\"{}\" already exists at the destination.",
-        dst.file_name()
-    ).encode_utf16().chain(once(0)).collect();
+    let title_w: Vec<u16> = "File already exists"
+        .encode_utf16()
+        .chain(once(0))
+        .collect();
+    let heading_w: Vec<u16> = format!("\"{}\" already exists at the destination.", dst.file_name())
+        .encode_utf16()
+        .chain(once(0))
+        .collect();
     let preview = unique_numbered_path(dst.as_path());
     let body = format!(
         "Source:\n{}\n\nDestination:\n{}\n\n\
@@ -63,14 +66,22 @@ pub fn prompt_item(
          Skip leaves the destination untouched and continues with the rest.\n\
          Keep both writes the source to \"{}\" instead.\n\n\
          {} conflict(s) remaining.",
-        src, dst, preview.file_name().and_then(|s| s.to_str()).unwrap_or(""), remaining,
+        src,
+        dst,
+        preview.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+        remaining,
     );
     let body_w: Vec<u16> = body.encode_utf16().chain(once(0)).collect();
     let verify_w: Vec<u16> = "Apply to all remaining conflicts"
-        .encode_utf16().chain(once(0)).collect();
+        .encode_utf16()
+        .chain(once(0))
+        .collect();
     let ovw_w: Vec<u16> = "&Overwrite".encode_utf16().chain(once(0)).collect();
     let skip_w: Vec<u16> = "&Skip".encode_utf16().chain(once(0)).collect();
-    let keep_w: Vec<u16> = "&Keep both (append number)".encode_utf16().chain(once(0)).collect();
+    let keep_w: Vec<u16> = "&Keep both (append number)"
+        .encode_utf16()
+        .chain(once(0))
+        .collect();
 
     let buttons = [
         TASKDIALOG_BUTTON {
@@ -118,19 +129,20 @@ pub fn prompt_item(
 
     let mut button = 0i32;
     let mut verify = BOOL(0);
-    let rc = unsafe {
-        TaskDialogIndirect(&config, Some(&mut button), None, Some(&mut verify))
-    };
+    let rc = unsafe { TaskDialogIndirect(&config, Some(&mut button), None, Some(&mut verify)) };
     if rc.is_err() {
         // API failure — treat as Cancel to be safe.
-        return BatchDecision { choice: ItemChoice::Cancel, sticky: true };
+        return BatchDecision {
+            choice: ItemChoice::Cancel,
+            sticky: true,
+        };
     }
     let sticky = verify.as_bool();
     let choice = match button {
         ID_OVERWRITE => ItemChoice::Overwrite,
-        ID_SKIP      => ItemChoice::Skip,
-        ID_RENAME    => ItemChoice::Rename,
-        _            => ItemChoice::Cancel,
+        ID_SKIP => ItemChoice::Skip,
+        ID_RENAME => ItemChoice::Rename,
+        _ => ItemChoice::Cancel,
     };
     BatchDecision { choice, sticky }
 }
@@ -149,12 +161,11 @@ pub fn prompt_item(
 /// * `archive.tar.gz` (taken) → `archive.tar (1).gz` (Explorer parity —
 ///   only the last extension segment is preserved)
 pub fn unique_numbered_path(dst: &std::path::Path) -> std::path::PathBuf {
-    if !dst.exists() { return dst.to_path_buf(); }
+    if !dst.exists() {
+        return dst.to_path_buf();
+    }
     let parent = dst.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    let stem = dst
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let stem = dst.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     let ext = dst.extension().and_then(|s| s.to_str());
     for n in 1..10_000 {
         let name = match ext {
@@ -162,7 +173,9 @@ pub fn unique_numbered_path(dst: &std::path::Path) -> std::path::PathBuf {
             _ => format!("{} ({})", stem, n),
         };
         let candidate = parent.join(&name);
-        if !candidate.exists() { return candidate; }
+        if !candidate.exists() {
+            return candidate;
+        }
     }
     dst.to_path_buf()
 }

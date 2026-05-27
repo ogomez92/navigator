@@ -104,7 +104,9 @@ impl Speaker {
     pub fn name(&self) -> &'static str {
         unsafe {
             let p = ffi::prism_backend_name(self.backend.as_ptr());
-            if p.is_null() { return ""; }
+            if p.is_null() {
+                return "";
+            }
             std::ffi::CStr::from_ptr(p).to_str().unwrap_or("")
         }
     }
@@ -122,13 +124,18 @@ fn check(err: ffi::PrismError) -> Result<()> {
     } else {
         let name = unsafe {
             let p = ffi::prism_error_string(err);
-            if p.is_null() { "unknown" } else {
+            if p.is_null() {
+                "unknown"
+            } else {
                 std::ffi::CStr::from_ptr(p).to_str().unwrap_or("unknown")
             }
         };
         // The str we return has 'static lifetime for formatting; safe because
         // prism_error_string returns pointers into static storage.
         let name_static: &'static str = unsafe { std::mem::transmute::<&str, &'static str>(name) };
-        Err(PrismError::Backend { code: err, name: name_static })
+        Err(PrismError::Backend {
+            code: err,
+            name: name_static,
+        })
     }
 }

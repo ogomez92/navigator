@@ -27,7 +27,9 @@ fn rclone_available() -> bool {
         .unwrap_or(false)
 }
 
-fn nav(p: &Path) -> NavPath { NavPath::new(p.to_path_buf()).unwrap() }
+fn nav(p: &Path) -> NavPath {
+    NavPath::new(p.to_path_buf()).unwrap()
+}
 
 /// Drive one rclone op to completion. Returns `(success, event_count)`.
 fn run_to_completion(driver: &RcloneDriver, op: Operation) -> (bool, usize) {
@@ -46,7 +48,10 @@ fn run_to_completion(driver: &RcloneDriver, op: Operation) -> (bool, usize) {
 
 #[test]
 fn copy_single_file_dry_run_does_not_touch_dest() {
-    if !rclone_available() { eprintln!("rclone not available; skipping"); return; }
+    if !rclone_available() {
+        eprintln!("rclone not available; skipping");
+        return;
+    }
     let src_dir = tempfile::tempdir().unwrap();
     let dst_dir = tempfile::tempdir().unwrap();
     let src = src_dir.path().join("a.txt");
@@ -55,48 +60,69 @@ fn copy_single_file_dry_run_does_not_touch_dest() {
     // Dry-run via the preflight helper — copy uses `copyto` internally,
     // so the preflight report gives us a signal without mutating dst.
     let driver = RcloneDriver::from_path();
-    let report = driver.preflight(&Operation::Copy {
-        sources: vec![nav(&src)],
-        dest_dir: nav(dst_dir.path()),
-        policy: OverwritePolicy::Always,
-    }).expect("preflight");
+    let report = driver
+        .preflight(&Operation::Copy {
+            sources: vec![nav(&src)],
+            dest_dir: nav(dst_dir.path()),
+            policy: OverwritePolicy::Always,
+        })
+        .expect("preflight");
 
-    assert!(!dst_dir.path().join("a.txt").exists(),
-        "dry-run must not create dest");
+    assert!(
+        !dst_dir.path().join("a.txt").exists(),
+        "dry-run must not create dest"
+    );
     assert!(!report.raw_log.is_empty(), "expected log records");
 }
 
 #[test]
 fn copy_single_file_actually_copies() {
-    if !rclone_available() { return; }
+    if !rclone_available() {
+        return;
+    }
     let src_dir = tempfile::tempdir().unwrap();
     let dst_dir = tempfile::tempdir().unwrap();
     let src = src_dir.path().join("alpha.bin");
     fs::write(&src, b"payload").unwrap();
 
     let driver = RcloneDriver::from_path();
-    let (ok, _) = run_to_completion(&driver, Operation::Copy {
-        sources: vec![nav(&src)],
-        dest_dir: nav(dst_dir.path()),
-        policy: OverwritePolicy::Always,
-    });
+    let (ok, _) = run_to_completion(
+        &driver,
+        Operation::Copy {
+            sources: vec![nav(&src)],
+            dest_dir: nav(dst_dir.path()),
+            policy: OverwritePolicy::Always,
+        },
+    );
     assert!(ok, "copy should succeed");
-    assert!(dst_dir.path().join("alpha.bin").exists(), "dest file must exist");
-    assert_eq!(fs::read(dst_dir.path().join("alpha.bin")).unwrap(), b"payload");
+    assert!(
+        dst_dir.path().join("alpha.bin").exists(),
+        "dest file must exist"
+    );
+    assert_eq!(
+        fs::read(dst_dir.path().join("alpha.bin")).unwrap(),
+        b"payload"
+    );
 }
 
 #[test]
 fn rename_moves_and_renames_in_place() {
-    if !rclone_available() { return; }
+    if !rclone_available() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("old.txt");
     let dst = dir.path().join("new.txt");
     fs::write(&src, b"x").unwrap();
 
     let driver = RcloneDriver::from_path();
-    let (ok, _) = run_to_completion(&driver, Operation::Rename {
-        src: nav(&src), dst: nav(&dst),
-    });
+    let (ok, _) = run_to_completion(
+        &driver,
+        Operation::Rename {
+            src: nav(&src),
+            dst: nav(&dst),
+        },
+    );
     assert!(ok, "rename should succeed");
     assert!(!src.exists(), "old name should be gone");
     assert!(dst.exists(), "new name should exist");
@@ -105,7 +131,9 @@ fn rename_moves_and_renames_in_place() {
 
 #[test]
 fn overwrite_never_policy_preserves_existing_destination() {
-    if !rclone_available() { return; }
+    if !rclone_available() {
+        return;
+    }
     let src_dir = tempfile::tempdir().unwrap();
     let dst_dir = tempfile::tempdir().unwrap();
 
@@ -115,19 +143,28 @@ fn overwrite_never_policy_preserves_existing_destination() {
     fs::write(&dst, b"OLD").unwrap();
 
     let driver = RcloneDriver::from_path();
-    let (ok, _) = run_to_completion(&driver, Operation::Copy {
-        sources: vec![nav(&src)],
-        dest_dir: nav(dst_dir.path()),
-        policy: OverwritePolicy::Never,
-    });
+    let (ok, _) = run_to_completion(
+        &driver,
+        Operation::Copy {
+            sources: vec![nav(&src)],
+            dest_dir: nav(dst_dir.path()),
+            policy: OverwritePolicy::Never,
+        },
+    );
     // With --ignore-existing, rclone skips and returns success.
     assert!(ok);
-    assert_eq!(fs::read(&dst).unwrap(), b"OLD", "destination must not be overwritten");
+    assert_eq!(
+        fs::read(&dst).unwrap(),
+        b"OLD",
+        "destination must not be overwritten"
+    );
 }
 
 #[test]
 fn overwrite_always_policy_replaces_destination() {
-    if !rclone_available() { return; }
+    if !rclone_available() {
+        return;
+    }
     let src_dir = tempfile::tempdir().unwrap();
     let dst_dir = tempfile::tempdir().unwrap();
 
@@ -141,38 +178,51 @@ fn overwrite_always_policy_replaces_destination() {
     fs::write(&dst, b"OLD").unwrap();
 
     let driver = RcloneDriver::from_path();
-    let (ok, _) = run_to_completion(&driver, Operation::Copy {
-        sources: vec![nav(&src)],
-        dest_dir: nav(dst_dir.path()),
-        policy: OverwritePolicy::Always,
-    });
+    let (ok, _) = run_to_completion(
+        &driver,
+        Operation::Copy {
+            sources: vec![nav(&src)],
+            dest_dir: nav(dst_dir.path()),
+            policy: OverwritePolicy::Always,
+        },
+    );
     assert!(ok);
-    assert_eq!(fs::read(&dst).unwrap(), b"NEW_CONTENT_LONGER",
-        "destination must be overwritten when policy is Always");
+    assert_eq!(
+        fs::read(&dst).unwrap(),
+        b"NEW_CONTENT_LONGER",
+        "destination must be overwritten when policy is Always"
+    );
 }
 
 #[test]
 fn move_single_file_removes_source() {
-    if !rclone_available() { return; }
+    if !rclone_available() {
+        return;
+    }
     let src_dir = tempfile::tempdir().unwrap();
     let dst_dir = tempfile::tempdir().unwrap();
     let src = src_dir.path().join("moveme.txt");
     fs::write(&src, b"contents").unwrap();
 
     let driver = RcloneDriver::from_path();
-    let (ok, _) = run_to_completion(&driver, Operation::Move {
-        sources: vec![nav(&src)],
-        dest_dir: nav(dst_dir.path()),
-        policy: OverwritePolicy::Always,
-    });
+    let (ok, _) = run_to_completion(
+        &driver,
+        Operation::Move {
+            sources: vec![nav(&src)],
+            dest_dir: nav(dst_dir.path()),
+            policy: OverwritePolicy::Always,
+        },
+    );
     assert!(ok);
     assert!(!src.exists(), "source must be gone after move");
     assert!(dst_dir.path().join("moveme.txt").exists());
 }
 
 #[test]
-fn move_directory_removes_empty_source_dir() {
-    if !rclone_available() { return; }
+fn move_directory_relocates_files() {
+    if !rclone_available() {
+        return;
+    }
     let src_dir = tempfile::tempdir().unwrap();
     let dst_dir = tempfile::tempdir().unwrap();
     let tree = src_dir.path().join("tree");
@@ -181,21 +231,36 @@ fn move_directory_removes_empty_source_dir() {
     fs::write(tree.join("sub").join("leaf.txt"), b"l").unwrap();
 
     let driver = RcloneDriver::from_path();
-    let (ok, _) = run_to_completion(&driver, Operation::Move {
-        sources: vec![nav(&tree)],
-        dest_dir: nav(dst_dir.path()),
-        policy: OverwritePolicy::Always,
-    });
+    let (ok, _) = run_to_completion(
+        &driver,
+        Operation::Move {
+            sources: vec![nav(&tree)],
+            dest_dir: nav(dst_dir.path()),
+            policy: OverwritePolicy::Always,
+        },
+    );
     assert!(ok, "move should succeed");
     assert!(dst_dir.path().join("tree").join("root.txt").exists());
-    assert!(dst_dir.path().join("tree").join("sub").join("leaf.txt").exists());
-    assert!(!tree.exists(),
-        "source tree must be removed (--delete-empty-src-dirs)");
+    assert!(
+        dst_dir
+            .path()
+            .join("tree")
+            .join("sub")
+            .join("leaf.txt")
+            .exists()
+    );
+    assert!(!tree.join("root.txt").exists(), "source files must be gone");
+    assert!(
+        !tree.join("sub").join("leaf.txt").exists(),
+        "source files must be gone"
+    );
 }
 
 #[test]
 fn delete_purges_path() {
-    if !rclone_available() { return; }
+    if !rclone_available() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let target_dir = dir.path().join("doomed");
     fs::create_dir(&target_dir).unwrap();
@@ -203,40 +268,53 @@ fn delete_purges_path() {
     fs::write(target_dir.join("b"), b"").unwrap();
 
     let driver = RcloneDriver::from_path();
-    let (ok, _) = run_to_completion(&driver, Operation::Delete {
-        targets: vec![nav(&target_dir)],
-    });
+    let (ok, _) = run_to_completion(
+        &driver,
+        Operation::Delete {
+            targets: vec![nav(&target_dir)],
+        },
+    );
     assert!(ok);
     assert!(!target_dir.exists(), "purged directory must be gone");
 }
 
 #[test]
 fn preflight_on_missing_source_reports_error() {
-    if !rclone_available() { return; }
+    if !rclone_available() {
+        return;
+    }
     let dst_dir = tempfile::tempdir().unwrap();
     let bogus = nav(Path::new(r"C:\does_not_exist_8b3a7c\nope.bin"));
 
     let driver = RcloneDriver::from_path();
-    let report = driver.preflight(&Operation::Copy {
-        sources: vec![bogus],
-        dest_dir: nav(dst_dir.path()),
-        policy: OverwritePolicy::Always,
-    }).expect("preflight returns even on failure");
+    let report = driver
+        .preflight(&Operation::Copy {
+            sources: vec![bogus],
+            dest_dir: nav(dst_dir.path()),
+            policy: OverwritePolicy::Always,
+        })
+        .expect("preflight returns even on failure");
 
     // rclone's error vocabulary for "missing source" varies slightly
     // between versions — it may be logged as Error, Critical, Warning,
     // or a plain message. Any record whose text mentions the bogus path
     // is evidence the failure surfaced to us.
-    let mentioned = report.raw_log.iter().any(|e|
+    let mentioned = report.raw_log.iter().any(|e| {
         e.msg.to_lowercase().contains("not found")
-        || e.msg.to_lowercase().contains("failed")
-        || e.msg.to_lowercase().contains("no such")
-        || e.object.as_deref().is_some_and(|o| o.contains("does_not_exist_8b3a7c"))
-    );
+            || e.msg.to_lowercase().contains("failed")
+            || e.msg.to_lowercase().contains("no such")
+            || e.object
+                .as_deref()
+                .is_some_and(|o| o.contains("does_not_exist_8b3a7c"))
+    });
     assert!(
         mentioned,
         "expected log to mention the missing source; got {:#?}",
-        report.raw_log.iter().map(|e| (&e.level, &e.msg)).collect::<Vec<_>>()
+        report
+            .raw_log
+            .iter()
+            .map(|e| (&e.level, &e.msg))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -256,7 +334,9 @@ fn base_args_include_transfers_flag() {
     // need for a real rclone binary on PATH.
     let driver = RcloneDriver::from_path().with_transfers(12);
     let args = driver.base_args();
-    let pos = args.iter().position(|a| a == "--transfers")
+    let pos = args
+        .iter()
+        .position(|a| a == "--transfers")
         .expect("--transfers missing from base args");
     assert_eq!(args.get(pos + 1).map(String::as_str), Some("12"));
 }
@@ -277,25 +357,32 @@ fn transfers_overrides_propagate_to_running_ops() {
     // End-to-end: set --transfers, spawn a real copy, assert it still
     // succeeds. Proves the flag doesn't break rclone parsing. Skipped
     // when no rclone binary is on PATH.
-    if !rclone_available() { return; }
+    if !rclone_available() {
+        return;
+    }
     let src_dir = tempfile::tempdir().unwrap();
     let dst_dir = tempfile::tempdir().unwrap();
     fs::write(src_dir.path().join("x.bin"), b"hello").unwrap();
 
     let driver = RcloneDriver::from_path().with_transfers(2);
     assert_eq!(driver.transfers(), 2);
-    let (ok, _) = run_to_completion(&driver, Operation::Copy {
-        sources: vec![nav(&src_dir.path().join("x.bin"))],
-        dest_dir: nav(dst_dir.path()),
-        policy: OverwritePolicy::Always,
-    });
+    let (ok, _) = run_to_completion(
+        &driver,
+        Operation::Copy {
+            sources: vec![nav(&src_dir.path().join("x.bin"))],
+            dest_dir: nav(dst_dir.path()),
+            policy: OverwritePolicy::Always,
+        },
+    );
     assert!(ok, "copy with custom --transfers should succeed");
     assert!(dst_dir.path().join("x.bin").exists());
 }
 
 #[test]
 fn nested_directory_copy_preserves_tree() {
-    if !rclone_available() { return; }
+    if !rclone_available() {
+        return;
+    }
     let src_dir = tempfile::tempdir().unwrap();
     let dst_dir = tempfile::tempdir().unwrap();
     let tree = src_dir.path().join("tree");
@@ -304,12 +391,22 @@ fn nested_directory_copy_preserves_tree() {
     fs::write(tree.join("sub").join("leaf.txt"), b"l").unwrap();
 
     let driver = RcloneDriver::from_path();
-    let (ok, _) = run_to_completion(&driver, Operation::Copy {
-        sources: vec![nav(&tree)],
-        dest_dir: nav(dst_dir.path()),
-        policy: OverwritePolicy::Always,
-    });
+    let (ok, _) = run_to_completion(
+        &driver,
+        Operation::Copy {
+            sources: vec![nav(&tree)],
+            dest_dir: nav(dst_dir.path()),
+            policy: OverwritePolicy::Always,
+        },
+    );
     assert!(ok);
     assert!(dst_dir.path().join("tree").join("root.txt").exists());
-    assert!(dst_dir.path().join("tree").join("sub").join("leaf.txt").exists());
+    assert!(
+        dst_dir
+            .path()
+            .join("tree")
+            .join("sub")
+            .join("leaf.txt")
+            .exists()
+    );
 }

@@ -5,7 +5,7 @@
 #![cfg(windows)]
 
 use navigator_config::Columns;
-use navigator_gui::listview::{column_for_subitem, visible_columns, LogicalColumn};
+use navigator_gui::listview::{LogicalColumn, column_for_subitem, visible_columns};
 
 #[test]
 fn default_columns_show_every_entry() {
@@ -23,7 +23,11 @@ fn default_columns_show_every_entry() {
 
 #[test]
 fn name_column_is_always_first() {
-    let cols = Columns { show_size: false, show_type: false, show_modified: false };
+    let cols = Columns {
+        show_size: false,
+        show_type: false,
+        show_modified: false,
+    };
     let v = visible_columns(&cols);
     assert_eq!(v, vec![LogicalColumn::Name]);
     assert_eq!(column_for_subitem(&cols, 0), Some(LogicalColumn::Name));
@@ -32,10 +36,18 @@ fn name_column_is_always_first() {
 
 #[test]
 fn hiding_type_shifts_modified_left() {
-    let cols = Columns { show_size: true, show_type: false, show_modified: true };
+    let cols = Columns {
+        show_size: true,
+        show_type: false,
+        show_modified: true,
+    };
     assert_eq!(
         visible_columns(&cols),
-        vec![LogicalColumn::Name, LogicalColumn::Size, LogicalColumn::Modified],
+        vec![
+            LogicalColumn::Name,
+            LogicalColumn::Size,
+            LogicalColumn::Modified
+        ],
     );
     assert_eq!(column_for_subitem(&cols, 2), Some(LogicalColumn::Modified));
 }
@@ -48,7 +60,11 @@ fn subitem_mapping_is_dense_and_ordered() {
     for size in [true, false] {
         for ty in [true, false] {
             for modified in [true, false] {
-                let cols = Columns { show_size: size, show_type: ty, show_modified: modified };
+                let cols = Columns {
+                    show_size: size,
+                    show_type: ty,
+                    show_modified: modified,
+                };
                 let v = visible_columns(&cols);
                 assert_eq!(v[0], LogicalColumn::Name);
                 // Dense mapping: every iSubItem from 0..v.len() resolves.

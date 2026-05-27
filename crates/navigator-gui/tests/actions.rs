@@ -29,16 +29,19 @@ fn folder_is_parent_for_files() {
 #[test]
 fn parent_is_always_the_directory_containing_target() {
     let file = expand("{parent}", Path::new(r"C:\a\b.txt"), false);
-    let dir  = expand("{parent}", Path::new(r"C:\a\b"),     true);
+    let dir = expand("{parent}", Path::new(r"C:\a\b"), true);
     assert_eq!(file, r"C:\a");
     // Note: parent of a directory is its own parent, not itself.
-    assert_eq!(dir,  r"C:\a");
+    assert_eq!(dir, r"C:\a");
 }
 
 #[test]
 fn name_returns_basename() {
-    assert_eq!(expand("{name}", Path::new(r"C:\foo\bar.txt"), false), "bar.txt");
-    assert_eq!(expand("{name}", Path::new(r"C:\foo\mydir"),   true),  "mydir");
+    assert_eq!(
+        expand("{name}", Path::new(r"C:\foo\bar.txt"), false),
+        "bar.txt"
+    );
+    assert_eq!(expand("{name}", Path::new(r"C:\foo\mydir"), true), "mydir");
 }
 
 #[test]
@@ -72,16 +75,24 @@ fn expand_args_substitutes_every_arg() {
         chord: ShortcutChord::default(),
         internal: None,
         command: "wt.exe".into(),
-        args: vec!["-d".into(), "{folder}".into(), "--file".into(), "{name}".into()],
+        args: vec![
+            "-d".into(),
+            "{folder}".into(),
+            "--file".into(),
+            "{name}".into(),
+        ],
         single: true,
     };
     let out = expand_args(&action, Path::new(r"C:\work\build.rs"), false);
-    assert_eq!(out, vec![
-        "-d".to_string(),
-        r"C:\work".to_string(),
-        "--file".to_string(),
-        "build.rs".to_string(),
-    ]);
+    assert_eq!(
+        out,
+        vec![
+            "-d".to_string(),
+            r"C:\work".to_string(),
+            "--file".to_string(),
+            "build.rs".to_string(),
+        ]
+    );
 }
 
 #[test]

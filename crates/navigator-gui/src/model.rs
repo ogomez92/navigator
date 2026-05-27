@@ -25,7 +25,12 @@ pub struct Sort {
 }
 
 impl Default for Sort {
-    fn default() -> Self { Self { mode: SortMode::Name, descending: false } }
+    fn default() -> Self {
+        Self {
+            mode: SortMode::Name,
+            descending: false,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -35,7 +40,7 @@ pub struct Model(Arc<RwLock<ModelInner>>);
 struct ModelInner {
     cwd: Option<NavPath>,
     all: Vec<Entry>,
-    visible: Vec<u32>,          // indices into `all`
+    visible: Vec<u32>, // indices into `all`
     selection: Selection,
     filter: Filter,
     sort: Sort,
@@ -45,20 +50,33 @@ struct ModelInner {
 }
 
 impl Model {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    pub fn cwd(&self) -> Option<NavPath> { self.0.read().cwd.clone() }
+    pub fn cwd(&self) -> Option<NavPath> {
+        self.0.read().cwd.clone()
+    }
 
-    pub fn len(&self) -> usize { self.0.read().visible.len() }
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn len(&self) -> usize {
+        self.0.read().visible.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Fetch the `i`-th visible entry.
     pub fn get(&self, i: usize) -> Option<Entry> {
         let g = self.0.read();
-        g.visible.get(i).and_then(|&idx| g.all.get(idx as usize)).cloned()
+        g.visible
+            .get(i)
+            .and_then(|&idx| g.all.get(idx as usize))
+            .cloned()
     }
 
-    pub fn filter(&self) -> Filter { self.0.read().filter }
+    pub fn filter(&self) -> Filter {
+        self.0.read().filter
+    }
 
     pub fn set_filter(&self, filter: Filter) -> usize {
         let mut g = self.0.write();
@@ -67,7 +85,9 @@ impl Model {
         g.visible.len()
     }
 
-    pub fn sort(&self) -> Sort { self.0.read().sort }
+    pub fn sort(&self) -> Sort {
+        self.0.read().sort
+    }
 
     pub fn set_sort(&self, sort: Sort) -> usize {
         let mut g = self.0.write();
@@ -79,7 +99,9 @@ impl Model {
         g.visible.len()
     }
 
-    pub fn is_search_mode(&self) -> bool { self.0.read().search_mode }
+    pub fn is_search_mode(&self) -> bool {
+        self.0.read().search_mode
+    }
 
     /// Replace the raw listing. Returns the new visible length so the caller
     /// can update the ListView's virtual item count in one call.
@@ -142,11 +164,15 @@ impl Model {
         f(&mut g.selection)
     }
 
-    pub fn selection_snapshot(&self) -> Selection { self.0.read().selection.clone() }
+    pub fn selection_snapshot(&self) -> Selection {
+        self.0.read().selection.clone()
+    }
 
     pub fn selected_paths(&self) -> Vec<NavPath> {
         let g = self.0.read();
-        let Some(cwd) = g.cwd.as_ref() else { return Vec::new(); };
+        let Some(cwd) = g.cwd.as_ref() else {
+            return Vec::new();
+        };
         g.selection
             .iter()
             .filter_map(|i| g.visible.get(i).and_then(|&idx| g.all.get(idx as usize)))
@@ -158,19 +184,24 @@ impl Model {
     /// navigate-up to re-focus the child directory we just left.
     pub fn index_of(&self, mut pred: impl FnMut(&Entry) -> bool) -> Option<usize> {
         let g = self.0.read();
-        g.visible.iter().enumerate().find_map(|(vi, &ai)| {
-            g.all.get(ai as usize).filter(|e| pred(e)).map(|_| vi)
-        })
+        g.visible
+            .iter()
+            .enumerate()
+            .find_map(|(vi, &ai)| g.all.get(ai as usize).filter(|e| pred(e)).map(|_| vi))
     }
 
     /// Find the first visible index whose name starts with `prefix` (ASCII
     /// case-insensitive), optionally resuming past `from`. Returns `None`
     /// when nothing matches.
     pub fn find_prefix(&self, prefix: &str, from: Option<usize>) -> Option<usize> {
-        if prefix.is_empty() { return None; }
+        if prefix.is_empty() {
+            return None;
+        }
         let g = self.0.read();
         let len = g.visible.len();
-        if len == 0 { return None; }
+        if len == 0 {
+            return None;
+        }
         let start = from.map(|i| (i + 1) % len).unwrap_or(0);
         let prefix_lc: String = prefix.to_ascii_lowercase();
         for step in 0..len {
@@ -190,8 +221,12 @@ fn rebuild_visible(inner: &mut ModelInner) {
     let f = inner.filter;
     inner.visible.clear();
     for (idx, e) in inner.all.iter().enumerate() {
-        if e.hidden && !f.show_hidden { continue; }
-        if e.system && !f.show_system { continue; }
+        if e.hidden && !f.show_hidden {
+            continue;
+        }
+        if e.system && !f.show_system {
+            continue;
+        }
         inner.visible.push(idx as u32);
     }
 }
@@ -201,21 +236,20 @@ fn rebuild_visible(inner: &mut ModelInner) {
 /// reverses the within-kind order.
 pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
     use std::cmp::Ordering;
-    entries.sort_by(|a, b| {
-        match (a.is_dir(), b.is_dir()) {
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            _ => {
-                let key = match sort.mode {
-                    SortMode::Name     => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                    SortMode::Size     => a.size.cmp(&b.size),
-                    SortMode::Type     => type_key(a).cmp(&type_key(b))
-                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
-                    SortMode::Modified => a.modified.cmp(&b.modified),
-                    SortMode::Created  => a.created.cmp(&b.created),
-                };
-                if sort.descending { key.reverse() } else { key }
-            }
+    entries.sort_by(|a, b| match (a.is_dir(), b.is_dir()) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => {
+            let key = match sort.mode {
+                SortMode::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SortMode::Size => a.size.cmp(&b.size),
+                SortMode::Type => type_key(a)
+                    .cmp(&type_key(b))
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                SortMode::Modified => a.modified.cmp(&b.modified),
+                SortMode::Created => a.created.cmp(&b.created),
+            };
+            if sort.descending { key.reverse() } else { key }
         }
     });
 }
@@ -257,7 +291,12 @@ mod tests {
     #[test]
     fn append_entries_preserves_existing_order_and_appends_at_end() {
         let m = Model::new();
-        let cwd = NavPath::new(std::path::PathBuf::from(if cfg!(windows) { r"C:\tmp\nav" } else { "/tmp/nav" })).unwrap();
+        let cwd = NavPath::new(std::path::PathBuf::from(if cfg!(windows) {
+            r"C:\tmp\nav"
+        } else {
+            "/tmp/nav"
+        }))
+        .unwrap();
         m.set_listing(cwd, vec![file("alpha"), file("bravo"), file("charlie")]);
         // Existing order is the sorted view.
         let before: Vec<String> = (0..m.len()).map(|i| m.get(i).unwrap().name).collect();
@@ -270,5 +309,35 @@ mod tests {
         m.append_entries(vec![file("aaaa"), file("zeta")]);
         let after: Vec<String> = (0..m.len()).map(|i| m.get(i).unwrap().name).collect();
         assert_eq!(after, vec!["alpha", "bravo", "charlie", "aaaa", "zeta"]);
+    }
+
+    /// Search-mode rows store relative paths (`subA\\file.ext`). Copy-paths,
+    /// activate, and the context menu all funnel through `selected_paths`,
+    /// which must join those relative names onto the search root to yield
+    /// real absolute paths — otherwise Ctrl+Shift+C would copy the bare
+    /// relative form and the shell context menu would build PIDLs against
+    /// nothing.
+    #[cfg(windows)]
+    #[test]
+    fn selected_paths_in_search_mode_reconstruct_full_paths() {
+        let m = Model::new();
+        let root = NavPath::new(std::path::PathBuf::from(r"C:\tmp\nav")).unwrap();
+        m.set_search_results(
+            root.clone(),
+            vec![file(r"subA\file.ext"), file(r"subB\nested\other.txt")],
+        );
+        // Select both rows.
+        m.with_selection(|sel| {
+            sel.insert(0);
+            sel.insert(1);
+        });
+        let paths: Vec<String> = m.selected_paths().iter().map(|p| p.to_string()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                String::from(r"C:\tmp\nav\subA\file.ext"),
+                String::from(r"C:\tmp\nav\subB\nested\other.txt"),
+            ],
+        );
     }
 }

@@ -15,33 +15,32 @@ use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use tracing::error;
 
-use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::Foundation::POINT;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, GetStockObject};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
     LIST_VIEW_ITEM_STATE_FLAGS, LVFI_PARTIAL, LVFI_STRING, LVIF_TEXT, NMHDR, NMITEMACTIVATE,
     NMLISTVIEW, NMLVDISPINFOW, NMLVFINDITEMW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    ACCEL, AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    CreateAcceleratorTableW, CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-    GetClientRect, GetMessageW, GetWindowLongPtrW, HCURSOR, HICON, HMENU, IDC_ARROW,
+    ACCEL, AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateAcceleratorTableW, CreateMenu,
+    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW, HCURSOR, HICON, HMENU, IDC_ARROW,
     IDI_APPLICATION, IsDialogMessageW, LoadCursorW, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR,
     MF_STRING, MF_UNCHECKED, MSG, PostQuitMessage, RegisterClassExW, SendMessageW, SetMenu,
     SetWindowLongPtrW, SetWindowTextW, TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE,
     WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_NOTIFY, WM_SETFONT,
     WM_SIZE, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
+use windows::core::{PCWSTR, w};
 
 use navigator_core::{Entry, EntryKind, NavPath};
 
 use crate::app::AppState;
 use crate::listview::{
-    column_for_subitem, format_filetime, format_filetime_relative, format_size,
-    ListView, LogicalColumn,
+    ListView, LogicalColumn, column_for_subitem, format_filetime, format_filetime_relative,
+    format_size,
 };
 
 /// Directory-listed payload posted back from the scan worker.
@@ -124,7 +123,9 @@ static WM_CREATE_PARAMS: OnceCell<Mutex<Option<Arc<AppState>>>> = OnceCell::new(
 
 fn ensure_class() -> windows::core::Result<()> {
     static REGISTERED: OnceCell<()> = OnceCell::new();
-    if REGISTERED.get().is_some() { return Ok(()); }
+    if REGISTERED.get().is_some() {
+        return Ok(());
+    }
     let hinstance = unsafe { GetModuleHandleW(None)? };
     unsafe {
         let wc = WNDCLASSEXW {
@@ -149,7 +150,10 @@ pub fn create(state: Arc<AppState>) -> windows::core::Result<Window> {
     ensure_class()?;
     let hinstance = unsafe { GetModuleHandleW(None)? };
 
-    WM_CREATE_PARAMS.get_or_init(|| Mutex::new(None)).lock().replace(state.clone());
+    WM_CREATE_PARAMS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .replace(state.clone());
 
     let hwnd = unsafe {
         CreateWindowExW(
@@ -157,7 +161,10 @@ pub fn create(state: Arc<AppState>) -> windows::core::Result<Window> {
             CLASS_NAME,
             w!("navigator"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT, CW_USEDEFAULT, 1100, 700,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            1100,
+            700,
             None,
             None,
             Some(hinstance.into()),
@@ -194,7 +201,10 @@ fn create_status_bar(parent: HWND) -> windows::core::Result<HWND> {
             w!("msctls_statusbar32"),
             w!(""),
             windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(style),
-            0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
             Some(parent),
             Some(HMENU(1003_isize as *mut std::ffi::c_void)),
             Some(hinstance.into()),
@@ -207,7 +217,9 @@ pub fn run_message_loop(hwnd: HWND) -> i32 {
     let mut msg = MSG::default();
     loop {
         let got = unsafe { GetMessageW(&mut msg, None, 0, 0).0 };
-        if got <= 0 { break; }
+        if got <= 0 {
+            break;
+        }
 
         unsafe {
             // Pick up the latest accelerator table each iteration so that
@@ -222,9 +234,7 @@ pub fn run_message_loop(hwnd: HWND) -> i32 {
             // (treating them as mnemonic lookups) before the accel
             // table ever sees them — that's what broke user-defined
             // Ctrl+T. Petzold's canonical pump is accel, then dialog.
-            if !accel.is_invalid()
-                && TranslateAcceleratorW(hwnd, accel, &msg) != 0
-            {
+            if !accel.is_invalid() && TranslateAcceleratorW(hwnd, accel, &msg) != 0 {
                 continue;
             }
             // Dialog-manager tab traversal + default-button handling. This
@@ -247,7 +257,9 @@ pub fn run_message_loop(hwnd: HWND) -> i32 {
 pub fn rebuild_accels(hwnd: HWND) {
     use windows::Win32::UI::WindowsAndMessaging::{DestroyAcceleratorTable, HACCEL};
 
-    let Some(data) = (unsafe { window_data(hwnd) }) else { return; };
+    let Some(data) = (unsafe { window_data(hwnd) }) else {
+        return;
+    };
 
     // NB: plain VK_BACK / VK_DELETE / VK_RETURN are NOT in this table. An
     // accelerator fires window-wide regardless of focus — if the address
@@ -267,14 +279,25 @@ pub fn rebuild_accels(hwnd: HWND) {
                 let cmd_id = Commands::ActionBase as u16 + i as u16;
                 tracing::info!(
                     "accel: action[{}] {:?} chord={:?} -> vk=0x{:02X} fVirt=0x{:X} cmd={}",
-                    i, action.name, action.chord, vk, mods.0, cmd_id,
+                    i,
+                    action.name,
+                    action.chord,
+                    vk,
+                    mods.0,
+                    cmd_id,
                 );
-                accels.push(ACCEL { fVirt: mods, key: vk, cmd: cmd_id });
+                accels.push(ACCEL {
+                    fVirt: mods,
+                    key: vk,
+                    cmd: cmd_id,
+                });
             }
             None => {
                 tracing::warn!(
                     "accel: action[{}] {:?} has unparsable chord {:?} — not bound",
-                    i, action.name, action.chord,
+                    i,
+                    action.name,
+                    action.chord,
                 );
             }
         }
@@ -290,7 +313,9 @@ pub fn rebuild_accels(hwnd: HWND) {
     let old = std::mem::replace(&mut *guard, new_accel);
     drop(guard);
     if !old.is_invalid() {
-        unsafe { let _ = DestroyAcceleratorTable(old); }
+        unsafe {
+            let _ = DestroyAcceleratorTable(old);
+        }
     }
 }
 
@@ -343,6 +368,11 @@ pub enum Commands {
     DumpTree = 145,
     Extract = 146,
     EmptyTrash = 147,
+    /// Spawn a new navigator instance opened to the containing folder of
+    /// the focused entry. Routed from the listview subclass on Ctrl+Enter
+    /// (the plain VK_RETURN arm fires `OpenFocused`). Especially useful in
+    /// search results, where each row may live in a different subdir.
+    OpenContaining = 148,
     // Help menu
     About = 160,
     // Shortcut/Action dynamic range
@@ -359,37 +389,142 @@ use crate::accel::chord_to_accel;
 fn build_menu() -> HMENU {
     unsafe {
         let file = CreatePopupMenu().unwrap();
-        let _ = AppendMenuW(file, MF_STRING, Commands::NewFolder as usize,       w!("&New folder…\tCtrl+N"));
+        let _ = AppendMenuW(
+            file,
+            MF_STRING,
+            Commands::NewFolder as usize,
+            w!("&New folder…\tCtrl+N"),
+        );
         let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(file, MF_STRING, Commands::HistBack as usize,        w!("&Back\tAlt+Left"));
-        let _ = AppendMenuW(file, MF_STRING, Commands::HistForward as usize,     w!("&Forward\tAlt+Right"));
-        let _ = AppendMenuW(file, MF_STRING, Commands::NavigateUp as usize,      w!("Navigate &up\tAlt+Up"));
+        let _ = AppendMenuW(
+            file,
+            MF_STRING,
+            Commands::HistBack as usize,
+            w!("&Back\tAlt+Left"),
+        );
+        let _ = AppendMenuW(
+            file,
+            MF_STRING,
+            Commands::HistForward as usize,
+            w!("&Forward\tAlt+Right"),
+        );
+        let _ = AppendMenuW(
+            file,
+            MF_STRING,
+            Commands::NavigateUp as usize,
+            w!("Navigate &up\tAlt+Up"),
+        );
         let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(file, MF_STRING, Commands::Refresh as usize,         w!("&Refresh\tF5"));
-        let _ = AppendMenuW(file, MF_STRING, Commands::ShowProperties as usize,  w!("P&roperties\tAlt+Enter"));
+        let _ = AppendMenuW(
+            file,
+            MF_STRING,
+            Commands::Refresh as usize,
+            w!("&Refresh\tF5"),
+        );
+        let _ = AppendMenuW(
+            file,
+            MF_STRING,
+            Commands::ShowProperties as usize,
+            w!("P&roperties\tAlt+Enter"),
+        );
         let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(file, MF_STRING, Commands::RecentOpsWindow as usize, w!("Recent &operations…"));
-        let _ = AppendMenuW(file, MF_STRING, Commands::EmptyTrash as usize,      w!("E&mpty .trash on all drives…"));
+        let _ = AppendMenuW(
+            file,
+            MF_STRING,
+            Commands::RecentOpsWindow as usize,
+            w!("Recent &operations…"),
+        );
+        let _ = AppendMenuW(
+            file,
+            MF_STRING,
+            Commands::EmptyTrash as usize,
+            w!("E&mpty .trash on all drives…"),
+        );
         let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(file, MF_STRING, Commands::ToggleHidden as usize,    w!("Show &hidden files\tCtrl+H"));
-        let _ = AppendMenuW(file, MF_STRING, Commands::ToggleSystem as usize,    w!("Show &system files\tCtrl+Shift+H"));
+        let _ = AppendMenuW(
+            file,
+            MF_STRING,
+            Commands::ToggleHidden as usize,
+            w!("Show &hidden files\tCtrl+H"),
+        );
+        let _ = AppendMenuW(
+            file,
+            MF_STRING,
+            Commands::ToggleSystem as usize,
+            w!("Show &system files\tCtrl+Shift+H"),
+        );
         let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(file, MF_STRING, Commands::Exit as usize,            w!("E&xit\tAlt+F4"));
+        let _ = AppendMenuW(
+            file,
+            MF_STRING,
+            Commands::Exit as usize,
+            w!("E&xit\tAlt+F4"),
+        );
 
         let edit = CreatePopupMenu().unwrap();
-        let _ = AppendMenuW(edit, MF_STRING, Commands::Undo as usize,      w!("&Undo\tCtrl+Z"));
+        let _ = AppendMenuW(
+            edit,
+            MF_STRING,
+            Commands::Undo as usize,
+            w!("&Undo\tCtrl+Z"),
+        );
         let _ = AppendMenuW(edit, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(edit, MF_STRING, Commands::Cut as usize,            w!("Cu&t\tCtrl+X"));
-        let _ = AppendMenuW(edit, MF_STRING, Commands::Copy as usize,           w!("&Copy\tCtrl+C"));
-        let _ = AppendMenuW(edit, MF_STRING, Commands::CopyToClipboard as usize, w!("Copy to &OS clipboard\tAlt+C"));
-        let _ = AppendMenuW(edit, MF_STRING, Commands::CopyPaths as usize,      w!("Copy &paths\tCtrl+Shift+C"));
-        let _ = AppendMenuW(edit, MF_STRING, Commands::AppendCopy as usize,     w!("Append to copy\tCtrl+Alt+C"));
-        let _ = AppendMenuW(edit, MF_STRING, Commands::AppendCut as usize,      w!("Append to cut\tCtrl+Alt+X"));
-        let _ = AppendMenuW(edit, MF_STRING, Commands::Paste as usize,          w!("&Paste\tCtrl+V"));
-        let _ = AppendMenuW(edit, MF_STRING, Commands::Delete as usize,         w!("&Delete\tDel"));
-        let _ = AppendMenuW(edit, MF_STRING, Commands::Rename as usize,         w!("Rena&me\tF2"));
+        let _ = AppendMenuW(edit, MF_STRING, Commands::Cut as usize, w!("Cu&t\tCtrl+X"));
+        let _ = AppendMenuW(
+            edit,
+            MF_STRING,
+            Commands::Copy as usize,
+            w!("&Copy\tCtrl+C"),
+        );
+        let _ = AppendMenuW(
+            edit,
+            MF_STRING,
+            Commands::CopyToClipboard as usize,
+            w!("Copy to &OS clipboard\tAlt+C"),
+        );
+        let _ = AppendMenuW(
+            edit,
+            MF_STRING,
+            Commands::CopyPaths as usize,
+            w!("Copy &paths\tCtrl+Shift+C"),
+        );
+        let _ = AppendMenuW(
+            edit,
+            MF_STRING,
+            Commands::AppendCopy as usize,
+            w!("Append to copy\tCtrl+Alt+C"),
+        );
+        let _ = AppendMenuW(
+            edit,
+            MF_STRING,
+            Commands::AppendCut as usize,
+            w!("Append to cut\tCtrl+Alt+X"),
+        );
+        let _ = AppendMenuW(
+            edit,
+            MF_STRING,
+            Commands::Paste as usize,
+            w!("&Paste\tCtrl+V"),
+        );
+        let _ = AppendMenuW(
+            edit,
+            MF_STRING,
+            Commands::Delete as usize,
+            w!("&Delete\tDel"),
+        );
+        let _ = AppendMenuW(
+            edit,
+            MF_STRING,
+            Commands::Rename as usize,
+            w!("Rena&me\tF2"),
+        );
         let _ = AppendMenuW(edit, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(edit, MF_STRING, Commands::SelectAll as usize,      w!("Select &all\tCtrl+A"));
+        let _ = AppendMenuW(
+            edit,
+            MF_STRING,
+            Commands::SelectAll as usize,
+            w!("Select &all\tCtrl+A"),
+        );
 
         // Sort key lives under its own submenu so each key is a distinct
         // menu item (easier to hit than a radio-group scattered inline).
@@ -397,42 +532,92 @@ fn build_menu() -> HMENU {
         // Type is available even if the Type column is hidden from
         // Options → Columns.
         let sort = CreatePopupMenu().unwrap();
-        let _ = AppendMenuW(sort, MF_STRING, Commands::SortName as usize,     w!("&Name"));
-        let _ = AppendMenuW(sort, MF_STRING, Commands::SortSize as usize,     w!("&Size"));
-        let _ = AppendMenuW(sort, MF_STRING, Commands::SortType as usize,     w!("&Type"));
-        let _ = AppendMenuW(sort, MF_STRING, Commands::SortModified as usize, w!("Date &modified"));
-        let _ = AppendMenuW(sort, MF_STRING, Commands::SortCreated as usize,  w!("Date &created"));
+        let _ = AppendMenuW(sort, MF_STRING, Commands::SortName as usize, w!("&Name"));
+        let _ = AppendMenuW(sort, MF_STRING, Commands::SortSize as usize, w!("&Size"));
+        let _ = AppendMenuW(sort, MF_STRING, Commands::SortType as usize, w!("&Type"));
+        let _ = AppendMenuW(
+            sort,
+            MF_STRING,
+            Commands::SortModified as usize,
+            w!("Date &modified"),
+        );
+        let _ = AppendMenuW(
+            sort,
+            MF_STRING,
+            Commands::SortCreated as usize,
+            w!("Date &created"),
+        );
         let _ = AppendMenuW(sort, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(sort, MF_STRING, Commands::SortDescending as usize, w!("&Descending order"));
+        let _ = AppendMenuW(
+            sort,
+            MF_STRING,
+            Commands::SortDescending as usize,
+            w!("&Descending order"),
+        );
 
         let view = CreatePopupMenu().unwrap();
         let _ = AppendMenuW(view, MF_POPUP, sort.0 as usize, w!("&Sort by"));
         let _ = AppendMenuW(view, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(view, MF_STRING, Commands::Search as usize,        w!("&Find in folder…\tCtrl+F"));
-        let _ = AppendMenuW(view, MF_STRING, Commands::FocusAddress as usize,  w!("Focus &address bar\tAlt+D"));
+        let _ = AppendMenuW(
+            view,
+            MF_STRING,
+            Commands::Search as usize,
+            w!("&Find in folder…\tCtrl+F"),
+        );
+        let _ = AppendMenuW(
+            view,
+            MF_STRING,
+            Commands::FocusAddress as usize,
+            w!("Focus &address bar\tAlt+D"),
+        );
 
         let tools = CreatePopupMenu().unwrap();
-        let _ = AppendMenuW(tools, MF_STRING, Commands::ConnectRemote as usize, w!("&Connect to remote…"));
+        let _ = AppendMenuW(
+            tools,
+            MF_STRING,
+            Commands::ConnectRemote as usize,
+            w!("&Connect to remote…"),
+        );
         let _ = AppendMenuW(tools, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(tools, MF_STRING, Commands::DumpTree as usize,  w!("&Dump folder tree\tAlt+L"));
-        let _ = AppendMenuW(tools, MF_STRING, Commands::Extract as usize,   w!("&Extract archive(s)\tCtrl+E"));
+        let _ = AppendMenuW(
+            tools,
+            MF_STRING,
+            Commands::DumpTree as usize,
+            w!("&Dump folder tree\tAlt+L"),
+        );
+        let _ = AppendMenuW(
+            tools,
+            MF_STRING,
+            Commands::Extract as usize,
+            w!("&Extract archive(s)\tCtrl+E"),
+        );
         let _ = AppendMenuW(tools, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(tools, MF_STRING, Commands::Options as usize,   w!("&Options…"));
-        let _ = AppendMenuW(tools, MF_STRING, Commands::Shortcuts as usize, w!("&Shortcuts and Actions…"));
+        let _ = AppendMenuW(
+            tools,
+            MF_STRING,
+            Commands::Options as usize,
+            w!("&Options…"),
+        );
+        let _ = AppendMenuW(
+            tools,
+            MF_STRING,
+            Commands::Shortcuts as usize,
+            w!("&Shortcuts and Actions…"),
+        );
 
         let help = CreatePopupMenu().unwrap();
-        let _ = AppendMenuW(help, MF_STRING, Commands::About as usize,     w!("&About…"));
+        let _ = AppendMenuW(help, MF_STRING, Commands::About as usize, w!("&About…"));
 
         let bar = CreateMenu().unwrap();
-        let _ = AppendMenuW(bar, MF_POPUP, file.0 as usize,  w!("&File"));
-        let _ = AppendMenuW(bar, MF_POPUP, edit.0 as usize,  w!("&Edit"));
+        let _ = AppendMenuW(bar, MF_POPUP, file.0 as usize, w!("&File"));
+        let _ = AppendMenuW(bar, MF_POPUP, edit.0 as usize, w!("&Edit"));
         // Alt+V / Alt+T are the natural mnemonics. A user who binds an
         // accelerator on those chords (via the shortcut editor) will
         // override the menu because TranslateAcceleratorW runs before the
         // menu loop gets a chance.
-        let _ = AppendMenuW(bar, MF_POPUP, view.0 as usize,  w!("&View"));
+        let _ = AppendMenuW(bar, MF_POPUP, view.0 as usize, w!("&View"));
         let _ = AppendMenuW(bar, MF_POPUP, tools.0 as usize, w!("&Tools"));
-        let _ = AppendMenuW(bar, MF_POPUP, help.0 as usize,  w!("&Help"));
+        let _ = AppendMenuW(bar, MF_POPUP, help.0 as usize, w!("&Help"));
         bar
     }
 }
@@ -444,8 +629,7 @@ fn create_address_bar(parent: HWND) -> windows::core::Result<HWND> {
     // stop routing Enter → IDOK so the user couldn't commit a typed
     // path. Single-line edit only: ES_AUTOHSCROLL keeps the caret
     // visible while typing past the right edge.
-    let style = WS_CHILD.0 | WS_VISIBLE.0 | WS_BORDER.0 | WS_TABSTOP.0
-        | 0x0080;  // ES_AUTOHSCROLL
+    let style = WS_CHILD.0 | WS_VISIBLE.0 | WS_BORDER.0 | WS_TABSTOP.0 | 0x0080; // ES_AUTOHSCROLL
     unsafe {
         let hinstance = GetModuleHandleW(None)?;
         let hwnd = CreateWindowExW(
@@ -453,7 +637,10 @@ fn create_address_bar(parent: HWND) -> windows::core::Result<HWND> {
             w!("EDIT"),
             w!(""),
             windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(style),
-            0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
             Some(parent),
             Some(HMENU(IDC_ADDRESS as isize as *mut std::ffi::c_void)),
             Some(hinstance.into()),
@@ -462,9 +649,17 @@ fn create_address_bar(parent: HWND) -> windows::core::Result<HWND> {
         // Stock GUI font, so the edit uses the normal window font rather
         // than the chunky system font.
         let font = GetStockObject(DEFAULT_GUI_FONT);
-        SendMessageW(hwnd, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+        SendMessageW(
+            hwnd,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
         let _ = windows::Win32::UI::Shell::SetWindowSubclass(
-            hwnd, Some(tab_nav_subclass_proc), 0xB33F, 0,
+            hwnd,
+            Some(tab_nav_subclass_proc),
+            0xB33F,
+            0,
         );
         Ok(hwnd)
     }
@@ -476,7 +671,10 @@ fn create_address_bar(parent: HWND) -> windows::core::Result<HWND> {
 pub fn install_tab_nav(hwnd: HWND) {
     unsafe {
         let _ = windows::Win32::UI::Shell::SetWindowSubclass(
-            hwnd, Some(tab_nav_subclass_proc), 0xB33F, 0,
+            hwnd,
+            Some(tab_nav_subclass_proc),
+            0xB33F,
+            0,
         );
     }
 }
@@ -489,7 +687,10 @@ pub fn install_tab_nav(hwnd: HWND) {
 pub fn install_esc_close(hwnd: HWND) {
     unsafe {
         let _ = windows::Win32::UI::Shell::SetWindowSubclass(
-            hwnd, Some(esc_close_subclass_proc), 0xB340, 0,
+            hwnd,
+            Some(esc_close_subclass_proc),
+            0xB340,
+            0,
         );
     }
 }
@@ -502,7 +703,9 @@ unsafe extern "system" fn esc_close_subclass_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
-    if msg == WM_KEYDOWN && wp.0 as u32 == 0x1B /* VK_ESCAPE */ {
+    if msg == WM_KEYDOWN && wp.0 as u32 == 0x1B
+    /* VK_ESCAPE */
+    {
         unsafe {
             if let Ok(parent) = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd) {
                 let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -530,12 +733,16 @@ unsafe extern "system" fn tab_nav_subclass_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
-    if msg == WM_KEYDOWN && wp.0 as u32 == 0x09 /* VK_TAB */ {
+    if msg == WM_KEYDOWN && wp.0 as u32 == 0x09
+    /* VK_TAB */
+    {
         unsafe {
             let shift = (windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x10) as i32) < 0;
             if let Ok(parent) = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd) {
                 if let Ok(next) = windows::Win32::UI::WindowsAndMessaging::GetNextDlgTabItem(
-                    parent, Some(hwnd), shift,
+                    parent,
+                    Some(hwnd),
+                    shift,
                 ) {
                     let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(next));
                 }
@@ -836,7 +1043,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
 
 pub unsafe fn window_data<'a>(hwnd: HWND) -> Option<&'a WindowData> {
     let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
-    if raw == 0 { None } else { Some(unsafe { &*(raw as *const WindowData) }) }
+    if raw == 0 {
+        None
+    } else {
+        Some(unsafe { &*(raw as *const WindowData) })
+    }
 }
 
 unsafe fn handle_listview_notify(
@@ -938,23 +1149,34 @@ unsafe fn handle_listview_notify(
 /// "select all" — used for directories, names with no extension, and
 /// dotfiles like `.gitignore` where the whole name is the meaningful part.
 fn rename_stem_select_end(name: &str, is_dir: bool) -> Option<i32> {
-    if is_dir { return None; }
+    if is_dir {
+        return None;
+    }
     let pos = name.rfind('.')?;
-    if pos == 0 { return None; }
+    if pos == 0 {
+        return None;
+    }
     Some(name[..pos].encode_utf16().count() as i32)
 }
 
 fn on_end_label_edit(state: &Arc<AppState>, disp: &NMLVDISPINFOW) {
     let idx = disp.item.iItem as usize;
     let ptr = disp.item.pszText.as_ptr();
-    if ptr.is_null() { return; } // user cancelled (Esc)
+    if ptr.is_null() {
+        return;
+    } // user cancelled (Esc)
     let new_name = read_wstr_cstr(ptr);
-    if new_name.is_empty() { return; }
-    let Some(entry) = state.model.get(idx) else { return; };
-    if new_name == entry.name { return; }
+    if new_name.is_empty() {
+        return;
+    }
+    let Some(entry) = state.model.get(idx) else {
+        return;
+    };
+    if new_name == entry.name {
+        return;
+    }
     state.op_rename(&entry.name, &new_name);
 }
-
 
 /// Resolve an `LVN_ODFINDITEMW` message into an index. The control passes
 /// us the accumulated prefix the user has typed and a starting index; we
@@ -967,11 +1189,19 @@ fn resolve_finditem(state: &Arc<AppState>, find: &NMLVFINDITEMW) -> isize {
         return -1;
     }
     let ptr = find.lvfi.psz.as_ptr();
-    if ptr.is_null() { return -1; }
+    if ptr.is_null() {
+        return -1;
+    }
     let prefix = read_wstr_cstr(ptr);
-    if prefix.is_empty() { return -1; }
+    if prefix.is_empty() {
+        return -1;
+    }
 
-    let from = if find.iStart >= 0 { Some(find.iStart as usize) } else { None };
+    let from = if find.iStart >= 0 {
+        Some(find.iStart as usize)
+    } else {
+        None
+    };
     match state.model.find_prefix(&prefix, from) {
         Some(i) => i as isize,
         None => -1,
@@ -979,20 +1209,31 @@ fn resolve_finditem(state: &Arc<AppState>, find: &NMLVFINDITEMW) -> isize {
 }
 
 fn read_wstr_cstr(p: *const u16) -> String {
-    if p.is_null() { return String::new(); }
+    if p.is_null() {
+        return String::new();
+    }
     unsafe {
         let mut len = 0usize;
-        while *p.add(len) != 0 { len += 1; if len > 4096 { break; } }
+        while *p.add(len) != 0 {
+            len += 1;
+            if len > 4096 {
+                break;
+            }
+        }
         let slice = std::slice::from_raw_parts(p, len);
         String::from_utf16_lossy(slice)
     }
 }
 
 fn fill_dispinfo(state: &Arc<AppState>, disp: &mut NMLVDISPINFOW) {
-    if (disp.item.mask & LVIF_TEXT).0 == 0 { return; }
+    if (disp.item.mask & LVIF_TEXT).0 == 0 {
+        return;
+    }
     let idx = disp.item.iItem as usize;
     let sub = disp.item.iSubItem;
-    let Some(entry) = state.model.get(idx) else { return; };
+    let Some(entry) = state.model.get(idx) else {
+        return;
+    };
 
     let (relative, cols) = {
         let g = state.config.read();
@@ -1000,10 +1241,21 @@ fn fill_dispinfo(state: &Arc<AppState>, disp: &mut NMLVDISPINFOW) {
     };
     let text: String = match column_for_subitem(&cols, sub) {
         Some(LogicalColumn::Name) => entry.name.clone(),
-        Some(LogicalColumn::Size) => if entry.is_dir() { String::new() } else { format_size(entry.size) },
+        Some(LogicalColumn::Size) => {
+            if entry.is_dir() {
+                String::new()
+            } else {
+                format_size(entry.size)
+            }
+        }
         Some(LogicalColumn::Type) => kind_label(&entry),
-        Some(LogicalColumn::Modified) => if relative { format_filetime_relative(entry.modified.0) }
-                                         else         { format_filetime(entry.modified.0) },
+        Some(LogicalColumn::Modified) => {
+            if relative {
+                format_filetime_relative(entry.modified.0)
+            } else {
+                format_filetime(entry.modified.0)
+            }
+        }
         None => String::new(),
     };
 
@@ -1028,15 +1280,26 @@ fn kind_label(e: &Entry) -> String {
         EntryKind::Symlink => "Link".into(),
         EntryKind::Other => "Other".into(),
         EntryKind::File => {
-            let ext = std::path::Path::new(&e.name).extension().and_then(|s| s.to_str()).unwrap_or("");
-            if ext.is_empty() { "File".into() } else { format!("{} file", ext.to_uppercase()) }
+            let ext = std::path::Path::new(&e.name)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if ext.is_empty() {
+                "File".into()
+            } else {
+                format!("{} file", ext.to_uppercase())
+            }
         }
     }
 }
 
 fn activate_index(state: &Arc<AppState>, idx: usize) {
-    let Some(entry) = state.model.get(idx) else { return; };
-    let Some(cwd) = state.model.cwd() else { return; };
+    let Some(entry) = state.model.get(idx) else {
+        return;
+    };
+    let Some(cwd) = state.model.cwd() else {
+        return;
+    };
     if cwd.is_this_pc() {
         // ThisPC view: entries carry a display string like
         // "Local Disk (C:)". Parse out the drive letter and navigate to
@@ -1069,7 +1332,10 @@ fn compute_context_point(data: &WindowData, lp: LPARAM) -> POINT {
         // LVIR_SELECTBOUNDS = 3 — bounds of the selection rectangle.
         if let Some(idx) = data.state.model.selection_snapshot().focus() {
             let mut rc = windows::Win32::Foundation::RECT {
-                left: 3, top: 0, right: 0, bottom: 0,
+                left: 3,
+                top: 0,
+                right: 0,
+                bottom: 0,
             };
             unsafe {
                 SendMessageW(
@@ -1078,7 +1344,10 @@ fn compute_context_point(data: &WindowData, lp: LPARAM) -> POINT {
                     Some(WPARAM(idx)),
                     Some(LPARAM(&raw mut rc as isize)),
                 );
-                let mut p = POINT { x: rc.left, y: rc.bottom };
+                let mut p = POINT {
+                    x: rc.left,
+                    y: rc.bottom,
+                };
                 let _ = windows::Win32::Graphics::Gdi::ClientToScreen(data.listview.hwnd, &mut p);
                 return p;
             }
@@ -1097,7 +1366,8 @@ fn sign_extend_16(v: i32) -> i32 {
 /// MessageBox gets a real parent hwnd and can be announced properly.
 fn prompt_remote_upload(hwnd: HWND, state: &Arc<crate::app::AppState>, staged: std::path::PathBuf) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, MessageBoxW, MB_DEFBUTTON1, MB_ICONQUESTION, MB_SETFOREGROUND, MB_YESNO, IDYES,
+        GetForegroundWindow, IDYES, MB_DEFBUTTON1, MB_ICONQUESTION, MB_SETFOREGROUND, MB_YESNO,
+        MessageBoxW,
     };
     use windows::core::PCWSTR;
 
@@ -1119,14 +1389,17 @@ fn prompt_remote_upload(hwnd: HWND, state: &Arc<crate::app::AppState>, staged: s
     // prompt will surface once the user alt-tabs back. Never steal.
     let is_foreground = unsafe { GetForegroundWindow() } == hwnd;
     let mut flags = MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1;
-    if is_foreground { flags |= MB_SETFOREGROUND; }
+    if is_foreground {
+        flags |= MB_SETFOREGROUND;
+    }
     let rc = unsafe {
         MessageBoxW(
             Some(hwnd),
             PCWSTR(body_w.as_ptr()),
             PCWSTR(title_w.as_ptr()),
             flags,
-        ).0
+        )
+        .0
     };
     if rc == IDYES.0 {
         state.op_remote_upload(staged, remote);
@@ -1140,7 +1413,9 @@ fn prompt_remote_upload(hwnd: HWND, state: &Arc<crate::app::AppState>, staged: s
 
 fn open_focused(data: &WindowData) {
     let sel = data.state.model.selection_snapshot();
-    let Some(idx) = sel.focus() else { return; };
+    let Some(idx) = sel.focus() else {
+        return;
+    };
     activate_index(&data.state, idx);
 }
 
@@ -1158,6 +1433,7 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
         x if x == Commands::HistForward as u16 => data.state.go_forward(),
         x if x == Commands::Undo as u16 => data.state.op_undo(),
         x if x == Commands::OpenFocused as u16 => open_focused(data),
+        x if x == Commands::OpenContaining as u16 => data.state.op_open_containing_new_window(),
         x if x == Commands::Rename as u16 => begin_rename(data),
         x if x == Commands::CopyToClipboard as u16 => data.state.op_copy_to_clipboard(),
         x if x == Commands::AppendCopy as u16 => data.state.op_append_clipboard(false),
@@ -1176,16 +1452,41 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
             data.state.toggle_system();
             sync_menu_checks(hwnd, &data.state);
         }
-        x if x == Commands::SortName as u16 => { data.state.set_sort_mode(navigator_config::SortMode::Name); sync_menu_checks(hwnd, &data.state); }
-        x if x == Commands::SortSize as u16 => { data.state.set_sort_mode(navigator_config::SortMode::Size); sync_menu_checks(hwnd, &data.state); }
-        x if x == Commands::SortType as u16 => { data.state.set_sort_mode(navigator_config::SortMode::Type); sync_menu_checks(hwnd, &data.state); }
-        x if x == Commands::SortModified as u16 => { data.state.set_sort_mode(navigator_config::SortMode::Modified); sync_menu_checks(hwnd, &data.state); }
-        x if x == Commands::SortCreated as u16 => { data.state.set_sort_mode(navigator_config::SortMode::Created); sync_menu_checks(hwnd, &data.state); }
-        x if x == Commands::SortDescending as u16 => { data.state.toggle_sort_descending(); sync_menu_checks(hwnd, &data.state); }
-        x if x == Commands::Search as u16 => { crate::search::open(hwnd, data.state.clone()); }
-        x if x == Commands::Exit as u16 => unsafe { let _ = DestroyWindow(hwnd); },
+        x if x == Commands::SortName as u16 => {
+            data.state.set_sort_mode(navigator_config::SortMode::Name);
+            sync_menu_checks(hwnd, &data.state);
+        }
+        x if x == Commands::SortSize as u16 => {
+            data.state.set_sort_mode(navigator_config::SortMode::Size);
+            sync_menu_checks(hwnd, &data.state);
+        }
+        x if x == Commands::SortType as u16 => {
+            data.state.set_sort_mode(navigator_config::SortMode::Type);
+            sync_menu_checks(hwnd, &data.state);
+        }
+        x if x == Commands::SortModified as u16 => {
+            data.state
+                .set_sort_mode(navigator_config::SortMode::Modified);
+            sync_menu_checks(hwnd, &data.state);
+        }
+        x if x == Commands::SortCreated as u16 => {
+            data.state
+                .set_sort_mode(navigator_config::SortMode::Created);
+            sync_menu_checks(hwnd, &data.state);
+        }
+        x if x == Commands::SortDescending as u16 => {
+            data.state.toggle_sort_descending();
+            sync_menu_checks(hwnd, &data.state);
+        }
+        x if x == Commands::Search as u16 => {
+            crate::search::open(hwnd, data.state.clone());
+        }
+        x if x == Commands::Exit as u16 => unsafe {
+            let _ = DestroyWindow(hwnd);
+        },
         x if x == Commands::About as u16 => {
-            data.state.say("navigator 0.1 — accessible file explorer", false);
+            data.state
+                .say("navigator 0.1 — accessible file explorer", false);
         }
         x if x == Commands::Options as u16 => {
             if let Err(e) = crate::options::open(hwnd, data.state.clone()) {
@@ -1222,7 +1523,12 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
             // Shortcut action. ID = ActionBase + index into `state.actions()`.
             let idx = (x - Commands::ActionBase as u16) as usize;
             let actions = data.state.actions();
-            tracing::info!("action dispatch: cmd={} idx={} total_actions={}", x, idx, actions.len());
+            tracing::info!(
+                "action dispatch: cmd={} idx={} total_actions={}",
+                x,
+                idx,
+                actions.len()
+            );
             if let Some(action) = actions.get(idx) {
                 if let Some(ic) = action.internal {
                     dispatch_internal(hwnd, data, ic);
@@ -1245,10 +1551,10 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
             // intentionally ignore them — navigation only happens on
             // Enter so the user can type a path in peace without the
             // listing thrashing on every keystroke.
-            if cmd == 1 /* IDOK */ {
-                let focus = unsafe {
-                    windows::Win32::UI::Input::KeyboardAndMouse::GetFocus()
-                };
+            if cmd == 1
+            /* IDOK */
+            {
+                let focus = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
                 if focus == data.listview.hwnd {
                     open_focused(data);
                 } else if focus == data.address {
@@ -1263,7 +1569,9 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
 fn navigate_from_address(data: &WindowData) {
     use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     let text = get_window_text(data.address);
-    if text.is_empty() { return; }
+    if text.is_empty() {
+        return;
+    }
     let pb = std::path::PathBuf::from(&text);
     match navigator_core::NavPath::new(pb) {
         Ok(p) => {
@@ -1272,7 +1580,9 @@ fn navigate_from_address(data: &WindowData) {
             // navigate the new listing immediately. The actual scan is
             // async; if it errors, WMAPP_DIR_ERROR shows a dialog and
             // focus is no worse than wherever the user landed before.
-            unsafe { let _ = SetFocus(Some(data.listview.hwnd)); }
+            unsafe {
+                let _ = SetFocus(Some(data.listview.hwnd));
+            }
         }
         Err(_) => data.state.say("path is not absolute", true),
     }
@@ -1282,10 +1592,14 @@ fn get_window_text(hwnd: HWND) -> String {
     use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW};
     unsafe {
         let len = GetWindowTextLengthW(hwnd);
-        if len <= 0 { return String::new(); }
+        if len <= 0 {
+            return String::new();
+        }
         let mut buf = vec![0u16; (len + 1) as usize];
         let got = GetWindowTextW(hwnd, &mut buf);
-        if got <= 0 { return String::new(); }
+        if got <= 0 {
+            return String::new();
+        }
         String::from_utf16_lossy(&buf[..got as usize])
     }
 }
@@ -1305,7 +1619,9 @@ fn address_display(path: &NavPath) -> String {
 
 fn set_address_text(hwnd: HWND, s: &str) {
     let w: Vec<u16> = s.encode_utf16().chain([0]).collect();
-    unsafe { let _ = SetWindowTextW(hwnd, PCWSTR(w.as_ptr())); }
+    unsafe {
+        let _ = SetWindowTextW(hwnd, PCWSTR(w.as_ptr()));
+    }
 }
 
 /// Update the main window title to `"<folder> — navigator"`. For drive
@@ -1322,11 +1638,17 @@ fn set_title_from_path(hwnd: HWND, path: &NavPath) {
         path.rclone_arg().unwrap_or_else(|| path.to_string())
     } else {
         let name = path.file_name();
-        if name.is_empty() { path.to_string() } else { name.to_string() }
+        if name.is_empty() {
+            path.to_string()
+        } else {
+            name.to_string()
+        }
     };
     let title = format!("{} — navigator", label);
     let w: Vec<u16> = title.encode_utf16().chain([0]).collect();
-    unsafe { let _ = SetWindowTextW(hwnd, PCWSTR(w.as_ptr())); }
+    unsafe {
+        let _ = SetWindowTextW(hwnd, PCWSTR(w.as_ptr()));
+    }
 }
 
 /// Set the status-bar's first part to `s`. The status bar uses its own
@@ -1337,7 +1659,12 @@ fn set_status_text(status: HWND, s: &str) {
     let w: Vec<u16> = s.encode_utf16().chain([0]).collect();
     unsafe {
         // wParam low word = part index; 0 is the single default part.
-        SendMessageW(status, SB_SETTEXTW, Some(WPARAM(0)), Some(LPARAM(w.as_ptr() as isize)));
+        SendMessageW(
+            status,
+            SB_SETTEXTW,
+            Some(WPARAM(0)),
+            Some(LPARAM(w.as_ptr() as isize)),
+        );
     }
 }
 
@@ -1359,7 +1686,10 @@ fn mirror_item_change(state: &Arc<AppState>, nm: &NMLISTVIEW) {
     state.model.with_selection(|sel| {
         if idx < 0 {
             if new & LVIS_SELECTED != 0 {
-                if total > 0 { sel.set_single(0); sel.extend_to(total - 1); }
+                if total > 0 {
+                    sel.set_single(0);
+                    sel.extend_to(total - 1);
+                }
             } else if old & LVIS_SELECTED != 0 {
                 sel.clear();
             }
@@ -1370,9 +1700,12 @@ fn mirror_item_change(state: &Arc<AppState>, nm: &NMLISTVIEW) {
             sel.set_focus(Some(i));
         }
         let was = old & LVIS_SELECTED != 0;
-        let is  = new & LVIS_SELECTED != 0;
-        if is && !was { sel.insert(i); }
-        else if was && !is { sel.remove(i); }
+        let is = new & LVIS_SELECTED != 0;
+        if is && !was {
+            sel.insert(i);
+        } else if was && !is {
+            sel.remove(i);
+        }
     });
 }
 
@@ -1381,13 +1714,25 @@ fn mirror_item_change(state: &Arc<AppState>, nm: &NMLISTVIEW) {
 fn mirror_range_change(state: &Arc<AppState>, nm: &NMLVODSTATECHANGE) {
     const LVIS_SELECTED: u32 = 0x0002;
     let was = nm.uOldState & LVIS_SELECTED != 0;
-    let is  = nm.uNewState & LVIS_SELECTED != 0;
-    if was == is { return; }
-    if nm.iFrom < 0 || nm.iTo < 0 { return; }
-    let (lo, hi) = if nm.iFrom <= nm.iTo { (nm.iFrom, nm.iTo) } else { (nm.iTo, nm.iFrom) };
+    let is = nm.uNewState & LVIS_SELECTED != 0;
+    if was == is {
+        return;
+    }
+    if nm.iFrom < 0 || nm.iTo < 0 {
+        return;
+    }
+    let (lo, hi) = if nm.iFrom <= nm.iTo {
+        (nm.iFrom, nm.iTo)
+    } else {
+        (nm.iTo, nm.iFrom)
+    };
     state.model.with_selection(|sel| {
         for i in (lo as usize)..=(hi as usize) {
-            if is { sel.insert(i); } else { sel.remove(i); }
+            if is {
+                sel.insert(i);
+            } else {
+                sel.remove(i);
+            }
         }
     });
 }
@@ -1410,29 +1755,59 @@ fn sync_menu_checks(hwnd: HWND, state: &Arc<AppState>) {
     let sort = state.model.sort();
     unsafe {
         let menu = GetMenu(hwnd);
-        if menu.is_invalid() { return; }
-        let hidden = if filter.show_hidden { MF_CHECKED } else { MF_UNCHECKED };
-        let system = if filter.show_system { MF_CHECKED } else { MF_UNCHECKED };
-        CheckMenuItem(menu, Commands::ToggleHidden as u32, (MF_BYCOMMAND | hidden).0);
-        CheckMenuItem(menu, Commands::ToggleSystem as u32, (MF_BYCOMMAND | system).0);
+        if menu.is_invalid() {
+            return;
+        }
+        let hidden = if filter.show_hidden {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+        let system = if filter.show_system {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+        CheckMenuItem(
+            menu,
+            Commands::ToggleHidden as u32,
+            (MF_BYCOMMAND | hidden).0,
+        );
+        CheckMenuItem(
+            menu,
+            Commands::ToggleSystem as u32,
+            (MF_BYCOMMAND | system).0,
+        );
 
         // Sort keys — set exactly one to MF_CHECKED. We don't use
         // CheckMenuRadioItem because the command IDs are non-contiguous
         // after adding SortType, and the radio-range API requires a
         // contiguous block of IDs.
         let all: [(Commands, navigator_config::SortMode); 5] = [
-            (Commands::SortName,     navigator_config::SortMode::Name),
-            (Commands::SortSize,     navigator_config::SortMode::Size),
-            (Commands::SortType,     navigator_config::SortMode::Type),
+            (Commands::SortName, navigator_config::SortMode::Name),
+            (Commands::SortSize, navigator_config::SortMode::Size),
+            (Commands::SortType, navigator_config::SortMode::Type),
             (Commands::SortModified, navigator_config::SortMode::Modified),
-            (Commands::SortCreated,  navigator_config::SortMode::Created),
+            (Commands::SortCreated, navigator_config::SortMode::Created),
         ];
         for (cmd, mode) in all {
-            let flag = if sort.mode == mode { MF_CHECKED } else { MF_UNCHECKED };
+            let flag = if sort.mode == mode {
+                MF_CHECKED
+            } else {
+                MF_UNCHECKED
+            };
             CheckMenuItem(menu, cmd as u32, (MF_BYCOMMAND | flag).0);
         }
-        let desc = if sort.descending { MF_CHECKED } else { MF_UNCHECKED };
-        CheckMenuItem(menu, Commands::SortDescending as u32, (MF_BYCOMMAND | desc).0);
+        let desc = if sort.descending {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+        CheckMenuItem(
+            menu,
+            Commands::SortDescending as u32,
+            (MF_BYCOMMAND | desc).0,
+        );
     }
 }
 
@@ -1444,28 +1819,38 @@ fn dispatch_internal(hwnd: HWND, data: &WindowData, ic: navigator_config::Intern
     use navigator_config::InternalCommand as IC;
     let state = &data.state;
     match ic {
-        IC::Copy         => state.op_copy(),
-        IC::Cut          => state.op_cut(),
-        IC::AppendCopy   => state.op_append_clipboard(false),
-        IC::AppendCut    => state.op_append_clipboard(true),
-        IC::Paste        => state.op_paste(),
-        IC::CopyPaths    => state.op_copy_paths(),
+        IC::Copy => state.op_copy(),
+        IC::Cut => state.op_cut(),
+        IC::AppendCopy => state.op_append_clipboard(false),
+        IC::AppendCut => state.op_append_clipboard(true),
+        IC::Paste => state.op_paste(),
+        IC::CopyPaths => state.op_copy_paths(),
         IC::CopyToClipboard => state.op_copy_to_clipboard(),
-        IC::Delete       => state.op_delete(),
-        IC::Rename       => begin_rename(data),
-        IC::SelectAll    => select_all(data),
-        IC::Refresh      => state.refresh(),
-        IC::ToggleHidden => { state.toggle_hidden(); sync_menu_checks(hwnd, state); }
-        IC::ToggleSystem => { state.toggle_system(); sync_menu_checks(hwnd, state); }
-        IC::Search       => { crate::search::open(hwnd, state.clone()); }
-        IC::NavigateUp   => state.navigate_up(),
-        IC::HistBack     => state.go_back(),
-        IC::HistForward  => state.go_forward(),
-        IC::Undo         => state.op_undo(),
+        IC::Delete => state.op_delete(),
+        IC::Rename => begin_rename(data),
+        IC::SelectAll => select_all(data),
+        IC::Refresh => state.refresh(),
+        IC::ToggleHidden => {
+            state.toggle_hidden();
+            sync_menu_checks(hwnd, state);
+        }
+        IC::ToggleSystem => {
+            state.toggle_system();
+            sync_menu_checks(hwnd, state);
+        }
+        IC::Search => {
+            crate::search::open(hwnd, state.clone());
+        }
+        IC::NavigateUp => state.navigate_up(),
+        IC::HistBack => state.go_back(),
+        IC::HistForward => state.go_forward(),
+        IC::Undo => state.op_undo(),
         IC::ShowProperties => state.op_show_properties(),
-        IC::DumpTree     => state.op_dump_tree(),
-        IC::Extract      => state.op_extract(),
-        IC::NewFolder    => { crate::new_folder::open(hwnd, state.clone()); }
+        IC::DumpTree => state.op_dump_tree(),
+        IC::Extract => state.op_extract(),
+        IC::NewFolder => {
+            crate::new_folder::open(hwnd, state.clone());
+        }
         IC::FocusAddress => focus_address(data),
         other => {
             if let Some(slot) = other.hotspot_goto_slot() {
@@ -1489,19 +1874,17 @@ fn focus_address(data: &WindowData) {
     const EM_SETSEL: u32 = 0x00B1;
     unsafe {
         let _ = SetFocus(Some(data.address));
-        SendMessageW(
-            data.address,
-            EM_SETSEL,
-            Some(WPARAM(0)),
-            Some(LPARAM(-1)),
-        );
+        SendMessageW(data.address, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
     }
 }
 
 fn begin_rename(data: &WindowData) {
     use windows::Win32::UI::Controls::LVM_EDITLABELW;
     let sel = data.state.model.selection_snapshot();
-    let Some(idx) = sel.focus() else { data.state.say("no item focused", false); return; };
+    let Some(idx) = sel.focus() else {
+        data.state.say("no item focused", false);
+        return;
+    };
     unsafe {
         SendMessageW(
             data.listview.hwnd,
@@ -1582,17 +1965,12 @@ fn select_row(lv: HWND, idx: usize) {
             Some(WPARAM(idx)),
             Some(LPARAM(&raw const item as isize)),
         );
-        SendMessageW(
-            lv,
-            LVM_ENSUREVISIBLE,
-            Some(WPARAM(idx)),
-            Some(LPARAM(0)),
-        );
+        SendMessageW(lv, LVM_ENSUREVISIBLE, Some(WPARAM(idx)), Some(LPARAM(0)));
     }
 }
 
 fn select_all(data: &WindowData) {
-    use windows::Win32::UI::Controls::{LVITEMW, LVIS_SELECTED, LVM_SETITEMSTATE};
+    use windows::Win32::UI::Controls::{LVIS_SELECTED, LVITEMW, LVM_SETITEMSTATE};
     const LVIS_MASK: LIST_VIEW_ITEM_STATE_FLAGS = LIST_VIEW_ITEM_STATE_FLAGS(0x000F);
     let mut item: LVITEMW = unsafe { std::mem::zeroed() };
     item.state = LVIS_SELECTED;

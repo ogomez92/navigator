@@ -49,15 +49,15 @@ fn reads_nested_dirs() {
 
 #[test]
 fn detects_hidden_attribute() {
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW,
-    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW};
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("secret.txt");
     fs::write(&p, b"").unwrap();
 
     let w: Vec<u16> = p.as_os_str().encode_wide().chain([0]).collect();
-    unsafe { SetFileAttributesW(w.as_ptr(), FILE_ATTRIBUTE_HIDDEN); }
+    unsafe {
+        SetFileAttributesW(w.as_ptr(), FILE_ATTRIBUTE_HIDDEN);
+    }
 
     let entries = read_dir(&make_absolute(dir.path())).unwrap();
     let secret = entries.iter().find(|e| e.name == "secret.txt").unwrap();
@@ -66,15 +66,15 @@ fn detects_hidden_attribute() {
 
 #[test]
 fn detects_system_attribute() {
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_SYSTEM, SetFileAttributesW,
-    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_SYSTEM, SetFileAttributesW};
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("driver.sys");
     fs::write(&p, b"").unwrap();
 
     let w: Vec<u16> = p.as_os_str().encode_wide().chain([0]).collect();
-    unsafe { SetFileAttributesW(w.as_ptr(), FILE_ATTRIBUTE_SYSTEM); }
+    unsafe {
+        SetFileAttributesW(w.as_ptr(), FILE_ATTRIBUTE_SYSTEM);
+    }
 
     let entries = read_dir(&make_absolute(dir.path())).unwrap();
     let sys = entries.iter().find(|e| e.name == "driver.sys").unwrap();
