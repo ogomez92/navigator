@@ -74,7 +74,7 @@ pub fn run(driver: &RcloneDriver, op: &Operation) -> std::io::Result<Outcome> {
         lpVerb: PCWSTR(verb_w.as_ptr()),
         lpFile: PCWSTR(exe_w.as_ptr()),
         lpParameters: PCWSTR(params_w.as_ptr()),
-        nShow: SW_HIDE.0 as i32,
+        nShow: SW_HIDE.0,
         ..Default::default()
     };
 

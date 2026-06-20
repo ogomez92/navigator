@@ -143,16 +143,14 @@ impl ListView {
 
         let mut lv = Self { hwnd };
         let cols = state.config.read().general.columns;
-        let mut next_idx = 0i32;
-        for col in visible_columns(&cols) {
+        for (next_idx, col) in visible_columns(&cols).into_iter().enumerate() {
             let (title, width, right) = match col {
                 LogicalColumn::Name => (w!("Name"), 320, false),
                 LogicalColumn::Size => (w!("Size"), 100, true),
                 LogicalColumn::Type => (w!("Type"), 120, false),
                 LogicalColumn::Modified => (w!("Modified"), 160, false),
             };
-            lv.add_column(next_idx, title, width, right);
-            next_idx += 1;
+            lv.add_column(next_idx as i32, title, width, right);
         }
 
         unsafe {
@@ -246,16 +244,14 @@ impl ListView {
         }
 
         let mut me = Self { hwnd: self.hwnd };
-        let mut next_idx = 0i32;
-        for col in visible_columns(cols) {
+        for (next_idx, col) in visible_columns(cols).into_iter().enumerate() {
             let (title, width, right) = match col {
                 LogicalColumn::Name => (w!("Name"), 320, false),
                 LogicalColumn::Size => (w!("Size"), 100, true),
                 LogicalColumn::Type => (w!("Type"), 120, false),
                 LogicalColumn::Modified => (w!("Modified"), 160, false),
             };
-            me.add_column(next_idx, title, width, right);
-            next_idx += 1;
+            me.add_column(next_idx as i32, title, width, right);
         }
     }
 }
@@ -294,12 +290,13 @@ unsafe extern "system" fn listview_subclass_proc(
         let ch = wp.0 as u32;
         // Filter: printable Unicode only, no control chars. Ctrl+letter
         // WM_CHAR codes land in 0x01..=0x1A — skip those too.
-        if ch >= 0x20 && ch != 0x7F {
-            if let Some(c) = char::from_u32(ch) {
-                let state = unsafe { &*(data as *const crate::app::AppState) };
-                if let Some(idx) = state.type_ahead_step(c) {
-                    focus_row(hwnd, idx);
-                }
+        if ch >= 0x20
+            && ch != 0x7F
+            && let Some(c) = char::from_u32(ch)
+        {
+            let state = unsafe { &*(data as *const crate::app::AppState) };
+            if let Some(idx) = state.type_ahead_step(c) {
+                focus_row(hwnd, idx);
             }
         }
         return windows::Win32::Foundation::LRESULT(0);
@@ -379,10 +376,10 @@ unsafe extern "system" fn listview_subclass_proc(
     if msg == WM_KEYDOWN && wp.0 as u32 == 0x09 {
         unsafe {
             let shift = (GetKeyState(0x10 /* VK_SHIFT */) as i32) < 0;
-            if let Ok(parent) = GetParent(hwnd) {
-                if let Ok(next) = GetNextDlgTabItem(parent, Some(hwnd), shift) {
-                    let _ = SetFocus(Some(next));
-                }
+            if let Ok(parent) = GetParent(hwnd)
+                && let Ok(next) = GetNextDlgTabItem(parent, Some(hwnd), shift)
+            {
+                let _ = SetFocus(Some(next));
             }
         }
         return windows::Win32::Foundation::LRESULT(0);

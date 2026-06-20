@@ -128,7 +128,7 @@ pub fn build_propsheet_page_template(cx_dlu: u16, cy_dlu: u16) -> Vec<u8> {
     }
     buf.extend_from_slice(&0u16.to_le_bytes());
 
-    while buf.len() % 4 != 0 {
+    while !buf.len().is_multiple_of(4) {
         buf.push(0);
     }
     buf
@@ -160,7 +160,7 @@ fn build_template(title: &str, cx: u16, cy: u16) -> Vec<u8> {
     }
     buf.extend_from_slice(&0u16.to_le_bytes());
 
-    while buf.len() % 4 != 0 {
+    while !buf.len().is_multiple_of(4) {
         buf.push(0);
     }
     buf

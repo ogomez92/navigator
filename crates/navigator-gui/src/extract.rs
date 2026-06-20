@@ -11,6 +11,7 @@
 //! binary already supports every format the user cares about, ships
 //! with a stable command-line, and keeps us off LGPL/etc. dependencies.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -46,7 +47,7 @@ pub fn is_extractable(path: &Path) -> bool {
         return false;
     };
     let lower = ext.to_ascii_lowercase();
-    EXTRACTABLE_EXTENSIONS.iter().any(|e| *e == lower.as_str())
+    EXTRACTABLE_EXTENSIONS.contains(&lower.as_str())
 }
 
 /// Locate `7z.exe` on `PATH`. Returns `None` if not installed.
@@ -228,16 +229,14 @@ pub fn run_extract(
             raw_dest
         };
 
-        if wrapping {
-            if let Err(e) = std::fs::create_dir_all(&dest) {
-                warn!("create_dir_all {:?}: {}", dest, e);
-                let _ = speech.try_send(Utterance {
-                    text: format!("can't create folder for {}", label),
-                    interrupt: true,
-                });
-                failed += 1;
-                continue;
-            }
+        if wrapping && let Err(e) = std::fs::create_dir_all(&dest) {
+            warn!("create_dir_all {:?}: {}", dest, e);
+            let _ = speech.try_send(Utterance {
+                text: format!("can't create folder for {}", label),
+                interrupt: true,
+            });
+            failed += 1;
+            continue;
         }
 
         let mut cmd = Command::new(&seven_zip);
@@ -254,14 +253,14 @@ pub fn run_extract(
         match status {
             Ok(s) if s.success() => {
                 ok += 1;
-                if opts.delete_when_extracted {
-                    if let Err(e) = std::fs::remove_file(&archive_path) {
-                        warn!("delete {:?}: {}", archive_path, e);
-                        let _ = speech.try_send(Utterance {
-                            text: format!("extracted {} but couldn't delete archive", label),
-                            interrupt: true,
-                        });
-                    }
+                if opts.delete_when_extracted
+                    && let Err(e) = std::fs::remove_file(&archive_path)
+                {
+                    warn!("delete {:?}: {}", archive_path, e);
+                    let _ = speech.try_send(Utterance {
+                        text: format!("extracted {} but couldn't delete archive", label),
+                        interrupt: true,
+                    });
                 }
             }
             Ok(s) => {
@@ -292,6 +291,131 @@ pub fn run_extract(
         text: summary,
         interrupt: failed > 0,
     });
+}
+
+/// Pick the `.zip` path produced when compressing `src`. The name is the
+/// source's file stem with a `.zip` extension, placed next to the source —
+/// e.g. `report.txt` → `report.zip`, folder `docs` → `docs.zip` (Explorer's
+/// "Send to → Compressed folder" parity). Pure; collision avoidance is the
+/// caller's job via [`unique_dest`].
+pub fn zip_dest(src: &Path) -> PathBuf {
+    let stem = src
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .or_else(|| src.file_name().and_then(|s| s.to_str()))
+        .unwrap_or("archive");
+    let parent = src.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!("{stem}.zip"))
+}
+
+/// The `7z a` invocation a zip operation resolves to. Built by [`plan_zip`]
+/// so the cwd / inputs / dest decision is unit-testable without spawning 7z.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ZipPlan {
+    /// Directory 7z runs from (`current_dir`); inputs are relative to it.
+    pub cwd: PathBuf,
+    /// Output archive (sibling of the primary item). Pre-dedupe — the
+    /// worker still runs it through [`unique_dest`].
+    pub dest: PathBuf,
+    /// Source arguments passed to 7z, relative to `cwd`.
+    pub inputs: Vec<OsString>,
+}
+
+/// Decide how to compress a selection into a single `.zip`.
+///
+/// * `primary` — the entry the archive is named after (the focused row);
+///   `dest` is always its sibling `<stem>.zip`.
+/// * `single_folder` — true *only* when the selection is exactly one
+///   directory. Then 7z runs from inside that folder and adds `*`, so the
+///   folder's contents land at the archive root (no wrapping subfolder).
+/// * Otherwise (2+ items, or one folder plus files, or a lone file) every
+///   entry in `items` is added by basename from the common parent, so each
+///   folder shows up as a subfolder inside the one archive.
+///
+/// Pure — collision avoidance is the caller's job via [`unique_dest`].
+pub fn plan_zip(primary: &Path, items: &[PathBuf], single_folder: bool) -> ZipPlan {
+    let dest = zip_dest(primary);
+    if single_folder {
+        ZipPlan {
+            cwd: primary.to_path_buf(),
+            dest,
+            inputs: vec![OsString::from("*")],
+        }
+    } else {
+        let parent = primary
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let inputs = items
+            .iter()
+            .filter_map(|p| p.file_name().map(|s| s.to_os_string()))
+            .collect();
+        ZipPlan {
+            cwd: parent,
+            dest,
+            inputs,
+        }
+    }
+}
+
+/// Compress `items` into a single sibling `.zip` using `seven_zip`. A lone
+/// selected folder is zipped by its contents (root of the archive); any
+/// other selection keeps each item's name (folders become subfolders).
+/// `primary` (the focused entry) names the archive. Originals are NEVER
+/// deleted. Announces the result via `speech`. Takes everything by value so
+/// it holds no `AppState` reference.
+pub fn run_zip(
+    items: Vec<NavPath>,
+    primary: NavPath,
+    seven_zip: PathBuf,
+    speech: Sender<Utterance>,
+) {
+    let item_paths: Vec<PathBuf> = items.iter().map(|p| p.as_path().to_path_buf()).collect();
+    let single_folder = item_paths.len() == 1 && item_paths[0].is_dir();
+
+    let plan = plan_zip(primary.as_path(), &item_paths, single_folder);
+    let dest = unique_dest(plan.dest);
+    let dest_label = dest
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("archive.zip")
+        .to_string();
+
+    let mut cmd = Command::new(&seven_zip);
+    cmd.current_dir(&plan.cwd)
+        .arg("a")
+        .arg("-tzip")
+        .arg("-y")
+        .arg("--")
+        .arg(&dest);
+    for input in &plan.inputs {
+        cmd.arg(input);
+    }
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    no_console(&mut cmd);
+
+    match cmd.status() {
+        Ok(s) if s.success() => {
+            let _ = speech.try_send(Utterance {
+                text: format!("created {}", dest_label),
+                interrupt: false,
+            });
+        }
+        Ok(s) => {
+            warn!("7z zip exit {} into {:?}", s.code().unwrap_or(-1), dest);
+            let _ = speech.try_send(Utterance {
+                text: "zip failed".into(),
+                interrupt: true,
+            });
+        }
+        Err(e) => {
+            warn!("7z spawn: {}", e);
+            let _ = speech.try_send(Utterance {
+                text: format!("7z failed to start: {}", e),
+                interrupt: true,
+            });
+        }
+    }
 }
 
 fn list_top_level_count(seven_zip: &Path, archive: &Path) -> std::io::Result<usize> {
@@ -433,6 +557,78 @@ Size = 0
         let parent = Path::new("/parent");
         assert_eq!(decide_dest(archive, parent, 5, false), parent);
         assert_eq!(decide_dest(archive, parent, 1, false), parent);
+    }
+
+    #[test]
+    fn zip_dest_names_sibling_zip() {
+        assert_eq!(
+            zip_dest(Path::new("/p/report.txt")),
+            Path::new("/p/report.zip")
+        );
+        assert_eq!(zip_dest(Path::new("/p/docs")), Path::new("/p/docs.zip"));
+        // Layered extension: only the outer one is dropped (file_stem).
+        assert_eq!(
+            zip_dest(Path::new("/p/a.tar.gz")),
+            Path::new("/p/a.tar.zip")
+        );
+    }
+
+    fn inputs_as_strings(plan: &ZipPlan) -> Vec<String> {
+        plan.inputs
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn plan_zip_single_folder_zips_contents() {
+        let folder = Path::new("/p/docs");
+        let items = [folder.to_path_buf()];
+        let plan = plan_zip(folder, &items, true);
+        // cwd is the folder itself and we add `*`, so contents land at root.
+        assert_eq!(plan.cwd, folder);
+        assert_eq!(plan.dest, Path::new("/p/docs.zip"));
+        assert_eq!(inputs_as_strings(&plan), vec!["*".to_string()]);
+    }
+
+    #[test]
+    fn plan_zip_folder_plus_file_wraps_each() {
+        let primary = Path::new("/p/docs");
+        let items = [
+            Path::new("/p/docs").to_path_buf(),
+            Path::new("/p/notes.txt").to_path_buf(),
+        ];
+        // Not a single folder → combined archive named after the primary,
+        // each item added by basename from the shared parent.
+        let plan = plan_zip(primary, &items, false);
+        assert_eq!(plan.cwd, Path::new("/p"));
+        assert_eq!(plan.dest, Path::new("/p/docs.zip"));
+        assert_eq!(inputs_as_strings(&plan), vec!["docs", "notes.txt"]);
+    }
+
+    #[test]
+    fn plan_zip_two_folders_wraps_each() {
+        let primary = Path::new("/p/docs");
+        let items = [
+            Path::new("/p/docs").to_path_buf(),
+            Path::new("/p/pics").to_path_buf(),
+        ];
+        let plan = plan_zip(primary, &items, false);
+        assert_eq!(plan.cwd, Path::new("/p"));
+        assert_eq!(plan.dest, Path::new("/p/docs.zip"));
+        assert_eq!(inputs_as_strings(&plan), vec!["docs", "pics"]);
+    }
+
+    #[test]
+    fn plan_zip_single_file_zips_the_file_at_root() {
+        let file = Path::new("/p/report.txt");
+        let items = [file.to_path_buf()];
+        // A lone file is the combined branch (single_folder == false), so it
+        // is added by basename → archive holds the file at its root.
+        let plan = plan_zip(file, &items, false);
+        assert_eq!(plan.cwd, Path::new("/p"));
+        assert_eq!(plan.dest, Path::new("/p/report.zip"));
+        assert_eq!(inputs_as_strings(&plan), vec!["report.txt"]);
     }
 
     #[test]

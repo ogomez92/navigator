@@ -816,7 +816,7 @@ unsafe extern "system" fn edit_dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp:
                         SetWindowLongPtrW(hwnd, DWLP_USER, 0);
                     }
                     let _ = EndDialog(hwnd, cmd as isize);
-                    return 1;
+                    1
                 }
                 ID_BTN_CANCEL => {
                     let raw = GetWindowLongPtrW(hwnd, DWLP_USER);
@@ -825,7 +825,7 @@ unsafe extern "system" fn edit_dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp:
                         SetWindowLongPtrW(hwnd, DWLP_USER, 0);
                     }
                     let _ = EndDialog(hwnd, cmd as isize);
-                    return 1;
+                    1
                 }
                 _ => 0,
             }

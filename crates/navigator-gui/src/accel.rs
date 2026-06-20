@@ -35,12 +35,12 @@ pub fn parse_vk(s: &str) -> Option<u16> {
             _ => None,
         };
     }
-    if bytes[0].to_ascii_uppercase() == b'F' && bytes.len() <= 3 {
-        if let Ok(n) = s[1..].parse::<u16>() {
-            if (1..=24).contains(&n) {
-                return Some(0x6F + n); // VK_F1 = 0x70, so n=1 → 0x70.
-            }
-        }
+    if bytes[0].eq_ignore_ascii_case(&b'F')
+        && bytes.len() <= 3
+        && let Ok(n) = s[1..].parse::<u16>()
+        && (1..=24).contains(&n)
+    {
+        return Some(0x6F + n); // VK_F1 = 0x70, so n=1 → 0x70.
     }
     named_vk(s)
 }
@@ -79,13 +79,13 @@ pub fn chord_to_accel(chord: &ShortcutChord) -> Option<(u16, ACCEL_VIRT_FLAGS)> 
     let vk = parse_vk(&chord.key)?;
     let mut mods = FVIRTKEY;
     if chord.ctrl {
-        mods = mods | FCONTROL;
+        mods |= FCONTROL;
     }
     if chord.shift {
-        mods = mods | FSHIFT;
+        mods |= FSHIFT;
     }
     if chord.alt {
-        mods = mods | FALT;
+        mods |= FALT;
     }
     Some((vk, mods))
 }

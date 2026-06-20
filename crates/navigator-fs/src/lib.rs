@@ -342,10 +342,11 @@ impl Matcher {
             return Matcher::Glob(parse_glob(&lower));
         }
         // `.png`, `.tar.gz` — extension-only filter.
-        if let Some(ext) = lower.strip_prefix('.') {
-            if !ext.is_empty() && !ext.contains('.') {
-                return Matcher::Extension(ext.to_string());
-            }
+        if let Some(ext) = lower.strip_prefix('.')
+            && !ext.is_empty()
+            && !ext.contains('.')
+        {
+            return Matcher::Extension(ext.to_string());
         }
         Matcher::Substring(lower)
     }

@@ -80,7 +80,7 @@ fn modal_loop(parent: HWND, hwnd: HWND) {
             if got <= 0 {
                 break;
             }
-            if IsDialogMessageW(hwnd, &mut msg).as_bool() {
+            if IsDialogMessageW(hwnd, &msg).as_bool() {
                 continue;
             }
             let _ = TranslateMessage(&msg);
@@ -161,10 +161,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             match cmd {
                 ID_FIND => {
                     let query = get_text(d.edit);
-                    if !query.is_empty() {
-                        if let Some(cwd) = d.state.model.cwd() {
-                            d.state.start_search(cwd, query);
-                        }
+                    if !query.is_empty()
+                        && let Some(cwd) = d.state.model.cwd()
+                    {
+                        d.state.start_search(cwd, query);
                     }
                     let _ = DestroyWindow(hwnd);
                 }

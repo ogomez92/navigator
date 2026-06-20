@@ -279,6 +279,22 @@ fn delete_purges_path() {
 }
 
 #[test]
+fn touch_creates_empty_file() {
+    if !rclone_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("brand.new");
+    assert!(!file.exists(), "precondition: file must not exist yet");
+
+    let driver = RcloneDriver::from_path();
+    let (ok, _) = run_to_completion(&driver, Operation::Touch { file: nav(&file) });
+    assert!(ok, "touch should succeed");
+    assert!(file.exists(), "touch must create the file");
+    assert_eq!(fs::read(&file).unwrap(), b"", "touched file must be empty");
+}
+
+#[test]
 fn preflight_on_missing_source_reports_error() {
     if !rclone_available() {
         return;

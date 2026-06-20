@@ -197,19 +197,14 @@ impl Default for Columns {
 
 /// How directory entries are ordered. Folder-first tiebreak is always
 /// applied before the chosen key, matching Explorer's behaviour.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SortMode {
+    #[default]
     Name,
     Size,
     Type,
     Modified,
     Created,
-}
-
-impl Default for SortMode {
-    fn default() -> Self {
-        SortMode::Name
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -271,10 +266,8 @@ impl ConfigHandle {
         // user can discover the file, hand-edit it, or just confirm where
         // settings live. Failure here is logged but non-fatal — the app
         // still runs against the in-memory defaults.
-        if created {
-            if let Err(e) = handle.save() {
-                warn!("failed to write default config: {}", e);
-            }
+        if created && let Err(e) = handle.save() {
+            warn!("failed to write default config: {}", e);
         }
         handle
     }

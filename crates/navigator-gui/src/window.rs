@@ -85,6 +85,8 @@ const LVN_ODSTATECHANGED: u32 = 4294967181;
 
 #[repr(C)]
 #[allow(non_snake_case)]
+// Name + field casing mirror the Win32 `NMLVODSTATECHANGE` struct verbatim.
+#[allow(clippy::upper_case_acronyms)]
 struct NMLVODSTATECHANGE {
     hdr: NMHDR,
     iFrom: i32,
@@ -240,7 +242,7 @@ pub fn run_message_loop(hwnd: HWND) -> i32 {
             // Dialog-manager tab traversal + default-button handling. This
             // is why plain top-level windows get Tab between children for
             // free when their controls have WS_TABSTOP.
-            if IsDialogMessageW(hwnd, &mut msg).as_bool() {
+            if IsDialogMessageW(hwnd, &msg).as_bool() {
                 continue;
             }
             let _ = TranslateMessage(&msg);
@@ -368,11 +370,13 @@ pub enum Commands {
     DumpTree = 145,
     Extract = 146,
     EmptyTrash = 147,
+    Zip = 149,
     /// Spawn a new navigator instance opened to the containing folder of
     /// the focused entry. Routed from the listview subclass on Ctrl+Enter
     /// (the plain VK_RETURN arm fires `OpenFocused`). Especially useful in
     /// search results, where each row may live in a different subdir.
     OpenContaining = 148,
+    NewFile = 150,
     // Help menu
     About = 160,
     // Shortcut/Action dynamic range
@@ -394,6 +398,12 @@ fn build_menu() -> HMENU {
             MF_STRING,
             Commands::NewFolder as usize,
             w!("&New folder…\tCtrl+N"),
+        );
+        let _ = AppendMenuW(
+            file,
+            MF_STRING,
+            Commands::NewFile as usize,
+            w!("New &file…\tCtrl+Shift+N"),
         );
         let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(
@@ -591,6 +601,12 @@ fn build_menu() -> HMENU {
             Commands::Extract as usize,
             w!("&Extract archive(s)\tCtrl+E"),
         );
+        let _ = AppendMenuW(
+            tools,
+            MF_STRING,
+            Commands::Zip as usize,
+            w!("&Zip selection\tCtrl+Shift+Z"),
+        );
         let _ = AppendMenuW(tools, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(
             tools,
@@ -738,14 +754,14 @@ unsafe extern "system" fn tab_nav_subclass_proc(
     {
         unsafe {
             let shift = (windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x10) as i32) < 0;
-            if let Ok(parent) = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd) {
-                if let Ok(next) = windows::Win32::UI::WindowsAndMessaging::GetNextDlgTabItem(
+            if let Ok(parent) = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd)
+                && let Ok(next) = windows::Win32::UI::WindowsAndMessaging::GetNextDlgTabItem(
                     parent,
                     Some(hwnd),
                     shift,
-                ) {
-                    let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(next));
-                }
+                )
+            {
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(next));
             }
         }
         return LRESULT(0);
@@ -963,12 +979,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         WM_KEYDOWN => unsafe {
             // Enter on the listview opens the focused entry (handled globally
             // because we don't own the ListView's own key handling).
-            if wp.0 as u32 == 0x0D {
-                if let Some(data) = window_data(hwnd) {
+            if wp.0 as u32 == 0x0D
+                && let Some(data) = window_data(hwnd) {
                     open_focused(data);
                     return LRESULT(0);
                 }
-            }
             DefWindowProcW(hwnd, msg, wp, lp)
         },
 
@@ -1000,11 +1015,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 crate::context_menu::show(hwnd, pt, &paths, from_keyboard);
             } else {
                 let sel = data.state.model.selection_snapshot();
-                if let (Some(idx), Some(cwd)) = (sel.focus(), data.state.model.cwd()) {
-                    if let Some(e) = data.state.model.get(idx) {
+                if let (Some(idx), Some(cwd)) = (sel.focus(), data.state.model.cwd())
+                    && let Some(e) = data.state.model.get(idx) {
                         crate::context_menu::show(hwnd, pt, &[cwd.join(&e.name)], from_keyboard);
                     }
-                }
             }
             LRESULT(0)
         },
@@ -1023,6 +1037,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         },
 
         WM_CLOSE => unsafe {
+            // Warn before tearing down in-flight rclone transfers. Closing
+            // the window ends the process, which closes the job-object
+            // handle and kills any running rclone children mid-copy (see
+            // navigator-rclone). Give the user a chance to wait.
+            if let Some(data) = window_data(hwnd) {
+                let n = data.state.ops_in_flight();
+                if n > 0 && !confirm_close_with_ops(hwnd, n) {
+                    return LRESULT(0);
+                }
+            }
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         },
@@ -1041,6 +1065,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
+/// # Safety
+///
+/// `hwnd` must be the main window whose `GWLP_USERDATA` was set to a
+/// `Box::into_raw(WindowData)` in `WM_CREATE` and not yet cleared (it's
+/// zeroed in `WM_DESTROY`). The returned reference borrows that live
+/// allocation; the caller must not outlive the window.
 pub unsafe fn window_data<'a>(hwnd: HWND) -> Option<&'a WindowData> {
     let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
     if raw == 0 {
@@ -1105,26 +1135,26 @@ unsafe fn handle_listview_notify(
             // `report.txt` to keep `.txt`. Folders keep the full selection.
             let disp = unsafe { &*(lp.0 as *const NMLVDISPINFOW) };
             let idx = disp.item.iItem as usize;
-            if let Some(entry) = data.state.model.get(idx) {
-                if let Some(end) = rename_stem_select_end(&entry.name, entry.is_dir()) {
-                    const LVM_GETEDITCONTROL: u32 = 0x1000 + 24;
-                    const EM_SETSEL: u32 = 0x00B1;
-                    unsafe {
-                        let edit = SendMessageW(
-                            data.listview.hwnd,
-                            LVM_GETEDITCONTROL,
+            if let Some(entry) = data.state.model.get(idx)
+                && let Some(end) = rename_stem_select_end(&entry.name, entry.is_dir())
+            {
+                const LVM_GETEDITCONTROL: u32 = 0x1000 + 24;
+                const EM_SETSEL: u32 = 0x00B1;
+                unsafe {
+                    let edit = SendMessageW(
+                        data.listview.hwnd,
+                        LVM_GETEDITCONTROL,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(0)),
+                    );
+                    let edit_hwnd = HWND(edit.0 as *mut _);
+                    if !edit_hwnd.0.is_null() {
+                        SendMessageW(
+                            edit_hwnd,
+                            EM_SETSEL,
                             Some(WPARAM(0)),
-                            Some(LPARAM(0)),
+                            Some(LPARAM(end as isize)),
                         );
-                        let edit_hwnd = HWND(edit.0 as *mut _);
-                        if !edit_hwnd.0.is_null() {
-                            SendMessageW(
-                                edit_hwnd,
-                                EM_SETSEL,
-                                Some(WPARAM(0)),
-                                Some(LPARAM(end as isize)),
-                            );
-                        }
                     }
                 }
             }
@@ -1305,10 +1335,10 @@ fn activate_index(state: &Arc<AppState>, idx: usize) {
         // "Local Disk (C:)". Parse out the drive letter and navigate to
         // its root. If parsing fails (e.g. an unrecognised entry), we
         // quietly bail rather than silently opening the wrong path.
-        if let Some(drive_root) = navigator_fs::drive_path_from_display(&entry.name) {
-            if let Ok(p) = navigator_core::NavPath::new(drive_root) {
-                state.navigate(p);
-            }
+        if let Some(drive_root) = navigator_fs::drive_path_from_display(&entry.name)
+            && let Ok(p) = navigator_core::NavPath::new(drive_root)
+        {
+            state.navigate(p);
         }
         return;
     }
@@ -1364,6 +1394,38 @@ fn sign_extend_16(v: i32) -> i32 {
 /// Ask the user whether to upload `staged` back to its origin remote.
 /// Called on the UI thread from the WMAPP_REMOTE_EDIT arm so the
 /// MessageBox gets a real parent hwnd and can be announced properly.
+/// Modal "an operation is still running — close anyway?" confirmation.
+/// Returns `true` if the user chose to close (kill the transfers), `false`
+/// to keep the window open. Defaults to the safe choice (No) so a stray
+/// Enter doesn't abort a copy.
+fn confirm_close_with_ops(hwnd: HWND, n: usize) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_YESNO, MessageBoxW,
+    };
+    use windows::core::PCWSTR;
+
+    let body = format!(
+        "{} file operation{} still running.\n\n\
+         Closing now will stop {} and may leave files partially copied. \
+         Close anyway?",
+        n,
+        if n == 1 { " is" } else { "s are" },
+        if n == 1 { "it" } else { "them" },
+    );
+    let title_w: Vec<u16> = "Operation in progress".encode_utf16().chain([0]).collect();
+    let body_w: Vec<u16> = body.encode_utf16().chain([0]).collect();
+    let rc = unsafe {
+        MessageBoxW(
+            Some(hwnd),
+            PCWSTR(body_w.as_ptr()),
+            PCWSTR(title_w.as_ptr()),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND,
+        )
+        .0
+    };
+    rc == IDYES.0
+}
+
 fn prompt_remote_upload(hwnd: HWND, state: &Arc<crate::app::AppState>, staged: std::path::PathBuf) {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, IDYES, MB_DEFBUTTON1, MB_ICONQUESTION, MB_SETFOREGROUND, MB_YESNO,
@@ -1442,6 +1504,7 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
         x if x == Commands::ShowProperties as u16 => data.state.op_show_properties(),
         x if x == Commands::DumpTree as u16 => data.state.op_dump_tree(),
         x if x == Commands::Extract as u16 => data.state.op_extract(),
+        x if x == Commands::Zip as u16 => data.state.op_zip(),
         x if x == Commands::EmptyTrash as u16 => data.state.op_empty_trash(),
         x if x == Commands::FocusAddress as u16 => focus_address(data),
         x if x == Commands::ToggleHidden as u16 => {
@@ -1482,7 +1545,14 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
             crate::search::open(hwnd, data.state.clone());
         }
         x if x == Commands::Exit as u16 => unsafe {
-            let _ = DestroyWindow(hwnd);
+            // Route through WM_CLOSE so the in-flight-operation warning
+            // applies to menu-Exit the same as the window's X / Alt+F4.
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(hwnd),
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+            );
         },
         x if x == Commands::About as u16 => {
             data.state
@@ -1518,6 +1588,9 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
         }
         x if x == Commands::NewFolder as u16 => {
             crate::new_folder::open(hwnd, data.state.clone());
+        }
+        x if x == Commands::NewFile as u16 => {
+            crate::new_folder::open_file(hwnd, data.state.clone());
         }
         x if (x >= Commands::ActionBase as u16) => {
             // Shortcut action. ID = ActionBase + index into `state.actions()`.
@@ -1710,29 +1783,75 @@ fn mirror_item_change(state: &Arc<AppState>, nm: &NMLISTVIEW) {
 }
 
 /// Fold one `LVN_ODSTATECHANGED` (virtual range select) into the model's
-/// `Selection`. Range is inclusive; `iFrom`/`iTo` may arrive in any order.
+/// `Selection`.
+///
+/// We deliberately do NOT apply the reported `[iFrom, iTo]` delta
+/// incrementally. For multi-row shift gestures (Shift+Home/End,
+/// Shift+PageUp/Down, shift-click that flips to the other side of the
+/// anchor) the control deselects one contiguous block and selects
+/// another in the same gesture. Reconstructing that by `insert`/`remove`
+/// over the single reported range leaves rows on the far side of the
+/// anchor stuck in the model — the selection drifts larger than the
+/// control's, and can look "inverted" after an anchor crossing.
+///
+/// Instead we treat the control as the source of truth (it is, for
+/// `LVS_OWNERDATA` — it stores its own item state) and rebuild the
+/// model's selected set from the control's actual selection. Enumeration
+/// is bounded by the selection size and only runs on genuine multi-row
+/// changes; single-row shift-arrow keeps the cheap `LVN_ITEMCHANGED`
+/// path in `mirror_item_change`.
 fn mirror_range_change(state: &Arc<AppState>, nm: &NMLVODSTATECHANGE) {
-    const LVIS_SELECTED: u32 = 0x0002;
-    let was = nm.uOldState & LVIS_SELECTED != 0;
-    let is = nm.uNewState & LVIS_SELECTED != 0;
-    if was == is {
+    let lv = nm.hdr.hwndFrom;
+    if lv.is_invalid() {
         return;
     }
-    if nm.iFrom < 0 || nm.iTo < 0 {
-        return;
-    }
-    let (lo, hi) = if nm.iFrom <= nm.iTo {
-        (nm.iFrom, nm.iTo)
-    } else {
-        (nm.iTo, nm.iFrom)
+    rebuild_selection_from_control(state, lv);
+}
+
+/// Replace the model's selected set with the control's current selection,
+/// preserving the focused row. Walks `LVM_GETNEXTITEM` with
+/// `LVNI_SELECTED`, which for a virtual listview reflects exactly what the
+/// OS thinks is selected right now.
+fn rebuild_selection_from_control(state: &Arc<AppState>, lv: HWND) {
+    use windows::Win32::UI::Controls::{LVM_GETNEXTITEM, LVNI_FOCUSED, LVNI_SELECTED};
+    let selected = {
+        let mut out: Vec<usize> = Vec::new();
+        let mut i: isize = -1;
+        loop {
+            let next = unsafe {
+                SendMessageW(
+                    lv,
+                    LVM_GETNEXTITEM,
+                    Some(WPARAM(i as usize)),
+                    Some(LPARAM(LVNI_SELECTED as isize)),
+                )
+            };
+            if next.0 < 0 {
+                break;
+            }
+            out.push(next.0 as usize);
+            i = next.0;
+        }
+        out
+    };
+    let focused = unsafe {
+        SendMessageW(
+            lv,
+            LVM_GETNEXTITEM,
+            Some(WPARAM(usize::MAX)),
+            Some(LPARAM(LVNI_FOCUSED as isize)),
+        )
     };
     state.model.with_selection(|sel| {
-        for i in (lo as usize)..=(hi as usize) {
-            if is {
-                sel.insert(i);
-            } else {
-                sel.remove(i);
-            }
+        let prev_focus = sel.focus();
+        sel.clear();
+        for idx in &selected {
+            sel.insert(*idx);
+        }
+        if focused.0 >= 0 {
+            sel.set_focus(Some(focused.0 as usize));
+        } else {
+            sel.set_focus(prev_focus);
         }
     });
 }
@@ -1848,8 +1967,12 @@ fn dispatch_internal(hwnd: HWND, data: &WindowData, ic: navigator_config::Intern
         IC::ShowProperties => state.op_show_properties(),
         IC::DumpTree => state.op_dump_tree(),
         IC::Extract => state.op_extract(),
+        IC::Zip => state.op_zip(),
         IC::NewFolder => {
             crate::new_folder::open(hwnd, state.clone());
+        }
+        IC::NewFile => {
+            crate::new_folder::open_file(hwnd, state.clone());
         }
         IC::FocusAddress => focus_address(data),
         other => {
@@ -1932,7 +2055,7 @@ fn refocus_after_up(data: &WindowData, cwd: &NavPath) {
         // through to row-0 default rather than leaving focus nowhere.
     }
 
-    if data.state.model.len() > 0 {
+    if !data.state.model.is_empty() {
         select_row(data.listview.hwnd, 0);
     }
 }

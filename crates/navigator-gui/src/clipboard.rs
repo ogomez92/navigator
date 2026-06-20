@@ -125,10 +125,10 @@ pub fn entry_details(e: &HistoryEntry) -> String {
     s.push_str(&format!("Operation: {}\n", verb));
     s.push_str(&format!("When:      {}\n", format_ts(e.ts)));
     s.push_str(&format!("Items:     {}\n", n));
-    if e.kind == "paste" {
-        if let Some(dst) = e.dest.as_deref() {
-            s.push_str(&format!("Dest:      {}\n", dst));
-        }
+    if e.kind == "paste"
+        && let Some(dst) = e.dest.as_deref()
+    {
+        s.push_str(&format!("Dest:      {}\n", dst));
     }
     // Source roots — one line summarising which directories the op
     // touched. Dedup so a batch of 50 files from one folder still shows

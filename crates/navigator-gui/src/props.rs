@@ -226,10 +226,10 @@ pub fn format_remote_properties(
         .map(|s| s.to_string())
         .unwrap_or_else(|| fmt_time_or_dash(entry.modified.0));
     s.push_str(&format!("Modified:  {}\n", mod_str));
-    if let Some(st) = stat {
-        if let Some(mime) = st.mime_type.as_deref().filter(|m| !m.is_empty()) {
-            s.push_str(&format!("MIME:      {}\n", mime));
-        }
+    if let Some(st) = stat
+        && let Some(mime) = st.mime_type.as_deref().filter(|m| !m.is_empty())
+    {
+        s.push_str(&format!("MIME:      {}\n", mime));
     }
 
     if let Some(st) = stat {
@@ -239,9 +239,9 @@ pub fn format_remote_properties(
             s.push_str("--- Unix metadata ---\n");
             if let Some(m) = mode {
                 s.push_str(&format!(
-                    "Mode:      {} ({})\n",
+                    "Mode:      {} (0o{:o})\n",
                     format_unix_mode(m),
-                    format!("0o{:o}", m & 0o7777)
+                    m & 0o7777
                 ));
             }
             for key in [

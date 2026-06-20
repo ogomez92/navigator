@@ -34,6 +34,7 @@ pub struct ShortcutChord {
     ///   * arrow + navigation keys: `Up`, `Down`, `Left`, `Right`, `Home`,
     ///     `End`, `PageUp`, `PageDown`, `Insert`, `Delete`, `Tab`,
     ///     `Space`, `Escape`/`Esc`, `Enter`/`Return`, `Backspace`
+    ///
     /// Kept as a string so the config file stays readable.
     pub key: String,
 }
@@ -101,6 +102,11 @@ pub enum InternalCommand {
     /// directory. The folder is only created after the user commits the
     /// name — unlike Explorer we don't create `New folder` up front.
     NewFolder,
+    /// Prompt for a name (extension required) and create a new empty file
+    /// in the current directory, then open it in the OS default app for
+    /// that extension. Like `NewFolder`, the file is only created once the
+    /// user commits the name.
+    NewFile,
     /// Move focus to the address bar and select its text. Default
     /// chord is Alt+D — same as Explorer / browsers.
     FocusAddress,
@@ -114,6 +120,10 @@ pub enum InternalCommand {
     /// Ctrl+E. Behaviour (delete-after, wrapper folder) is governed by
     /// the `[extraction]` config section.
     Extract,
+    /// Compress the selected file(s)/folder(s) into a `.zip` next to each,
+    /// using `7z` on PATH. Default chord: Ctrl+Shift+Z. The original is
+    /// never deleted.
+    Zip,
 }
 
 impl InternalCommand {
@@ -257,6 +267,7 @@ pub fn default_actions() -> Vec<ShortcutAction> {
         ),
         internal("Dump tree", DumpTree, chord(false, false, true, "L")),
         internal("New folder", NewFolder, chord(true, false, false, "N")),
+        internal("New file", NewFile, chord(true, true, false, "N")),
         internal(
             "Focus address bar",
             FocusAddress,
@@ -269,6 +280,7 @@ pub fn default_actions() -> Vec<ShortcutAction> {
             chord(false, false, true, "C"),
         ),
         internal("Extract archive", Extract, chord(true, false, false, "E")),
+        internal("Zip selection", Zip, chord(true, true, false, "Z")),
     ]
 }
 
@@ -312,6 +324,28 @@ mod tests {
         assert!(c.ctrl && !c.shift && !c.alt);
         assert!(
             c.key.eq_ignore_ascii_case("e"),
+            "unexpected key: {:?}",
+            c.key
+        );
+    }
+
+    #[test]
+    fn zip_default_is_ctrl_shift_z() {
+        let c = default_chord(InternalCommand::Zip).expect("seeded");
+        assert!(c.ctrl && c.shift && !c.alt);
+        assert!(
+            c.key.eq_ignore_ascii_case("z"),
+            "unexpected key: {:?}",
+            c.key
+        );
+    }
+
+    #[test]
+    fn new_file_default_is_ctrl_shift_n() {
+        let c = default_chord(InternalCommand::NewFile).expect("seeded");
+        assert!(c.ctrl && c.shift && !c.alt);
+        assert!(
+            c.key.eq_ignore_ascii_case("n"),
             "unexpected key: {:?}",
             c.key
         );

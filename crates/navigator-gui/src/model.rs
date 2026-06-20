@@ -207,10 +207,10 @@ impl Model {
         for step in 0..len {
             let i = (start + step) % len;
             let idx = g.visible[i] as usize;
-            if let Some(e) = g.all.get(idx) {
-                if e.name.to_ascii_lowercase().starts_with(&prefix_lc) {
-                    return Some(i);
-                }
+            if let Some(e) = g.all.get(idx)
+                && e.name.to_ascii_lowercase().starts_with(&prefix_lc)
+            {
+                return Some(i);
             }
         }
         None
@@ -309,6 +309,32 @@ mod tests {
         m.append_entries(vec![file("aaaa"), file("zeta")]);
         let after: Vec<String> = (0..m.len()).map(|i| m.get(i).unwrap().name).collect();
         assert_eq!(after, vec!["alpha", "bravo", "charlie", "aaaa", "zeta"]);
+    }
+
+    /// Type-ahead cycling depends on `find_prefix` resuming *past* the
+    /// current focus and wrapping. Focused on `he`, a single `h` must
+    /// advance to the next `h` entry (`ho`) rather than snapping back to
+    /// the first one (`ha`) — the bug behind the type-ahead fix.
+    #[test]
+    fn find_prefix_resumes_past_focus_and_wraps() {
+        let m = Model::new();
+        let cwd = NavPath::new(std::path::PathBuf::from(if cfg!(windows) {
+            r"C:\tmp\nav"
+        } else {
+            "/tmp/nav"
+        }))
+        .unwrap();
+        // Sorted view: ha(0), he(1), ho(2).
+        m.set_listing(cwd, vec![file("ha"), file("he"), file("ho")]);
+
+        // Focused on `he` (index 1): single `h` advances to `ho`.
+        assert_eq!(m.find_prefix("h", Some(1)), Some(2));
+        // From `ho` it wraps around to `ha`.
+        assert_eq!(m.find_prefix("h", Some(2)), Some(0));
+        // From the top (no focus) it still lands on the first match.
+        assert_eq!(m.find_prefix("h", None), Some(0));
+        // A `from` that is itself the sole match returns itself (wrap).
+        assert_eq!(m.find_prefix("he", Some(1)), Some(1));
     }
 
     /// Search-mode rows store relative paths (`subA\\file.ext`). Copy-paths,

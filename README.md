@@ -103,6 +103,8 @@ flow:
 | Ctrl + Shift + C             | Copy full path(s) to OS clipboard                   |
 | Ctrl + Z                     | Undo last clipboard / paste / delete                |
 | Del                          | Delete to per-volume `.trash`                       |
+| Ctrl + N                     | New folder (prompts for name)                       |
+| Ctrl + Shift + N             | New file (name needs a `.type`) + open in default app |
 | F2                           | Rename                                              |
 | Ctrl + F                     | Find in folder                                      |
 | Ctrl + H / Ctrl + Shift + H  | Toggle hidden / system files                        |

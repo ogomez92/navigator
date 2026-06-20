@@ -1,8 +1,11 @@
-//! Ctrl+N "New folder" dialog. Modal input with a single edit field; on
-//! OK the name is handed to [`AppState::op_new_folder`] which creates the
-//! directory via rclone so remote and local endpoints work the same way.
+//! "New folder" (Ctrl+N) / "New file" (Ctrl+Shift+N) dialog. A single
+//! modal input field; on OK the name is handed to
+//! [`AppState::op_new_folder`] / [`AppState::op_new_file`], which create
+//! the entry via rclone so remote and local endpoints work the same way.
+//! The new-file path additionally opens the created file in the OS
+//! default app for its extension.
 //!
-//! The folder is **not** created up front and then renamed (Explorer's
+//! The entry is **not** created up front and then renamed (Explorer's
 //! default) — if the user cancels, nothing happens at all.
 
 use std::ffi::c_void;
@@ -33,20 +36,63 @@ const ID_EDIT: u16 = 610;
 const ID_OK: u16 = 1; // IDOK — Enter submits
 const ID_CANCEL: u16 = 2;
 
+/// What the dialog is asking the user to name. Drives the window title,
+/// the field label, and which `AppState` op runs on commit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Folder,
+    File,
+}
+
+impl Kind {
+    fn title(self) -> PCWSTR {
+        match self {
+            Kind::Folder => w!("New folder — navigator"),
+            Kind::File => w!("New file — navigator"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Kind::Folder => "Folder name:",
+            Kind::File => "File name (with extension):",
+        }
+    }
+}
+
 struct Data {
     state: Arc<AppState>,
+    kind: Kind,
     edit: HWND,
 }
 
-static PARAMS: OnceCell<Mutex<Option<Arc<AppState>>>> = OnceCell::new();
+/// What `open_kind` hands to `WM_CREATE` through the shared cell.
+type PendingOpen = (Arc<AppState>, Kind);
 
+static PARAMS: OnceCell<Mutex<Option<PendingOpen>>> = OnceCell::new();
+
+/// Open the "New folder" prompt (Ctrl+N).
 pub fn open(parent: HWND, state: Arc<AppState>) {
-    // Refuse to even open the dialog in contexts where a folder can't be
+    open_kind(parent, state, Kind::Folder);
+}
+
+/// Open the "New file" prompt (Ctrl+Shift+N). The created file is opened
+/// in the OS default app for its extension once it exists.
+pub fn open_file(parent: HWND, state: Arc<AppState>) {
+    open_kind(parent, state, Kind::File);
+}
+
+fn open_kind(parent: HWND, state: Arc<AppState>, kind: Kind) {
+    // Refuse to even open the dialog in contexts where nothing can be
     // created. Announces the reason so screen-reader users know why
     // nothing happened.
     if let Some(cwd) = state.model.cwd() {
         if cwd.is_this_pc() || cwd.is_remotes_root() {
-            state.say("cannot create folder here", true);
+            let what = match kind {
+                Kind::Folder => "folder",
+                Kind::File => "file",
+            };
+            state.say(&format!("cannot create {what} here"), true);
             return;
         }
     } else {
@@ -60,7 +106,7 @@ pub fn open(parent: HWND, state: Arc<AppState>) {
     PARAMS
         .get_or_init(|| Mutex::new(None))
         .lock()
-        .replace(state);
+        .replace((state, kind));
     let hinstance = match unsafe { GetModuleHandleW(None) } {
         Ok(h) => h,
         Err(_) => return,
@@ -69,7 +115,7 @@ pub fn open(parent: HWND, state: Arc<AppState>) {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
-            w!("New folder — navigator"),
+            kind.title(),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -96,7 +142,7 @@ fn modal_loop(parent: HWND, hwnd: HWND) {
             if got <= 0 {
                 break;
             }
-            if IsDialogMessageW(hwnd, &mut msg).as_bool() {
+            if IsDialogMessageW(hwnd, &msg).as_bool() {
                 continue;
             }
             let _ = TranslateMessage(&msg);
@@ -134,7 +180,7 @@ fn ensure_class() -> windows::core::Result<()> {
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_CREATE => unsafe {
-            let Some(state) = PARAMS.get().and_then(|m| m.lock().take()) else {
+            let Some((state, kind)) = PARAMS.get().and_then(|m| m.lock().take()) else {
                 return LRESULT(-1);
             };
             let font = GetStockObject(DEFAULT_GUI_FONT);
@@ -147,7 +193,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 );
             };
 
-            let label = mkstatic(hwnd, "Folder name:", 10, 12, 460);
+            let label = mkstatic(hwnd, kind.label(), 10, 12, 460);
             apply_font(label);
             let edit = mkedit(hwnd, 10, 36, 450, ID_EDIT);
             apply_font(edit);
@@ -156,7 +202,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let cancel = mkbutton(hwnd, "Cancel", 370, 80, 90, 28, ID_CANCEL);
             apply_font(cancel);
 
-            let data = Box::new(Data { state, edit });
+            let data = Box::new(Data { state, kind, edit });
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(data) as isize);
 
             // Focus the edit so the user can type the name immediately.
@@ -172,7 +218,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 ID_OK => {
                     let name = get_text(d.edit);
                     if !name.trim().is_empty() {
-                        d.state.op_new_folder(name);
+                        match d.kind {
+                            Kind::Folder => d.state.op_new_folder(name),
+                            Kind::File => d.state.op_new_file(name),
+                        }
                     }
                     let _ = DestroyWindow(hwnd);
                 }

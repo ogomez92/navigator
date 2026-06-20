@@ -37,11 +37,16 @@ const IDC_BTN_CLOSE: u16 = 305;
 
 const CLASS: PCWSTR = w!("NavigatorProgress");
 
+/// Shared cancel callback: the worker installs one via `set_cancel`; the
+/// UI thread invokes it when the user clicks Cancel. `Option` because it's
+/// unset until a worker arms it; `Arc<Mutex<…>>` so handle clones share it.
+type CancelSlot = Arc<Mutex<Option<Box<dyn FnMut() + Send>>>>;
+
 /// Shared handle: workers call methods on this, the UI thread owns the HWND.
 #[derive(Clone)]
 pub struct ProgressHandle {
     hwnd: HWND,
-    cancel_flag: Arc<Mutex<Option<Box<dyn FnMut() + Send>>>>,
+    cancel_flag: CancelSlot,
 }
 
 // HWND is not Send but we never touch it outside of PostMessage which is
@@ -98,7 +103,7 @@ struct Data {
     progbar: HWND,
     log: HWND,
     btn_cancel: HWND,
-    cancel_flag: Arc<Mutex<Option<Box<dyn FnMut() + Send>>>>,
+    cancel_flag: CancelSlot,
     finished: bool,
 }
 
@@ -109,14 +114,14 @@ pub fn open(parent: HWND) -> windows::core::Result<ProgressHandle> {
     let hinstance = unsafe { GetModuleHandleW(None)? };
 
     // Singleton: reuse the previous window if it's still alive.
-    if let Some(h) = SINGLETON.get().and_then(|m| m.lock().unwrap().clone()) {
-        if unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(h.hwnd)) }.as_bool() {
-            unsafe {
-                let _ = ShowWindow(h.hwnd, SW_SHOW);
-            }
-            bring_to_foreground(h.hwnd);
-            return Ok(h);
+    if let Some(h) = SINGLETON.get().and_then(|m| m.lock().unwrap().clone())
+        && unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(h.hwnd)) }.as_bool()
+    {
+        unsafe {
+            let _ = ShowWindow(h.hwnd, SW_SHOW);
         }
+        bring_to_foreground(h.hwnd);
+        return Ok(h);
     }
 
     let hwnd = unsafe {
@@ -200,7 +205,7 @@ fn ensure_class() -> windows::core::Result<()> {
     Ok(())
 }
 
-fn build_children(parent: HWND, cancel_flag: Arc<Mutex<Option<Box<dyn FnMut() + Send>>>>) -> Data {
+fn build_children(parent: HWND, cancel_flag: CancelSlot) -> Data {
     let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
     let apply_font = |h: HWND| unsafe {
         SendMessageW(
@@ -251,7 +256,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     (done as f64 / total as f64 * 100.0) as u32
                 )
             } else {
-                format!("{}", fmt_bytes(done))
+                fmt_bytes(done).to_string()
             };
             set_text(d.label_stats, &stats);
             let percent = if total > 0 {

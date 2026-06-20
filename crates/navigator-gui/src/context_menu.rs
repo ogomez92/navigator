@@ -167,7 +167,7 @@ unsafe fn show_inner(
         (desktop, children)
     };
 
-    let ctx_menu: IContextMenu = unsafe { parent.GetUIObjectOf(hwnd, &*children_owned, None)? };
+    let ctx_menu: IContextMenu = unsafe { parent.GetUIObjectOf(hwnd, &children_owned, None)? };
 
     // Populate an HMENU from the context-menu object.
     let hmenu: HMENU = unsafe { CreatePopupMenu()? };
@@ -244,7 +244,7 @@ unsafe fn show_inner(
 
     ACTIVE.with(|a| *a.borrow_mut() = None);
 
-    if cmd >= CMD_BASE && cmd <= CMD_MAX {
+    if (CMD_BASE..=CMD_MAX).contains(&cmd) {
         let verb_id = cmd - CMD_BASE;
         unsafe {
             invoke(&ctx_menu, hwnd, verb_id)?;

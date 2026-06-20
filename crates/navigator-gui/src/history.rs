@@ -38,10 +38,10 @@ impl History {
     pub fn push(&mut self, path: NavPath) {
         // Collapse consecutive duplicates — navigating to the same place
         // shouldn't grow the history.
-        if let Some(current) = self.entries.get(self.cursor) {
-            if *current == path {
-                return;
-            }
+        if let Some(current) = self.entries.get(self.cursor)
+            && *current == path
+        {
+            return;
         }
         if self.cursor < self.entries.len() {
             self.entries.truncate(self.cursor + 1);

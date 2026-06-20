@@ -2,6 +2,7 @@
 //! background scan worker, and the clipboard for cut/copy.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread;
 
@@ -95,6 +96,32 @@ pub struct AppState {
     /// Process-wide cache for files downloaded from rclone remotes so
     /// they can be opened in local apps. See `remote_cache.rs`.
     pub remote_cache: Arc<RemoteCache>,
+    /// Count of mutating rclone operations currently running (copy/move/
+    /// delete/trash, plus remote stage/upload). Each worker holds an
+    /// [`OpGuard`] for its lifetime, so this is accurate even on a panic.
+    /// The window-close handler reads it to warn the user that closing
+    /// will kill in-flight transfers (the job object terminates the
+    /// rclone children on exit — see `navigator-rclone`).
+    ops_in_flight: Arc<AtomicUsize>,
+}
+
+/// RAII counter for in-flight operations. Increments on construction,
+/// decrements on drop — so a worker thread that finishes (or unwinds)
+/// always leaves the count balanced. Cloned from `AppState.ops_in_flight`
+/// into each worker via `AppState::op_guard`.
+pub struct OpGuard(Arc<AtomicUsize>);
+
+impl OpGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        OpGuard(counter)
+    }
+}
+
+impl Drop for OpGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 const UNDO_STACK_MAX: usize = 50;
@@ -196,9 +223,23 @@ impl AppState {
             undo_stack: Mutex::new(Vec::new()),
             self_weak: OnceCell::new(),
             remote_cache: Arc::new(RemoteCache::new()),
+            ops_in_flight: Arc::new(AtomicUsize::new(0)),
         });
         let _ = me.self_weak.set(Arc::downgrade(&me));
         me
+    }
+
+    /// Number of mutating rclone operations currently running. The
+    /// window-close handler reads this to warn before tearing down
+    /// in-flight transfers.
+    pub fn ops_in_flight(&self) -> usize {
+        self.ops_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Mint an [`OpGuard`] tied to this state's in-flight counter. Held by
+    /// each op worker for its lifetime so `ops_in_flight` stays accurate.
+    fn op_guard(&self) -> OpGuard {
+        OpGuard::new(self.ops_in_flight.clone())
     }
 
     /// Build the plugin host, load any plugins on disk, and wire the nav
@@ -311,23 +352,23 @@ impl AppState {
                 // Re-stat the file and replace the cached entry so size +
                 // mtime columns reflect reality. Return the visible index
                 // via AppState → the window handler invalidates that row.
-                if let Some(new) = single_entry(&root, &name) {
-                    if let Some(vis_idx) = self.model.update_entry(&name, new) {
-                        self.invalidate_row(vis_idx);
-                    }
+                if let Some(new) = single_entry(&root, &name)
+                    && let Some(vis_idx) = self.model.update_entry(&name, new)
+                {
+                    self.invalidate_row(vis_idx);
                 }
             }
             crate::watcher::WatchEvent::Renamed { from, to } => {
                 if let Some(f) = from {
                     self.model.remove_by_name(&f);
                 }
-                if let Some(t) = to {
-                    if let Some(e) = single_entry(&root, &t) {
-                        if append_mode {
-                            self.model.append_entries(vec![e]);
-                        } else {
-                            self.refresh();
-                        }
+                if let Some(t) = to
+                    && let Some(e) = single_entry(&root, &t)
+                {
+                    if append_mode {
+                        self.model.append_entries(vec![e]);
+                    } else {
+                        self.refresh();
                     }
                 }
             }
@@ -357,12 +398,12 @@ impl AppState {
                 sel.focus(),
                 sel.len()
             );
-            if let (Some(idx), Some(cwd)) = (sel.focus(), self.model.cwd()) {
-                if let Some(e) = self.model.get(idx) {
-                    let p = cwd.join(&e.name);
-                    tracing::info!("run_action: fallback to focused entry {:?}", p.to_string());
-                    paths.push(p);
-                }
+            if let (Some(idx), Some(cwd)) = (sel.focus(), self.model.cwd())
+                && let Some(e) = self.model.get(idx)
+            {
+                let p = cwd.join(&e.name);
+                tracing::info!("run_action: fallback to focused entry {:?}", p.to_string());
+                paths.push(p);
             }
         }
         if paths.is_empty() {
@@ -447,6 +488,13 @@ impl AppState {
     /// instead of searching "ab"). Returns the row index of the match,
     /// or `None` if nothing matches.
     ///
+    /// A single-character buffer is treated as "advance to the next entry
+    /// starting with this letter", so it cycles from the current focus —
+    /// that's what makes the first press move forward (e.g. focused on
+    /// `he`, press `h` → `ho`, not back to `ha`) as well as repeated
+    /// presses step through every match. A multi-character buffer is a real
+    /// typed prefix and searches from the top for its first match.
+    ///
     /// Same-letter fallback: when the buffer is a run of one character
     /// (e.g. "aa", "aaa") and no entry starts with the run, cycle through
     /// entries starting with that single letter from the current focus.
@@ -463,7 +511,14 @@ impl AppState {
         g.1 = now;
         let prefix = g.0.clone();
         drop(g);
-        if let Some(idx) = self.model.find_prefix(&prefix, None) {
+        // Single letter → cycle from the current focus (Explorer parity);
+        // multi-char prefix → first match from the top.
+        let from = if prefix.chars().count() == 1 {
+            self.model.selection_snapshot().focus()
+        } else {
+            None
+        };
+        if let Some(idx) = self.model.find_prefix(&prefix, from) {
             return Some(idx);
         }
         let ch_lc = ch.to_ascii_lowercase();
@@ -779,6 +834,7 @@ impl AppState {
         let rclone = self.rclone.clone();
         let cache = Arc::clone(&self.remote_cache);
         let remote_for_thread = remote.clone();
+        let guard = self.op_guard();
 
         let _ = speech.send(crate::speech::Utterance {
             text: format!("downloading {}", remote.file_name()),
@@ -788,6 +844,7 @@ impl AppState {
         std::thread::Builder::new()
             .name("navigator-remote-open".into())
             .spawn(move || {
+                let _guard = guard;
                 let op = Operation::CopyTo {
                     src: remote_for_thread.clone(),
                     dst: staged_nav,
@@ -1307,12 +1364,11 @@ impl AppState {
                     },
                     interrupt: fail_count > 0,
                 });
-                if let Some(state) = state_weak.upgrade() {
-                    if let (Some(cwd), Some(parent)) = (state.model.cwd(), parent_hint) {
-                        if cwd == parent {
-                            state.refresh();
-                        }
-                    }
+                if let Some(state) = state_weak.upgrade()
+                    && let (Some(cwd), Some(parent)) = (state.model.cwd(), parent_hint)
+                    && cwd == parent
+                {
+                    state.refresh();
                 }
             })
             .expect("spawn remote-purge worker");
@@ -1446,7 +1502,10 @@ impl AppState {
         let text = paths
             .iter()
             .map(|p| {
-                let s = p.to_string();
+                // Remote paths must cross as rclone `name:sub` syntax — the
+                // raw `\\?\NavigatorRemote\...` sentinel is useless in the Run
+                // dialog or a CLI arg. Local paths copy verbatim.
+                let s = p.rclone_arg().unwrap_or_else(|| p.to_string());
                 if s.chars().any(|c| c.is_whitespace()) {
                     format!("\"{}\"", s)
                 } else {
@@ -1593,6 +1652,52 @@ impl AppState {
             .name("navigator-extract".into())
             .spawn(move || crate::extract::run_extract(extractable, opts, seven_zip, speech))
             .expect("spawn extract worker");
+    }
+
+    /// Compress the selected file(s)/folder(s) into a single sibling `.zip`
+    /// via `7z` on PATH. A lone selected folder is zipped by its contents
+    /// (no wrapping subfolder); any other selection keeps each item's name
+    /// inside the one archive. The archive is named after the focused entry.
+    /// Remote (rclone) selections are skipped — 7z can't read
+    /// `\\?\NavigatorRemote\...`. Originals are never deleted. Runs on a
+    /// worker; the file watcher folds the new `.zip` into the listing so no
+    /// refresh is needed.
+    pub fn op_zip(&self) {
+        let selection = self.model.selected_paths();
+        if selection.is_empty() {
+            self.say("nothing selected", false);
+            return;
+        }
+        let local: Vec<navigator_core::NavPath> =
+            selection.into_iter().filter(|p| !p.is_remote()).collect();
+        if local.is_empty() {
+            self.say("can't zip remote items", true);
+            return;
+        }
+        let seven_zip = match crate::extract::find_7z() {
+            Some(p) => p,
+            None => {
+                self.say("7z not found on PATH; install 7-Zip to zip files", true);
+                return;
+            }
+        };
+        // The archive is named after the focused row when it's part of the
+        // local selection; otherwise fall back to the first selected item.
+        let focused = self.model.cwd().and_then(|cwd| {
+            let idx = self.model.selection_snapshot().focus()?;
+            let entry = self.model.get(idx)?;
+            Some(cwd.join(&entry.name))
+        });
+        let primary = focused
+            .filter(|p| local.iter().any(|l| l == p))
+            .unwrap_or_else(|| local[0].clone());
+        let speech = self.speech.handle();
+        let total = local.len();
+        self.say(&format!("zipping {} item(s)", total), false);
+        std::thread::Builder::new()
+            .name("navigator-zip".into())
+            .spawn(move || crate::extract::run_zip(local, primary, seven_zip, speech))
+            .expect("spawn zip worker");
     }
 
     /// Show the read-only properties viewer for the focused entry. For
@@ -1742,6 +1847,48 @@ impl AppState {
         self.spawn_op(Operation::Mkdir { dir: dst });
     }
 
+    /// Create an empty file named `name` inside the current directory and
+    /// open it in the OS default app for its type. The caller prompts for
+    /// the name (see the `new_folder` dialog in `File` mode). A `.` segment
+    /// is required so the shell has a type to resolve. Pending focus is
+    /// armed so the created row gets the caret after the post-op refresh.
+    pub fn op_new_file(&self, name: String) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            self.say("file name empty", true);
+            return;
+        }
+        if name.contains(['\\', '/', ':']) || name == "." || name == ".." {
+            self.say("invalid file name", true);
+            return;
+        }
+        // Require a non-empty segment after the final dot so ShellExecute
+        // can resolve a handler. Accepts `notes.txt`, `archive.tar.gz`, and
+        // dotfiles like `.gitignore`; rejects `notes` (no dot) and `notes.`
+        // (trailing dot, empty extension).
+        if !name.contains('.') || name.ends_with('.') {
+            self.say("file name needs an extension, like notes.txt", true);
+            return;
+        }
+        let Some(cwd) = self.model.cwd() else {
+            return;
+        };
+        if cwd.is_this_pc() || cwd.is_remotes_root() {
+            self.say("cannot create file here", true);
+            return;
+        }
+        let dst = cwd.join(&name);
+        // If it already exists locally, don't clobber its contents — just
+        // open the existing file (`rclone touch` would only bump mtime).
+        if !dst.is_remote() && dst.as_path().exists() {
+            self.say(&format!("{} already exists, opening", name), false);
+            self.open_file(dst);
+            return;
+        }
+        self.set_pending_focus(dst.clone());
+        self.spawn_new_file(dst);
+    }
+
     /// Kick off a single-shot op (rename / one-file). For multi-source
     /// batches see [`run_batch`].
     fn spawn_op(&self, op: Operation) {
@@ -1750,6 +1897,17 @@ impl AppState {
             .name("navigator-rclone-op".into())
             .spawn(move || ctx.run_single(op))
             .expect("spawn rclone op thread");
+    }
+
+    /// Touch a new empty file via rclone, then open it once it exists.
+    /// Separate from [`spawn_op`] because the post-op step (ShellExecute
+    /// the freshly created file) isn't part of the generic op flow.
+    fn spawn_new_file(&self, file: NavPath) {
+        let ctx = self.clone_for_worker();
+        thread::Builder::new()
+            .name("navigator-new-file".into())
+            .spawn(move || ctx.run_new_file(file))
+            .expect("spawn new-file thread");
     }
 
     /// Upload a staged remote file back to its origin. Runs on a worker
@@ -1765,6 +1923,7 @@ impl AppState {
         let cache = Arc::clone(&self.remote_cache);
         let remote_display = remote.rclone_arg().unwrap_or_else(|| remote.to_string());
         let state_weak = self.self_weak.get().cloned().unwrap_or_else(Weak::new);
+        let guard = self.op_guard();
 
         let _ = speech.send(crate::speech::Utterance {
             text: format!("uploading to {}", remote_display),
@@ -1774,6 +1933,7 @@ impl AppState {
         std::thread::Builder::new()
             .name("navigator-remote-upload".into())
             .spawn(move || {
+                let _guard = guard;
                 let op = Operation::CopyTo {
                     src: staged_nav,
                     dst: remote.clone(),
@@ -1815,15 +1975,13 @@ impl AppState {
                     // the rescan instead of snapping to row 0. Only
                     // refresh if cwd matches the remote's parent — the
                     // user may have navigated away during upload.
-                    if let Some(state) = state_weak.upgrade() {
-                        if let Some(cwd) = state.model.cwd() {
-                            if let Some(parent) = remote.parent() {
-                                if cwd == parent {
-                                    state.set_pending_focus(remote.clone());
-                                    state.refresh();
-                                }
-                            }
-                        }
+                    if let Some(state) = state_weak.upgrade()
+                        && let Some(cwd) = state.model.cwd()
+                        && let Some(parent) = remote.parent()
+                        && cwd == parent
+                    {
+                        state.set_pending_focus(remote.clone());
+                        state.refresh();
                     }
                 } else {
                     cache.finish_prompt(&staged, None);
@@ -2005,12 +2163,32 @@ impl WorkerCtx {
     }
 
     fn run_single(self, op: Operation) {
+        let _guard = self.state.upgrade().map(|s| s.op_guard());
         let ok = self.run_one(op);
         self.say(if ok { "done" } else { "operation failed" }, !ok);
         self.refresh();
     }
 
+    /// Create `file` via `rclone touch`, then hand it to the shell so the
+    /// OS default app for its extension opens it. `pending_focus` was armed
+    /// by the caller, so the post-op refresh lands the caret on the new row
+    /// (local paths only — remote opens stage a download asynchronously).
+    fn run_new_file(self, file: NavPath) {
+        let _guard = self.state.upgrade().map(|s| s.op_guard());
+        let ok = self.run_one(Operation::Touch { file: file.clone() });
+        if ok {
+            self.say(format!("created {}", file.file_name()), false);
+            if let Some(state) = self.state.upgrade() {
+                state.open_file(file);
+            }
+        } else {
+            self.say("could not create file", true);
+        }
+        self.refresh();
+    }
+
     fn run_batch(self, sources: Vec<NavPath>, dest_dir: NavPath, cut: bool) {
+        let _guard = self.state.upgrade().map(|s| s.op_guard());
         use crate::preflight::{BatchDecision, ItemChoice, prompt_item, unique_numbered_path};
 
         let total = sources.len();
@@ -2141,6 +2319,7 @@ impl WorkerCtx {
     /// rejected (user clicked Skip) or another process may have already
     /// cleaned things up. All results fold into a single summary.
     fn run_revert_paste(self, created: Vec<NavPath>, originals: Vec<NavPath>, cut_mode: bool) {
+        let _guard = self.state.upgrade().map(|s| s.op_guard());
         let total = created.len();
         let mut failed = 0u32;
         let mut skipped = 0u32;
@@ -2189,6 +2368,7 @@ impl WorkerCtx {
     /// rclone-purging it. The pair list is (trash_path, original) so a
     /// future undo can move each entry back to its original location.
     fn run_trash_batch(self, pairs: Vec<(NavPath, NavPath)>) {
+        let _guard = self.state.upgrade().map(|s| s.op_guard());
         let total = pairs.len();
         let mut failed = 0u32;
         for (i, (trash, original)) in pairs.into_iter().enumerate() {
@@ -2217,6 +2397,7 @@ impl WorkerCtx {
     /// the original path has been repopulated by something new, we skip
     /// that entry rather than clobbering the user's fresh file.
     fn run_revert_delete(self, pairs: Vec<(NavPath, NavPath)>) {
+        let _guard = self.state.upgrade().map(|s| s.op_guard());
         let total = pairs.len();
         let mut failed = 0u32;
         let mut skipped = 0u32;

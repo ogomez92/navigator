@@ -19,6 +19,12 @@ struct State {
 unsafe impl Send for State {}
 unsafe impl Sync for State {}
 
+/// # Safety
+///
+/// `api` must point to a valid `HostApi` and `out` to writable storage for
+/// one `Plugin`. The host guarantees both for the lifetime of the call.
+/// Returns non-zero (leaving `out` untouched) on null pointers or ABI
+/// mismatch.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn navigator_plugin_entry(api: *const HostApi, out: *mut Plugin) -> i32 {
     if api.is_null() || out.is_null() {

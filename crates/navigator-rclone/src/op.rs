@@ -19,6 +19,71 @@ use crate::log::{LogEvent, LogLevel};
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Windows job-object plumbing so every spawned rclone child is killed
+/// when the navigator process exits. Without it, closing the window
+/// mid-copy leaves rclone.exe running detached (Windows does not kill
+/// children with their parent) — the transfer keeps going with no UI,
+/// no progress, and no completion bookkeeping. The job is created once,
+/// flagged `KILL_ON_JOB_CLOSE`, and never closed by us: when the process
+/// exits its only handle closes and the OS terminates the children.
+#[cfg(windows)]
+mod job {
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+    use std::sync::OnceLock;
+
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+    use windows::core::PCWSTR;
+
+    /// Lazily create the process-wide job. Returns the raw handle value
+    /// (as `isize` so it can live in a `OnceLock` — `HANDLE` isn't `Send`).
+    /// `0` means creation failed; callers then no-op so a missing job never
+    /// breaks file operations.
+    fn job_handle() -> isize {
+        static JOB: OnceLock<isize> = OnceLock::new();
+        *JOB.get_or_init(|| unsafe {
+            let Ok(h) = CreateJobObjectW(None, PCWSTR::null()) else {
+                return 0;
+            };
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                h,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                core::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if ok.is_err() {
+                let _ = windows::Win32::Foundation::CloseHandle(h);
+                return 0;
+            }
+            // Deliberately leak `h` — it must stay open for the whole
+            // process lifetime so the kill-on-close semantics fire on exit.
+            h.0 as isize
+        })
+    }
+
+    /// Assign `child` to the kill-on-close job. Best-effort: failures are
+    /// swallowed (the child simply keeps the old orphan behaviour).
+    pub fn assign(child: &Child) {
+        let raw = job_handle();
+        if raw == 0 {
+            return;
+        }
+        unsafe {
+            let _ = AssignProcessToJobObject(
+                HANDLE(raw as *mut core::ffi::c_void),
+                HANDLE(child.as_raw_handle()),
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverwritePolicy {
     /// Fail the operation if any destination already exists.
@@ -63,6 +128,12 @@ pub enum Operation {
     /// semantics check ahead of time.
     Mkdir {
         dir: NavPath,
+    },
+    /// Create an empty file (or bump its mtime if it already exists).
+    /// `rclone touch` is the cross-backend equivalent of Unix `touch`, so
+    /// this works for local and remote endpoints alike.
+    Touch {
+        file: NavPath,
     },
 }
 
@@ -167,6 +238,8 @@ impl RcloneDriver {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
+        #[cfg(windows)]
+        job::assign(&child);
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
 
@@ -174,17 +247,18 @@ impl RcloneDriver {
 
         let mut parse = |line: &str| {
             if let Ok(ev) = serde_json::from_str::<LogEvent>(line) {
-                if ev.msg.contains("Would copy") || ev.msg.contains("Would move") {
-                    if let Some(obj) = ev.object.as_ref() {
-                        // rclone prints relative paths; the caller has enough
-                        // context to absolutize if needed.
-                        report.would_overwrite.push(PathBuf::from(obj));
-                    }
+                if (ev.msg.contains("Would copy") || ev.msg.contains("Would move"))
+                    && let Some(obj) = ev.object.as_ref()
+                {
+                    // rclone prints relative paths; the caller has enough
+                    // context to absolutize if needed.
+                    report.would_overwrite.push(PathBuf::from(obj));
                 }
-                if ev.msg.contains("not found") && matches!(ev.level, Some(LogLevel::Error)) {
-                    if let Some(obj) = ev.object.as_ref() {
-                        report.missing_sources.push(PathBuf::from(obj));
-                    }
+                if ev.msg.contains("not found")
+                    && matches!(ev.level, Some(LogLevel::Error))
+                    && let Some(obj) = ev.object.as_ref()
+                {
+                    report.missing_sources.push(PathBuf::from(obj));
                 }
                 report.raw_log.push(ev);
             }
@@ -217,6 +291,11 @@ impl RcloneDriver {
         tracing::info!(target: "rclone.spawn", op_id = id, "rclone spawn: {}", argv.join(" "));
 
         let mut child = cmd.spawn()?;
+        // Tie this rclone child to the process-wide job object so it dies
+        // with the navigator process instead of orphaning a half-finished
+        // copy/move when the user closes the window mid-op.
+        #[cfg(windows)]
+        job::assign(&child);
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
 
@@ -301,6 +380,17 @@ impl RcloneDriver {
             "--stats-one-line".into(),
             "--transfers".into(),
             self.transfers.to_string(),
+            // Treat local paths literally. rclone's default Windows local
+            // encoding maps shell-invalid chars (|, ?, *, :, ...) to their
+            // full-width Unicode equivalents, so a file literally named with
+            // a full-width `｜` (U+FF5C) on disk gets re-encoded to ASCII `|`
+            // and rclone then can't find it ("directory not found"). We hand
+            // rclone the exact on-disk name (local listings come from
+            // navigator-fs / FindFirstFileW, not rclone), so disabling the
+            // encoding makes those names round-trip. Only affects the *local*
+            // backend; remote backends keep their own encoding.
+            "--local-encoding".into(),
+            "None".into(),
         ]
     }
 
@@ -499,10 +589,10 @@ impl RemoteStat {
     pub fn unix_mode(&self) -> Option<u32> {
         let raw = self.metadata.get("mode")?;
         // rclone emits decimal; some backends emit octal with a leading 0.
-        if let Some(stripped) = raw.strip_prefix('0').filter(|s| !s.is_empty()) {
-            if let Ok(v) = u32::from_str_radix(stripped, 8) {
-                return Some(v);
-            }
+        if let Some(stripped) = raw.strip_prefix('0').filter(|s| !s.is_empty())
+            && let Ok(v) = u32::from_str_radix(stripped, 8)
+        {
+            return Some(v);
         }
         raw.parse::<u32>().ok()
     }
@@ -666,6 +756,13 @@ pub fn local_dest_dir(op: &Operation) -> Option<std::path::PathBuf> {
                 .filter(|_| !dir.is_remote())
                 .map(|p| p.to_path_buf());
         }
+        Operation::Touch { file } => {
+            return file
+                .as_path()
+                .parent()
+                .filter(|_| !file.is_remote())
+                .map(|p| p.to_path_buf());
+        }
         Operation::Delete { .. } => return None,
     };
     if nav.is_remote() {
@@ -729,6 +826,10 @@ pub fn op_args(op: &Operation, dry_run: bool) -> Vec<String> {
         Operation::Mkdir { dir } => {
             out.push("mkdir".into());
             out.push(nav_arg(dir));
+        }
+        Operation::Touch { file } => {
+            out.push("touch".into());
+            out.push(nav_arg(file));
         }
     }
     out

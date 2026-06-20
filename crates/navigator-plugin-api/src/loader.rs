@@ -112,8 +112,8 @@ impl PluginLoader {
                 host: ABI_VERSION,
             });
         }
-        // Drop the symbol before moving `lib` into the result.
-        drop(entry);
+        // `entry`'s borrow of `lib` ends here (NLL) — `vtable` is an owned
+        // copy — so `lib` can move into the result below.
         Ok(LoadedPlugin {
             path: path.to_path_buf(),
             vtable,
