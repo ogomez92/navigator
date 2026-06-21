@@ -37,7 +37,7 @@ Scalable, accessible Windows file explorer in Rust.
 ## Goals
 
 - **Accessible first.** Native Win32 controls (`SysListView32`, standard edits, toolbars) — MSAA/UIA work without extra plumbing. Screen readers see the app as a regular Explorer-class window.
-- **Screen-reader output** via the [Prism](https://github.com/prismatoid/prism) C library (local at `D:\code\libs\prism`). Used for supplementary announcements (status, progress, warnings) on top of native a11y.
+- **Screen-reader output** via the [Prism](https://github.com/prismatoid/prism) C library (prebuilt and vendored in `crates/navigator-prism/vendor/`). Used for supplementary announcements (status, progress, warnings) on top of native a11y.
 - **File operations via `rclone`.** No `SHFileOperation`. Copy/cut/paste spawn `rclone copyto` / `moveto` with `--use-json-log` so we can parse errors and detect overwrites up-front with `--dry-run`.
 - **Extensible** through Rust plugins loaded as DLLs via a stable C ABI (`navigator-plugin-api`).
 - **Fast.** Directory listing via raw `FindFirstFileW`. Virtual `ListView` (LVS_OWNERDATA) so million-entry folders render instantly.
