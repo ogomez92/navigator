@@ -17,15 +17,15 @@ cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
 
-Personal install: `./release.sh` builds `--release` and copies `target/release/navigator.exe` to `C:/Users/Nitropc/stuff/bin/x.exe`. Bash script (Git Bash / WSL); the old `scripts/release.ps1` was removed.
+Personal install: `./r.sh` (Git Bash / WSL) or `r.cmd` (PowerShell / cmd) builds `--release` and copies `target/release/navigator.exe` to a personal bin dir as `x.exe`. Destination defaults to `~/stuff/bin/x.exe` (`%USERPROFILE%\stuff\bin\x.exe`) and is overridable via the `NAVIGATOR_INSTALL` env var.
 
 Runtime env: `NAVIGATOR_LOG` sets the `tracing` `EnvFilter` (default `info`).
 
 ### Native dependencies
 
 - **Prism** (screen-reader / TTS C library) is linked by `crates/navigator-prism/build.rs`.
-  - Resolution: `PRISM_DIR` env var, else `D:\code\libs\prism\prism-windows-x64`.
-  - Expects `<base>/dynamic/<profile>/lib/prism.lib` + `<base>/dynamic/<profile>/bin/prism.dll`. Build copies `prism.dll` next to the output binary. `--features static` switches to `static/<profile>/lib`.
+  - Resolution: `PRISM_DIR` env var, else the prebuilt prism **vendored in the crate** at `crates/navigator-prism/vendor/prism-windows-x64` (dynamic-only, ~5 MB, checked into git) — a fresh clone builds with no external setup. Only `prism.*` is vendored; tolk is not needed.
+  - Expects `<base>/dynamic/<profile>/lib/prism.lib` + `<base>/dynamic/<profile>/bin/prism.dll`. Build copies `prism.dll` next to the output binary. `--features static` switches to `static/<profile>/lib`, which is **not** vendored — set `PRISM_DIR` to a full distribution for static builds.
   - `<profile>` is `debug` for dev builds, `release` otherwise.
 - **rclone** must be on `PATH` at runtime — all file operations shell out to it.
 - **7z** must be on `PATH` for the Extract action (Ctrl+E). Missing binary surfaces as a prism announcement, not a dialog. See `[extraction]` config + `extract.rs`.

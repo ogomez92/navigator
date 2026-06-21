@@ -57,7 +57,10 @@ Scalable, accessible Windows file explorer in Rust.
 
 ## Build
 
-Requires Rust 1.95+, MSVC toolchain, and `prism-windows-x64` at `D:\code\libs\prism`.
+Requires Rust 1.95+ and the MSVC toolchain (`x86_64-pc-windows-msvc`). The
+prebuilt [Prism](https://github.com/prismatoid/prism) library is **vendored in
+the repo** (`crates/navigator-prism/vendor/`), so a fresh clone builds with no
+external setup:
 
     cargo build --release
 
@@ -65,7 +68,16 @@ Run:
 
     cargo run --release
 
-Personal install:
+> Only the *dynamic* prism build is vendored. To build with `--features static`,
+> set the `PRISM_DIR` environment variable to a full prism distribution that
+> includes the `static` tree.
+
+> **Runtime requirements:** `rclone` (for all file operations) and `7z` (for
+> `Ctrl+E` extraction) must be on your `PATH`. `prism.dll` is copied next to the
+> built exe automatically.
+
+Personal install (builds release and copies the exe to a bin dir as `x.exe`;
+destination defaults to `~/stuff/bin/x.exe`, override with `NAVIGATOR_INSTALL`):
 
     .\r.cmd      # PowerShell / cmd
     ./r.sh       # Git Bash / WSL

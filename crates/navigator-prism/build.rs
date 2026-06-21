@@ -2,7 +2,10 @@
 //!
 //! Resolution order for the base directory:
 //!   1. `PRISM_DIR` env var (must contain `include/prism.h` + a `dynamic`/`static` tree)
-//!   2. Default: `D:\code\libs\prism\prism-windows-x64`
+//!   2. Default: the prebuilt prism shipped with this crate at
+//!      `<crate>/vendor/prism-windows-x64` — so a fresh clone builds with no
+//!      external setup. Only the *dynamic* tree is vendored; for `--features
+//!      static` you must point `PRISM_DIR` at a full distribution.
 //!
 //! Static linking is selected with `--features static`; otherwise the DLL
 //! import lib is used and `prism.dll` is copied next to the final binary.
@@ -19,9 +22,10 @@ fn main() {
         panic!("navigator-prism currently targets Windows only");
     }
 
+    let vendored = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/prism-windows-x64");
     let base: PathBuf = env::var_os("PRISM_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"D:\code\libs\prism\prism-windows-x64"));
+        .unwrap_or(vendored);
 
     let profile = env::var("PROFILE").unwrap_or_else(|_| "release".into());
     let flavor = if profile == "debug" {
@@ -37,7 +41,19 @@ fn main() {
     };
 
     if !lib_dir.join("prism.lib").is_file() {
-        panic!("prism.lib not found under {}", lib_dir.display());
+        if cfg!(feature = "static") {
+            panic!(
+                "prism.lib not found under {} — the prism build vendored in this crate \
+                 is dynamic-only. For `--features static`, set PRISM_DIR to a full prism \
+                 distribution that contains the `static` tree.",
+                lib_dir.display()
+            );
+        }
+        panic!(
+            "prism.lib not found under {} — set PRISM_DIR to a prism distribution \
+             containing include/ + dynamic/<profile>/lib/prism.lib.",
+            lib_dir.display()
+        );
     }
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
