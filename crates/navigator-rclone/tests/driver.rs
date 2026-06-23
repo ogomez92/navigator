@@ -272,6 +272,7 @@ fn delete_purges_path() {
         &driver,
         Operation::Delete {
             targets: vec![nav(&target_dir)],
+            is_dir: true,
         },
     );
     assert!(ok);

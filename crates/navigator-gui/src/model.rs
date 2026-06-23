@@ -180,6 +180,22 @@ impl Model {
             .collect()
     }
 
+    /// Like [`selected_paths`](Self::selected_paths) but also reports
+    /// whether each entry is a directory. Delete uses this to pick the
+    /// right rclone verb for remote targets — `purge` for directories,
+    /// `deletefile` for files (the verbs are not interchangeable).
+    pub fn selected_paths_with_kind(&self) -> Vec<(NavPath, bool)> {
+        let g = self.0.read();
+        let Some(cwd) = g.cwd.as_ref() else {
+            return Vec::new();
+        };
+        g.selection
+            .iter()
+            .filter_map(|i| g.visible.get(i).and_then(|&idx| g.all.get(idx as usize)))
+            .map(|e| (cwd.join(&e.name), e.is_dir()))
+            .collect()
+    }
+
     /// Visible index of the first entry matching `pred`. Used after
     /// navigate-up to re-focus the child directory we just left.
     pub fn index_of(&self, mut pred: impl FnMut(&Entry) -> bool) -> Option<usize> {

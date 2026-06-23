@@ -1134,11 +1134,12 @@ impl AppState {
     }
 
     pub fn op_delete(&self) {
-        let paths = self.model.selected_paths();
-        if paths.is_empty() {
+        let selected = self.model.selected_paths_with_kind();
+        if selected.is_empty() {
             self.say("nothing selected", false);
             return;
         }
+        let paths: Vec<NavPath> = selected.iter().map(|(p, _)| p.clone()).collect();
         crate::clipboard::push_history(crate::clipboard::HistoryEntry {
             kind: "delete".into(),
             sources: paths.iter().map(|p| p.to_string()).collect(),
@@ -1160,12 +1161,24 @@ impl AppState {
         // Split by endpoint. Remote paths can't go to a local `.trash`
         // dir — rclone would have to cross the boundary — and rclone's
         // own purge is irreversible, so we confirm + skip the undo
-        // stack. Local paths still route through the trash flow.
-        let (remote_targets, local): (Vec<NavPath>, Vec<NavPath>) =
-            paths.iter().cloned().partition(|p| p.is_remote());
+        // stack. Local paths still route through the trash flow. We carry
+        // the per-entry directory flag through so the remote worker can
+        // pick `purge` (dirs) vs `deletefile` (files). Local targets drop
+        // the flag — they route through the trash rename, not rclone.
+        let mut remote_targets: Vec<(NavPath, bool)> = Vec::new();
+        let mut local: Vec<NavPath> = Vec::new();
+        for (p, is_dir) in selected {
+            if p.is_remote() {
+                remote_targets.push((p, is_dir));
+            } else {
+                local.push(p);
+            }
+        }
 
         if !remote_targets.is_empty() {
-            if !confirm_remote_delete(self.main_hwnd(), &remote_targets) {
+            let remote_paths: Vec<NavPath> =
+                remote_targets.iter().map(|(p, _)| p.clone()).collect();
+            if !confirm_remote_delete(self.main_hwnd(), &remote_paths) {
                 // User cancelled. Don't touch local either — avoids a
                 // half-delete where they confirmed one endpoint and not
                 // the other. Clear pending_focus since no op will fire.
@@ -1314,11 +1327,11 @@ impl AppState {
     /// thread. No undo — rclone purge is destructive, and most backends
     /// (S3 without versioning, SFTP, WebDAV) have no recovery path. UI
     /// refreshes when the last target finishes.
-    fn spawn_remote_purge(&self, targets: Vec<NavPath>) {
+    fn spawn_remote_purge(&self, targets: Vec<(NavPath, bool)>) {
         let rclone = self.rclone.clone();
         let speech = self.speech.handle();
         let state_weak = self.self_weak.get().cloned().unwrap_or_else(Weak::new);
-        let parent_hint = targets.first().and_then(|p| p.parent());
+        let parent_hint = targets.first().and_then(|(p, _)| p.parent());
 
         let _ = speech.send(crate::speech::Utterance {
             text: format!("deleting {} remote item(s)", targets.len()),
@@ -1330,9 +1343,10 @@ impl AppState {
             .spawn(move || {
                 let mut ok_count = 0usize;
                 let mut fail_count = 0usize;
-                for t in &targets {
+                for (t, is_dir) in &targets {
                     let op = Operation::Delete {
                         targets: vec![t.clone()],
+                        is_dir: *is_dir,
                     };
                     let handle = match rclone.spawn(op) {
                         Ok(h) => h,
@@ -2336,6 +2350,7 @@ impl WorkerCtx {
             } else {
                 Operation::Delete {
                     targets: vec![c.clone()],
+                    is_dir: self.path_is_dir(c),
                 }
             };
             self.say(
@@ -2451,6 +2466,22 @@ impl WorkerCtx {
             state.set_pending_focus(target);
         }
         self.refresh();
+    }
+
+    /// Classify a path as a directory so a delete can pick the right
+    /// rclone verb (`purge` for dirs, `deletefile` for files). Local
+    /// paths consult the filesystem directly; remote paths fall back to
+    /// an `rclone lsjson --stat`. Defaults to `false` (treat as a file)
+    /// when the remote stat can't answer — a wrong guess just surfaces
+    /// rclone's own "is a file/directory" error rather than mis-deleting.
+    fn path_is_dir(&self, p: &NavPath) -> bool {
+        if !p.is_remote() {
+            return p.as_path().is_dir();
+        }
+        p.rclone_arg()
+            .and_then(|arg| self.rclone.stat(&arg).ok().flatten())
+            .map(|s| s.is_dir)
+            .unwrap_or(false)
     }
 
     /// Run one rclone process synchronously. Returns `true` on success.
@@ -3089,6 +3120,7 @@ mod prune_tests {
         fs::create_dir(&dir).unwrap();
         let op = Operation::Delete {
             targets: vec![NavPath::new(&dir).unwrap()],
+            is_dir: true,
         };
         prune_empty_src_dirs(&op);
         assert!(dir.exists(), "Delete op must not trigger src cleanup");

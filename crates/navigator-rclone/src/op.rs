@@ -108,33 +108,30 @@ pub enum Operation {
     },
     /// Single-source rename to an exact destination path. Used by F2 and
     /// anywhere we need the target filename to differ from the source.
-    Rename {
-        src: NavPath,
-        dst: NavPath,
-    },
+    Rename { src: NavPath, dst: NavPath },
     /// Single-source copy to an exact destination path. Used when the
     /// preflight "Append number" choice gives a copy a new target name
     /// — the caller has already resolved the final filename, so rclone
     /// just runs `copyto` against that path.
-    CopyTo {
-        src: NavPath,
-        dst: NavPath,
-    },
+    CopyTo { src: NavPath, dst: NavPath },
     Delete {
         targets: Vec<NavPath>,
+        /// Whether the (single) target is a directory. rclone's delete
+        /// verbs are strictly complementary: `purge` removes a directory
+        /// and its contents but rejects a file ("is a file not a
+        /// directory"), while `deletefile` removes a single file but
+        /// rejects a directory. The caller must classify the target so
+        /// `op_args` can pick the right verb.
+        is_dir: bool,
     },
     /// Create a directory. `rclone mkdir` succeeds when the target already
     /// exists on most backends; callers that want strict "must be new"
     /// semantics check ahead of time.
-    Mkdir {
-        dir: NavPath,
-    },
+    Mkdir { dir: NavPath },
     /// Create an empty file (or bump its mtime if it already exists).
     /// `rclone touch` is the cross-backend equivalent of Unix `touch`, so
     /// this works for local and remote endpoints alike.
-    Touch {
-        file: NavPath,
-    },
+    Touch { file: NavPath },
 }
 
 /// Paths that would be overwritten by a copy/move. Returned from
@@ -817,9 +814,9 @@ pub fn op_args(op: &Operation, dry_run: bool) -> Vec<String> {
             out.push(nav_arg(src));
             out.push(nav_arg(dst));
         }
-        Operation::Delete { targets } => {
+        Operation::Delete { targets, is_dir } => {
             if let Some(t) = targets.first() {
-                out.push("purge".into());
+                out.push(if *is_dir { "purge" } else { "deletefile" }.into());
                 out.push(nav_arg(t));
             }
         }
@@ -858,4 +855,36 @@ fn path_arg(p: &Path) -> String {
     // disambiguate but breaks absolute paths, so we rely on the `C:\...`
     // form which rclone recognises as local.
     p.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A remote `Delete` of a directory must emit `purge`; a file must
+    /// emit `deletefile`. The verbs are not interchangeable — `purge`
+    /// rejects a file ("is a file not a directory") and `deletefile`
+    /// rejects a directory — so picking by `is_dir` is the whole fix.
+    #[test]
+    fn delete_picks_verb_by_kind() {
+        let file = NavPath::new("gdrive:notes/todo.txt").unwrap();
+        let args = op_args(
+            &Operation::Delete {
+                targets: vec![file],
+                is_dir: false,
+            },
+            false,
+        );
+        assert_eq!(args, vec!["deletefile", "gdrive:notes/todo.txt"]);
+
+        let dir = NavPath::new("gdrive:notes").unwrap();
+        let args = op_args(
+            &Operation::Delete {
+                targets: vec![dir],
+                is_dir: true,
+            },
+            false,
+        );
+        assert_eq!(args, vec!["purge", "gdrive:notes"]);
+    }
 }
