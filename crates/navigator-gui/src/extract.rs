@@ -1,4 +1,5 @@
-//! Archive extraction via the standalone `7z.exe` on `PATH`.
+//! Archive extraction via the standalone `7z.exe` (found on `PATH`, or
+//! failing that in the default 7-Zip install dirs — see [`find_7z`]).
 //!
 //! Pure logic — extension classification, top-level entry parsing, and
 //! the wrapper-folder decision — lives here so it can be unit-tested
@@ -50,9 +51,20 @@ pub fn is_extractable(path: &Path) -> bool {
     EXTRACTABLE_EXTENSIONS.contains(&lower.as_str())
 }
 
-/// Locate `7z.exe` on `PATH`. Returns `None` if not installed.
+/// Locate `7z.exe`. Tries `PATH` first, then the well-known 7-Zip
+/// install directories. Returns `None` if not installed.
+///
+/// The fallback exists because `PATH` here is the environment block this
+/// process *inherited at launch*. Windows never refreshes a running
+/// process's block when `PATH` changes — it only broadcasts
+/// `WM_SETTINGCHANGE` — so a navigator started from a shell/Explorer
+/// session that predates the 7-Zip install sees a stale `PATH` and the
+/// lookup fails even though a fresh shell finds 7z fine. Checking the
+/// standard install dirs makes Extract work anyway.
 pub fn find_7z() -> Option<PathBuf> {
-    which_in_path("7z.exe").or_else(|| which_in_path("7z"))
+    which_in_path("7z.exe")
+        .or_else(|| which_in_path("7z"))
+        .or_else(find_7z_in_install_dirs)
 }
 
 fn which_in_path(name: &str) -> Option<PathBuf> {
@@ -64,6 +76,32 @@ fn which_in_path(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Directories a default 7-Zip install writes `7z.exe` into, in the
+/// order we should prefer them (64-bit machine-wide, then 32-bit, then
+/// the per-user install the MSI offers). Built from environment
+/// variables rather than hardcoded `C:\` so localized / relocated
+/// `Program Files` still resolve.
+fn install_dir_candidates() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for var in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(base) = std::env::var_os(var) {
+            dirs.push(PathBuf::from(base).join("7-Zip"));
+        }
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        dirs.push(PathBuf::from(local).join("Programs").join("7-Zip"));
+    }
+    dirs.dedup();
+    dirs
+}
+
+fn find_7z_in_install_dirs() -> Option<PathBuf> {
+    install_dir_candidates()
+        .into_iter()
+        .map(|d| d.join("7z.exe"))
+        .find(|c| c.is_file())
 }
 
 /// Parse the stdout of `7z l -slt -ba -- archive` to count distinct

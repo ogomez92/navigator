@@ -145,6 +145,8 @@ flow:
 | Ctrl + C / X / V             | Copy / cut / paste (via rclone)                     |
 | Ctrl + Alt + C / X           | Append to copy / cut clipboard                      |
 | Ctrl + Shift + C             | Copy full path(s) to OS clipboard                   |
+| Alt + C / X                  | Copy / cut selection to OS clipboard (CF_HDROP)     |
+| Ctrl + Alt + V               | Paste from OS clipboard via Windows shell (no rclone) |
 | Ctrl + Z                     | Undo last clipboard / paste / delete                |
 | Del                          | Delete to per-volume `.trash`                       |
 | Ctrl + N                     | New folder (prompts for name)                       |

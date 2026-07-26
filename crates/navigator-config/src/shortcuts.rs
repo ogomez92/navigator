@@ -116,6 +116,19 @@ pub enum InternalCommand {
     /// files. Distinct from the app's own file-backed clipboard, which
     /// only navigator instances see. Default chord: Alt+C.
     CopyToClipboard,
+    /// Cut the selected file/folder *handles* to the real Windows
+    /// clipboard as `CF_HDROP` with a `Preferred DropEffect = MOVE`
+    /// hint — the mirror of `CopyToClipboard`. A subsequent paste (in
+    /// Explorer or navigator's own `PasteFromClipboard`) *moves* the
+    /// files rather than copying. Default chord: Alt+X.
+    CutToClipboard,
+    /// Paste whatever files sit on the real Windows clipboard
+    /// (`CF_HDROP`) into the current folder using the Windows shell
+    /// copy engine (`SHFileOperation`), honouring the clipboard's
+    /// `Preferred DropEffect` (move vs copy). Deliberately bypasses
+    /// rclone so huge batches don't trip antivirus heuristics that flag
+    /// rclone hammering thousands of files. Default chord: Alt+V.
+    PasteFromClipboard,
     /// Extract the selected archive(s) using `7z` on PATH. Default chord:
     /// Ctrl+E. Behaviour (delete-after, wrapper folder) is governed by
     /// the `[extraction]` config section.
@@ -281,6 +294,20 @@ pub fn default_actions() -> Vec<ShortcutAction> {
         ),
         internal("Extract archive", Extract, chord(true, false, false, "E")),
         internal("Zip selection", Zip, chord(true, true, false, "Z")),
+        // OS-clipboard cut + paste. Alt+C already copies to the OS
+        // clipboard; Alt+X cuts (writes a MOVE hint) and Alt+V pastes via
+        // the Windows shell copy engine (no rclone) so huge batches don't
+        // trip antivirus heuristics.
+        internal(
+            "Cut to OS clipboard",
+            CutToClipboard,
+            chord(false, false, true, "X"),
+        ),
+        internal(
+            "Paste from OS clipboard",
+            PasteFromClipboard,
+            chord(true, false, true, "V"),
+        ),
     ]
 }
 
@@ -335,6 +362,28 @@ mod tests {
         assert!(c.ctrl && c.shift && !c.alt);
         assert!(
             c.key.eq_ignore_ascii_case("z"),
+            "unexpected key: {:?}",
+            c.key
+        );
+    }
+
+    #[test]
+    fn cut_to_clipboard_default_is_alt_x() {
+        let c = default_chord(InternalCommand::CutToClipboard).expect("seeded");
+        assert!(c.alt && !c.ctrl && !c.shift);
+        assert!(
+            c.key.eq_ignore_ascii_case("x"),
+            "unexpected key: {:?}",
+            c.key
+        );
+    }
+
+    #[test]
+    fn paste_from_clipboard_default_is_ctrl_alt_v() {
+        let c = default_chord(InternalCommand::PasteFromClipboard).expect("seeded");
+        assert!(c.ctrl && c.alt && !c.shift);
+        assert!(
+            c.key.eq_ignore_ascii_case("v"),
             "unexpected key: {:?}",
             c.key
         );

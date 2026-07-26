@@ -346,6 +346,8 @@ pub enum Commands {
     CopyToClipboard = 114,
     AppendCopy = 115,
     AppendCut = 116,
+    CutToClipboard = 117,
+    PasteFromClipboard = 118,
     // File menu
     ToggleHidden = 120,
     ToggleSystem = 121,
@@ -495,6 +497,12 @@ fn build_menu() -> HMENU {
         let _ = AppendMenuW(
             edit,
             MF_STRING,
+            Commands::CutToClipboard as usize,
+            w!("Cut to OS clip&board\tAlt+X"),
+        );
+        let _ = AppendMenuW(
+            edit,
+            MF_STRING,
             Commands::CopyPaths as usize,
             w!("Copy &paths\tCtrl+Shift+C"),
         );
@@ -515,6 +523,12 @@ fn build_menu() -> HMENU {
             MF_STRING,
             Commands::Paste as usize,
             w!("&Paste\tCtrl+V"),
+        );
+        let _ = AppendMenuW(
+            edit,
+            MF_STRING,
+            Commands::PasteFromClipboard as usize,
+            w!("Paste from OS clipboard (shell)\tCtrl+Alt+V"),
         );
         let _ = AppendMenuW(
             edit,
@@ -1498,6 +1512,8 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
         x if x == Commands::OpenContaining as u16 => data.state.op_open_containing_new_window(),
         x if x == Commands::Rename as u16 => begin_rename(data),
         x if x == Commands::CopyToClipboard as u16 => data.state.op_copy_to_clipboard(),
+        x if x == Commands::CutToClipboard as u16 => data.state.op_cut_to_clipboard(),
+        x if x == Commands::PasteFromClipboard as u16 => data.state.op_paste_from_clipboard(),
         x if x == Commands::AppendCopy as u16 => data.state.op_append_clipboard(false),
         x if x == Commands::AppendCut as u16 => data.state.op_append_clipboard(true),
         x if x == Commands::NavigateUp as u16 => data.state.navigate_up(),
@@ -1945,6 +1961,8 @@ fn dispatch_internal(hwnd: HWND, data: &WindowData, ic: navigator_config::Intern
         IC::Paste => state.op_paste(),
         IC::CopyPaths => state.op_copy_paths(),
         IC::CopyToClipboard => state.op_copy_to_clipboard(),
+        IC::CutToClipboard => state.op_cut_to_clipboard(),
+        IC::PasteFromClipboard => state.op_paste_from_clipboard(),
         IC::Delete => state.op_delete(),
         IC::Rename => begin_rename(data),
         IC::SelectAll => select_all(data),
@@ -2063,7 +2081,9 @@ fn refocus_after_up(data: &WindowData, cwd: &NavPath) {
 /// Focus + single-select the row at `idx` in the listview, scrolling it
 /// into view. Clears any previous selection first.
 fn select_row(lv: HWND, idx: usize) {
-    use windows::Win32::UI::Controls::{LVITEMW, LVM_ENSUREVISIBLE, LVM_SETITEMSTATE};
+    use windows::Win32::UI::Controls::{
+        LVITEMW, LVM_ENSUREVISIBLE, LVM_SETITEMSTATE, LVM_SETSELECTIONMARK,
+    };
     // The `windows` crate exposes LVIS_* as a newtype without BitOr, so
     // combine the raw bits ourselves. LVIS_FOCUSED = 0x1, LVIS_SELECTED = 0x2.
     const SEL_FOCUS: LIST_VIEW_ITEM_STATE_FLAGS = LIST_VIEW_ITEM_STATE_FLAGS(0x0003);
@@ -2087,6 +2107,16 @@ fn select_row(lv: HWND, idx: usize) {
             LVM_SETITEMSTATE,
             Some(WPARAM(idx)),
             Some(LPARAM(&raw const item as isize)),
+        );
+        // Reset the selection mark too — see `listview::focus_row`. LVIS_FOCUSED
+        // does not move the anchor Shift+arrow extends from, so a stale mark
+        // from before the navigate would make the first Shift+Down select a
+        // whole block of rows.
+        SendMessageW(
+            lv,
+            LVM_SETSELECTIONMARK,
+            Some(WPARAM(0)),
+            Some(LPARAM(idx as isize)),
         );
         SendMessageW(lv, LVM_ENSUREVISIBLE, Some(WPARAM(idx)), Some(LPARAM(0)));
     }

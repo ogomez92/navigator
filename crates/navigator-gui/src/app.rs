@@ -1612,7 +1612,8 @@ impl AppState {
         let n = paths.len();
         let os_paths: Vec<std::path::PathBuf> =
             paths.iter().map(|p| p.as_path().to_path_buf()).collect();
-        match set_clipboard_hdrop(self.main_hwnd(), &os_paths) {
+        // DROPEFFECT_COPY = 1 — a paste reproduces the files.
+        match set_clipboard_hdrop(self.main_hwnd(), &os_paths, 1) {
             Ok(()) => {
                 let msg = if n == 1 {
                     "1 item on OS clipboard".to_string()
@@ -1623,6 +1624,94 @@ impl AppState {
             }
             Err(e) => {
                 self.say(&format!("OS clipboard failed: {}", e), true);
+            }
+        }
+    }
+
+    /// Cut the current selection to the *real* Windows clipboard as
+    /// `CF_HDROP` with a `Preferred DropEffect = MOVE` hint, so a
+    /// subsequent paste (in Explorer or navigator's own
+    /// `op_paste_from_clipboard`) moves the files instead of copying.
+    /// The mirror of `op_copy_to_clipboard`; remote (rclone) paths are
+    /// rejected — the shell can't resolve `\\?\NavigatorRemote\...`.
+    pub fn op_cut_to_clipboard(&self) {
+        let paths = self.model.selected_paths();
+        if paths.is_empty() {
+            self.say("nothing selected", false);
+            return;
+        }
+        if paths.iter().any(|p| p.is_remote()) {
+            self.say("can't cut remote paths to OS clipboard", true);
+            return;
+        }
+        let n = paths.len();
+        let os_paths: Vec<std::path::PathBuf> =
+            paths.iter().map(|p| p.as_path().to_path_buf()).collect();
+        // DROPEFFECT_MOVE = 2 — a paste relocates the files.
+        match set_clipboard_hdrop(self.main_hwnd(), &os_paths, 2) {
+            Ok(()) => {
+                let msg = if n == 1 {
+                    "1 item cut to OS clipboard".to_string()
+                } else {
+                    format!("{} items cut to OS clipboard", n)
+                };
+                self.say(&msg, false);
+            }
+            Err(e) => {
+                self.say(&format!("OS clipboard failed: {}", e), true);
+            }
+        }
+    }
+
+    /// Paste whatever files sit on the real Windows clipboard
+    /// (`CF_HDROP`) into the current folder using the Windows shell copy
+    /// engine (`SHFileOperationW`), honouring the clipboard's `Preferred
+    /// DropEffect` (move vs copy). Deliberately bypasses rclone — the
+    /// whole point is to hand large batches to the shell so antivirus
+    /// heuristics don't flag rclone streaming thousands of files.
+    ///
+    /// Runs on the UI thread on purpose: `SHFileOperationW` puts up its
+    /// own accessible, modal progress + conflict dialog owned by the main
+    /// window, which needs to live on the thread that owns that window.
+    /// Refreshes the listing once the shell returns.
+    pub fn op_paste_from_clipboard(&self) {
+        let Some(dest) = self.model.cwd() else {
+            return;
+        };
+        // The shell copy engine only understands real local directories.
+        if dest.is_remote() || dest.is_this_pc() || dest.is_remotes_root() {
+            self.say("can't paste here", true);
+            return;
+        }
+
+        let (sources, is_move) = match get_clipboard_hdrop(self.main_hwnd()) {
+            Ok(v) => v,
+            Err(e) => {
+                self.say(&format!("OS clipboard read failed: {}", e), true);
+                return;
+            }
+        };
+        if sources.is_empty() {
+            self.say("no files on OS clipboard", false);
+            return;
+        }
+
+        let n = sources.len();
+        let dest_path = dest.as_path().to_path_buf();
+        match shell_copy_move(self.main_hwnd(), &sources, &dest_path, is_move) {
+            Ok(aborted) => {
+                let verb = if is_move { "moved" } else { "copied" };
+                if aborted {
+                    self.say("paste cancelled", false);
+                } else if n == 1 {
+                    self.say(&format!("1 item {}", verb), false);
+                } else {
+                    self.say(&format!("{} items {}", n, verb), false);
+                }
+                self.refresh();
+            }
+            Err(e) => {
+                self.say(&format!("paste failed: {}", e), true);
             }
         }
     }
@@ -1652,7 +1741,7 @@ impl AppState {
             Some(p) => p,
             None => {
                 self.say(
-                    "7z not found on PATH; install 7-Zip to extract archives",
+                    "7z not found; install 7-Zip to extract archives",
                     true,
                 );
                 return;
@@ -1691,7 +1780,7 @@ impl AppState {
         let seven_zip = match crate::extract::find_7z() {
             Some(p) => p,
             None => {
-                self.say("7z not found on PATH; install 7-Zip to zip files", true);
+                self.say("7z not found; install 7-Zip to zip files", true);
                 return;
             }
         };
@@ -2760,9 +2849,9 @@ fn set_clipboard_text(
 }
 
 /// Place a `CF_HDROP` (Windows file-handle list) on the clipboard,
-/// plus a `Preferred DropEffect = COPY` hint. Pasting the result in
-/// Explorer / open-file dialogs / other apps reproduces the files via
-/// the shell's normal copy machinery.
+/// plus a `Preferred DropEffect` hint. Pasting the result in Explorer /
+/// open-file dialogs / other apps reproduces the files via the shell's
+/// normal copy machinery.
 ///
 /// Blob layout for the DROPFILES handle:
 ///   * `DROPFILES` header (20 bytes, packed) — `pFiles = 20`, `fWide = 1`
@@ -2770,11 +2859,13 @@ fn set_clipboard_text(
 ///   * one extra `0u16` so the list ends in a double-NUL
 ///
 /// The "Preferred DropEffect" registered format carries a single
-/// `DWORD` (`DROPEFFECT_COPY = 1`), telling the receiver to treat the
-/// drop as a copy rather than guessing from same-vs-cross-volume rules.
+/// `DWORD` — `drop_effect` — telling the receiver whether to copy
+/// (`DROPEFFECT_COPY = 1`) or move (`DROPEFFECT_MOVE = 2`) on paste
+/// rather than guessing from same-vs-cross-volume rules.
 fn set_clipboard_hdrop(
     hwnd: Option<windows::Win32::Foundation::HWND>,
     paths: &[std::path::PathBuf],
+    drop_effect: u32,
 ) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Foundation::{GlobalFree, HANDLE};
@@ -2853,7 +2944,7 @@ fn set_clipboard_hdrop(
                 {
                     let dst = GlobalLock(hde) as *mut u32;
                     if !dst.is_null() {
-                        *dst = 1; // DROPEFFECT_COPY
+                        *dst = drop_effect; // DROPEFFECT_COPY (1) / MOVE (2)
                         let _ = GlobalUnlock(hde);
                         if SetClipboardData(fmt, Some(HANDLE(hde.0))).is_err() {
                             let _ = GlobalFree(Some(hde));
@@ -2869,6 +2960,149 @@ fn set_clipboard_hdrop(
         let _ = CloseClipboard();
         result
     }
+}
+
+/// Read a `CF_HDROP` file list off the Windows clipboard along with the
+/// `Preferred DropEffect` flag. Returns `(paths, is_move)` — `is_move`
+/// is `true` only when the source tagged the clip as a pure MOVE
+/// (`DROPEFFECT_MOVE` set, `DROPEFFECT_COPY` clear), matching how
+/// Explorer distinguishes a Cut from a Copy. Anything else defaults to
+/// copy, which never loses data.
+///
+/// When no `CF_HDROP` is present (e.g. only text is on the clipboard)
+/// the returned path list is empty — the caller announces that. All
+/// reads happen while the clipboard is open; the `HDROP` handle is
+/// system-owned and must not outlive `CloseClipboard`, so paths are
+/// copied out eagerly.
+fn get_clipboard_hdrop(
+    hwnd: Option<windows::Win32::Foundation::HWND>,
+) -> std::io::Result<(Vec<std::path::PathBuf>, bool)> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+        RegisterClipboardFormatW,
+    };
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Ole::CF_HDROP;
+    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+    use windows::core::PCWSTR;
+
+    unsafe {
+        // Cheap pre-check that doesn't require taking the global lock.
+        if IsClipboardFormatAvailable(u32::from(CF_HDROP.0)).is_err() {
+            return Ok((Vec::new(), false));
+        }
+        OpenClipboard(hwnd).map_err(io_err)?;
+        let result = (|| -> std::io::Result<(Vec<std::path::PathBuf>, bool)> {
+            let handle = GetClipboardData(u32::from(CF_HDROP.0)).map_err(io_err)?;
+            let hdrop = HDROP(handle.0);
+
+            // 0xFFFF_FFFF asks DragQueryFile for the file count.
+            let count = DragQueryFileW(hdrop, 0xFFFF_FFFF, None);
+            let mut paths = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                // With no buffer, DragQueryFile returns the length in
+                // wide chars (excluding the NUL) — path lengths can
+                // exceed MAX_PATH, so size the buffer per entry.
+                let len = DragQueryFileW(hdrop, i, None);
+                if len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u16; len as usize + 1];
+                let copied = DragQueryFileW(hdrop, i, Some(&mut buf));
+                if copied == 0 {
+                    continue;
+                }
+                let s = std::ffi::OsString::from_wide(&buf[..copied as usize]);
+                paths.push(std::path::PathBuf::from(s));
+            }
+
+            // Preferred DropEffect — a single DWORD in a registered
+            // format. Absent format ⇒ copy (the conventional default).
+            let mut is_move = false;
+            let fmt_name: Vec<u16> = "Preferred DropEffect"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let fmt = RegisterClipboardFormatW(PCWSTR(fmt_name.as_ptr()));
+            if fmt != 0
+                && IsClipboardFormatAvailable(fmt).is_ok()
+                && let Ok(h) = GetClipboardData(fmt)
+            {
+                let p = GlobalLock(HGLOBAL(h.0)) as *const u32;
+                if !p.is_null() {
+                    let effect = *p;
+                    // DROPEFFECT_MOVE = 2, DROPEFFECT_COPY = 1. Treat as a
+                    // move only when MOVE is set and COPY is not — any copy
+                    // hint (or ambiguous combo) falls back to copy.
+                    is_move = (effect & 2) != 0 && (effect & 1) == 0;
+                    let _ = GlobalUnlock(HGLOBAL(h.0));
+                }
+            }
+
+            Ok((paths, is_move))
+        })();
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+/// Copy or move `sources` into the `dest` directory via the Windows
+/// shell copy engine (`SHFileOperationW`). This is the deliberate
+/// exception to the "all mutations go through rclone" invariant: the
+/// shell engine is what antivirus recognises as a legitimate file
+/// operation, so pasting thousands of files this way avoids the
+/// heuristics that flag rclone. The shell owns the (accessible) progress
+/// and overwrite-conflict UI, parented to `hwnd`.
+///
+/// Returns `Ok(true)` if the user aborted mid-operation, `Ok(false)` on
+/// a clean run, `Err` on a shell error code.
+fn shell_copy_move(
+    hwnd: Option<windows::Win32::Foundation::HWND>,
+    sources: &[std::path::PathBuf],
+    dest: &std::path::Path,
+    move_op: bool,
+) -> std::io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::{
+        FO_COPY, FO_MOVE, FOF_NOCONFIRMMKDIR, SHFILEOPSTRUCTW, SHFileOperationW,
+    };
+    use windows::core::PCWSTR;
+
+    // pFrom: each source NUL-terminated, list ends in a double-NUL.
+    let mut from: Vec<u16> = Vec::new();
+    for s in sources {
+        from.extend(s.as_os_str().encode_wide());
+        from.push(0);
+    }
+    from.push(0);
+
+    // pTo: the single destination directory, also double-NUL-terminated.
+    let mut to: Vec<u16> = dest.as_os_str().encode_wide().collect();
+    to.push(0);
+    to.push(0);
+
+    let mut op = SHFILEOPSTRUCTW {
+        hwnd: hwnd.unwrap_or(HWND(std::ptr::null_mut())),
+        wFunc: if move_op { FO_MOVE } else { FO_COPY },
+        pFrom: PCWSTR(from.as_ptr()),
+        pTo: PCWSTR(to.as_ptr()),
+        // Don't prompt to create the destination — it already exists.
+        // Overwrite/skip conflicts still surface the shell's own dialog.
+        fFlags: FOF_NOCONFIRMMKDIR.0 as u16,
+        ..Default::default()
+    };
+
+    let rc = unsafe { SHFileOperationW(&mut op) };
+    if rc != 0 {
+        return Err(std::io::Error::other(format!(
+            "SHFileOperation returned 0x{:x}",
+            rc
+        )));
+    }
+    Ok(op.fAnyOperationsAborted.as_bool())
 }
 
 fn io_err(e: windows::core::Error) -> std::io::Error {

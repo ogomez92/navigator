@@ -393,6 +393,7 @@ unsafe extern "system" fn listview_subclass_proc(
 fn focus_row(lv: windows::Win32::Foundation::HWND, idx: usize) {
     use windows::Win32::UI::Controls::{
         LIST_VIEW_ITEM_STATE_FLAGS, LVITEMW, LVM_ENSUREVISIBLE, LVM_SETITEMSTATE,
+        LVM_SETSELECTIONMARK,
     };
     const SEL_FOCUS: LIST_VIEW_ITEM_STATE_FLAGS = LIST_VIEW_ITEM_STATE_FLAGS(0x0003);
     unsafe {
@@ -414,6 +415,17 @@ fn focus_row(lv: windows::Win32::Foundation::HWND, idx: usize) {
             LVM_SETITEMSTATE,
             Some(windows::Win32::Foundation::WPARAM(idx)),
             Some(windows::Win32::Foundation::LPARAM(&raw const item as isize)),
+        );
+        // Move the selection mark (the anchor Shift+arrow / shift-click
+        // extend *from*). LVIS_FOCUSED alone does NOT move it, so without
+        // this a Shift+Down after a type-ahead jump extends from wherever
+        // the user last clicked or plain-arrowed and swallows every row in
+        // between.
+        SendMessageW(
+            lv,
+            LVM_SETSELECTIONMARK,
+            Some(windows::Win32::Foundation::WPARAM(0)),
+            Some(windows::Win32::Foundation::LPARAM(idx as isize)),
         );
         SendMessageW(
             lv,

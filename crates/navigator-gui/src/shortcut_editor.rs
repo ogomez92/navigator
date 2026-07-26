@@ -110,6 +110,33 @@ const PRESETS: &[Preset] = &[
         args: &[],
         single: false,
     },
+    // OS-clipboard trio — CF_HDROP copy/cut plus a shell (SHFileOperation)
+    // paste. The paste bypasses rclone so huge batches don't trip
+    // antivirus heuristics.
+    Preset {
+        label: "Built-in: Copy to OS clipboard",
+        name: "Copy to OS clipboard",
+        internal: Some(InternalCommand::CopyToClipboard),
+        command: "",
+        args: &[],
+        single: false,
+    },
+    Preset {
+        label: "Built-in: Cut to OS clipboard",
+        name: "Cut to OS clipboard",
+        internal: Some(InternalCommand::CutToClipboard),
+        command: "",
+        args: &[],
+        single: false,
+    },
+    Preset {
+        label: "Built-in: Paste from OS clipboard",
+        name: "Paste from OS clipboard",
+        internal: Some(InternalCommand::PasteFromClipboard),
+        command: "",
+        args: &[],
+        single: false,
+    },
     Preset {
         label: "Built-in: Copy paths",
         name: "Copy paths",
