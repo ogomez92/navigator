@@ -33,6 +33,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
+use navigator_core::ConflictMode;
+
 use crate::app::AppState;
 
 // Offsets reserved by `DefDlgProc`. DWLP_MSGRESULT is used to return
@@ -49,6 +51,7 @@ const ID_CHECK_SYSTEM: u16 = 201;
 const ID_EDIT_INTERVAL: u16 = 300;
 const ID_CHECK_PROG: u16 = 700;
 const ID_EDIT_TRANSFERS: u16 = 701;
+const ID_COMBO_CONFLICT: u16 = 702;
 const ID_CHECK_EXTRACT_DELETE: u16 = 800;
 const ID_CHECK_EXTRACT_FOLDER: u16 = 801;
 const ID_LIST_PLUGINS: u16 = 400;
@@ -528,7 +531,18 @@ struct RcloneData {
     state: Arc<AppState>,
     check_prog: HWND,
     edit_transfers: HWND,
+    combo_conflict: HWND,
 }
+
+/// Modes offered as the *default* for a plain paste. Mirror is deliberately
+/// absent: it deletes destination files the user never selected, so it is
+/// reachable only from Paste special where the choice is explicit. A
+/// hand-edited `config.toml` that sets it is still honoured.
+const DEFAULT_CONFLICT_MODES: [ConflictMode; 3] = [
+    ConflictMode::AddNewOnly,
+    ConflictMode::Update,
+    ConflictMode::Replace,
+];
 
 unsafe extern "system" fn page_rclone_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) -> isize {
     match msg {
@@ -550,11 +564,62 @@ unsafe extern "system" fn page_rclone_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp
                 320,
             );
             let edit_transfers = create_edit(hwnd, 12, 78, 80, ID_EDIT_TRANSFERS);
+
+            let r = state.config.read().rclone.clone();
+
+            let lbl_conflict = create_label(
+                hwnd,
+                "When items already e&xist at the destination:",
+                12,
+                116,
+                320,
+            );
+            let labels: Vec<String> = DEFAULT_CONFLICT_MODES
+                .iter()
+                .map(|m| format!("{} — {}", m.label(), m.description()))
+                .collect();
+            let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+            let selected = DEFAULT_CONFLICT_MODES
+                .iter()
+                .position(|m| *m == r.on_conflict)
+                .or_else(|| {
+                    // A config set to Mirror (or anything not offered here)
+                    // shows as Update rather than presenting a wrong
+                    // selection. Looked up by value, not a hard-coded index,
+                    // so reordering the const cannot silently change it.
+                    DEFAULT_CONFLICT_MODES
+                        .iter()
+                        .position(|m| *m == ConflictMode::Update)
+                })
+                .unwrap_or(0);
+            let combo_conflict =
+                create_combo(hwnd, 12, 140, 420, ID_COMBO_CONFLICT, &label_refs, selected);
+            // Two single-line statics rather than one long one: `create_label`
+            // makes a fixed 20px-tall STATIC with no wrapping, so a 95-char
+            // string would simply be clipped.
+            let lbl_hint = create_label(
+                hwnd,
+                "Paste only asks when this would replace or delete something.",
+                12,
+                172,
+                430,
+            );
+            let lbl_hint2 = create_label(
+                hwnd,
+                "Ctrl+Shift+V chooses the mode for a single paste.",
+                12,
+                192,
+                430,
+            );
+
             apply_font_to(check_prog);
             apply_font_to(lbl);
             apply_font_to(edit_transfers);
+            apply_font_to(lbl_conflict);
+            apply_font_to(combo_conflict);
+            apply_font_to(lbl_hint);
+            apply_font_to(lbl_hint2);
 
-            let r = state.config.read().rclone.clone();
             set_check(check_prog, r.progress_window);
             set_text(edit_transfers, &r.transfers_clamped().to_string());
 
@@ -562,6 +627,7 @@ unsafe extern "system" fn page_rclone_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp
                 state,
                 check_prog,
                 edit_transfers,
+                combo_conflict,
             });
             SetWindowLongPtrW(hwnd, DWLP_USER, Box::into_raw(data) as isize);
             1
@@ -582,9 +648,17 @@ unsafe extern "system" fn page_rclone_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp
                         .ok()
                         .filter(|n: &u32| *n >= 1 && *n <= 64)
                         .unwrap_or(current);
+                    // Leave the stored mode alone if the combo somehow has
+                    // no selection, so a config hand-set to Mirror is not
+                    // silently rewritten just by opening Options.
+                    let mode = combo_selection(d.combo_conflict)
+                        .and_then(|i| DEFAULT_CONFLICT_MODES.get(i).copied());
                     d.state.config.with_mut(|c| {
                         c.rclone.progress_window = prog;
                         c.rclone.transfers = entered;
+                        if let Some(m) = mode {
+                            c.rclone.on_conflict = m;
+                        }
                     });
                     let _ = d.state.config.save();
                 }
@@ -972,6 +1046,63 @@ fn create_checkbox(parent: HWND, text: &str, x: i32, y: i32, id: u16) -> HWND {
         )
         .unwrap()
     }
+}
+
+/// Drop-down list (no editable field) pre-filled with `items`, with
+/// `selected` chosen. `CBS_DROPDOWNLIST` keeps it keyboard-navigable and
+/// announced as a combo box by screen readers; `WS_VSCROLL` matters because
+/// the list is taller than the collapsed control.
+fn create_combo(
+    parent: HWND,
+    x: i32,
+    y: i32,
+    w: i32,
+    id: u16,
+    items: &[&str],
+    selected: usize,
+) -> HWND {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CB_ADDSTRING, CB_SETCURSEL, CBS_DROPDOWNLIST, WS_VSCROLL,
+    };
+    unsafe {
+        let h = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("COMBOBOX"),
+            w!(""),
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
+                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
+            ),
+            x,
+            y,
+            w,
+            // Height covers the collapsed field plus the dropped list.
+            200,
+            Some(parent),
+            Some(HMENU(id as isize as *mut std::ffi::c_void)),
+            Some(GetModuleHandleW(None).unwrap().into()),
+            None,
+        )
+        .unwrap();
+        for it in items {
+            let tw: Vec<u16> = it.encode_utf16().chain([0]).collect();
+            SendMessageW(
+                h,
+                CB_ADDSTRING,
+                Some(WPARAM(0)),
+                Some(LPARAM(tw.as_ptr() as isize)),
+            );
+        }
+        SendMessageW(h, CB_SETCURSEL, Some(WPARAM(selected)), Some(LPARAM(0)));
+        h
+    }
+}
+
+/// Current selection index of a combo box, or `None` if nothing is selected.
+fn combo_selection(h: HWND) -> Option<usize> {
+    use windows::Win32::UI::WindowsAndMessaging::CB_GETCURSEL;
+    let r = unsafe { SendMessageW(h, CB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))) };
+    // CB_ERR (-1) means no selection.
+    if r.0 < 0 { None } else { Some(r.0 as usize) }
 }
 
 fn create_label(parent: HWND, text: &str, x: i32, y: i32, w: i32) -> HWND {

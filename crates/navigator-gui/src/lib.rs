@@ -11,6 +11,7 @@
 pub mod accel;
 pub mod actions;
 pub mod app;
+pub mod batch;
 pub mod clipboard;
 pub mod context_menu;
 pub mod dialog;

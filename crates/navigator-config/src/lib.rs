@@ -6,12 +6,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use navigator_core::ConflictMode;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 pub mod shortcuts;
 
+pub use navigator_core::ConflictMode as PasteConflictMode;
 pub use shortcuts::{HOTSPOT_COUNT, InternalCommand, ShortcutAction, ShortcutChord};
 
 #[derive(Debug, thiserror::Error)]
@@ -130,6 +132,19 @@ pub struct Rclone {
     /// native default is 4; ours is 8 based on typical SSD throughput.
     /// Clamped to `1..=64` at load time so a junk value cannot brick ops.
     pub transfers: u32,
+    /// What a plain paste does about destinations that already exist.
+    /// Defaults to [`ConflictMode::Update`]: copy what differs, never
+    /// replace a destination that is newer than the source. A paste only
+    /// prompts when this mode would actually destroy something.
+    ///
+    /// [`ConflictMode::Mirror`] deserializes here but is **not** honoured as
+    /// a plain-paste default: it deletes destination files the user never
+    /// selected, so it must come from an explicit Paste special choice
+    /// rather than from a setting edited weeks earlier. `op_paste` clamps it
+    /// to [`ConflictMode::Update`]. The Options combo does not offer it, and
+    /// a hand-edited config that sets it only affects which radio Paste
+    /// special pre-selects.
+    pub on_conflict: ConflictMode,
 }
 
 impl Default for Rclone {
@@ -137,6 +152,7 @@ impl Default for Rclone {
         Self {
             progress_window: false,
             transfers: 8,
+            on_conflict: ConflictMode::Update,
         }
     }
 }

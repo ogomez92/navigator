@@ -94,9 +94,17 @@ The Extract worker deliberately does NOT call `state.refresh()`. The notify watc
 
 ### File operations invariant
 
-All mutations (copy, move, delete, rename) go through `navigator-rclone`. No `SHFileOperation`, no direct `DeleteFileW`. Overwrite decisions come from pre-flight (`--dry-run`) plus the `preflight` module's per-item prompt — never from `--ignore-existing` by default.
+All mutations (copy, move, delete, rename) go through `navigator-rclone`. No `SHFileOperation`, no direct `DeleteFileW`.
 
-The preflight TaskDialog offers three choices plus Cancel: `Overwrite`, `Skip`, and `Keep both (append number)`. `Keep both` maps to `ItemChoice::Rename` and delegates to `preflight::unique_numbered_path` to pick a fresh sibling like `foo (1).txt` (Explorer parity — multi-extension files become `archive.tar (1).gz`). For copy paths the batch worker uses `Operation::CopyTo { src, dst }`; for cut paths it reuses `Operation::Rename { src, dst }` with the new dst. `CopyTo` is distinct from `Copy { dest_dir, .. }` because `Copy` always keeps the source filename — don't shove a renamed destination through it.
+> **This section is a summary. `CLAUDE.md` is the authoritative version** — see its *Conflict handling is mode-based, not per-item* and *Batching* sections. The per-item `Overwrite` / `Skip` prompt described in older revisions of this file no longer exists; `ItemChoice`, `prompt_item`, `BatchDecision` and `OverwritePolicy` were all deleted.
+
+Conflict handling is **mode-based, decided once per batch**, not per file. A paste carries a `navigator_core::ConflictMode` — `AddNewOnly` (`--ignore-existing`), `Update` (`--update`, the default), `Replace` (`--ignore-times`), or `Mirror` (verb becomes `sync`, Paste special only). `RcloneDriver::conflicts` diffs two `--dry-run` passes to find what would actually be destroyed, and Ctrl+V prompts *only* when that comes back non-empty. `Mirror` is never honoured as a plain-paste default even if `config.toml` names it.
+
+`Keep both` renames the whole selected item (`photos` → `photos (1)`) via `preflight::unique_numbered_path`; it never numbers files inside a merging directory. For copy paths the batch worker uses `Operation::CopyTo { src, dst }`; for cut paths `Operation::Rename { src, dst }`. `CopyTo` is distinct from `Copy { dest_dir, .. }` because `Copy` always keeps the source filename — don't shove a renamed destination through it.
+
+Multi-file pastes collapse into one `rclone copy --files-from` invocation per source folder (`Operation::CopyBatch` / `MoveBatch`, partitioned by `navigator_gui::batch`). **Directories must never enter a `--files-from` list** — rclone ignores them silently and exits 0.
+
+**Undo may only delete destinations that did not exist before the paste.** `op_paste` filters the undo record accordingly; without it Ctrl+Z deletes precisely the files the chosen mode protected.
 
 ### Clipboard + undo + trash
 

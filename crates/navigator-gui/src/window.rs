@@ -379,6 +379,8 @@ pub enum Commands {
     /// search results, where each row may live in a different subdir.
     OpenContaining = 148,
     NewFile = 150,
+    /// Paste, choosing the conflict mode first. Only route to Mirror.
+    PasteSpecial = 151,
     // Help menu
     About = 160,
     // Shortcut/Action dynamic range
@@ -523,6 +525,12 @@ fn build_menu() -> HMENU {
             MF_STRING,
             Commands::Paste as usize,
             w!("&Paste\tCtrl+V"),
+        );
+        let _ = AppendMenuW(
+            edit,
+            MF_STRING,
+            Commands::PasteSpecial as usize,
+            w!("Paste &special…\tCtrl+Shift+V"),
         );
         let _ = AppendMenuW(
             edit,
@@ -1501,6 +1509,7 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
         x if x == Commands::CopyPaths as u16 => data.state.op_copy_paths(),
         x if x == Commands::Cut as u16 => data.state.op_cut(),
         x if x == Commands::Paste as u16 => data.state.op_paste(),
+        x if x == Commands::PasteSpecial as u16 => data.state.op_paste_special(),
         x if x == Commands::SelectAll as u16 => select_all(data),
         x if x == Commands::Refresh as u16 => data.state.refresh(),
         x if x == Commands::Delete as u16 => data.state.op_delete(),
@@ -1959,6 +1968,7 @@ fn dispatch_internal(hwnd: HWND, data: &WindowData, ic: navigator_config::Intern
         IC::AppendCopy => state.op_append_clipboard(false),
         IC::AppendCut => state.op_append_clipboard(true),
         IC::Paste => state.op_paste(),
+        IC::PasteSpecial => state.op_paste_special(),
         IC::CopyPaths => state.op_copy_paths(),
         IC::CopyToClipboard => state.op_copy_to_clipboard(),
         IC::CutToClipboard => state.op_cut_to_clipboard(),

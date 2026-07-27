@@ -3,12 +3,14 @@
 //! No GUI or OS-specific code lives here. Anything in this crate must be safe
 //! to use from a plugin, the GUI, or a background worker.
 
+pub mod conflict;
 pub mod entry;
 pub mod error;
 pub mod event;
 pub mod path;
 pub mod selection;
 
+pub use conflict::ConflictMode;
 pub use entry::{Entry, EntryKind, FileTime};
 pub use error::{Error, Result};
 pub use event::Event;

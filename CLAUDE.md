@@ -41,15 +41,16 @@ Thin binary, fat workspace. `crates/navigator/src/main.rs` only parses args + in
 - **`navigator-config`** — TOML config at `<exe_dir>/config.toml` (never `%APPDATA%`). `ConfigHandle` is an `Arc<RwLock<Config>>` clone-able handle. Also defines shortcut actions.
 - **`navigator-plugin-api`** — stable C ABI for plugins. Plugins are `cdylib` crates exporting `navigator_plugin_entry`. Strings crossing the boundary are `*const u8 + len` (UTF-8), everything `#[repr(C)]`. Loaded with `libloading`.
 - **`navigator-prism`** — safe FFI wrapper around the prism C library. `Prism` is a process-wide singleton guarded by an `AtomicBool`; `Speaker` handles are `Send` but not `Sync`.
-- **`navigator-rclone`** — rclone driver. Spawns `rclone` with `--use-json-log --stats=1s --transfers N`, parses each stdout line as a structured log record. Emits `OpEvent::{Progress, Log, Done}` on a crossbeam channel. Pre-flight `--dry-run` detects overwrites before the real op starts. `RcloneDriver::with_transfers(n)` sets `--transfers`; `AppState::clone_for_worker` re-reads `config.rclone.transfers_clamped()` on every spawn so a config save applies to the next op without a restart. `base_args()` is exposed for tests.
+- **`navigator-rclone`** — rclone driver. Spawns `rclone` with `--use-json-log --stats=1s --transfers N`, parses each stdout line as a structured log record. Emits `OpEvent::{Progress, Log, Done}` on a crossbeam channel. `conflicts()` diffs two `--dry-run` passes to find what a paste would destroy (see *Conflict handling* below). `RcloneDriver::with_transfers(n)` sets `--transfers`; `AppState::clone_for_worker` re-reads `config.rclone.transfers_clamped()` on every spawn so a config save applies to the next op without a restart. `base_args()` is exposed for tests.
 - **`navigator-fs`** — directory scanning via raw `FindFirstFileExW` with `FindExInfoBasic` + `FIND_FIRST_EX_LARGE_FETCH`. Exposes `read_dir`, `list_drives` (for the virtual "This PC" view), and `search_recursive`.
-- **`navigator-core`** — shared value types (`NavPath`, `Entry`, `Selection`, `Event`, `Error`). No GUI / OS code; safe to use from plugins.
+- **`navigator-core`** — shared value types (`NavPath`, `Entry`, `Selection`, `Event`, `Error`, `ConflictMode`). No GUI / OS code; safe to use from plugins. `navigator-config` depends on it solely for `ConflictMode`, so the paste-conflict vocabulary has one definition instead of a mirrored enum that can drift.
 - **`plugins/sample`** — example plugin.
 
 ### Threading model
 
 One UI thread (the Win32 message loop) and several workers. All cross-thread comms go through `crossbeam-channel` or Win32 `PostMessageW`. Worker names below are thread names / modules inside `navigator-gui`, not separate crates.
 
+- **`navigator-batch-op`** — per-paste worker. Runs `run_batch`: resolves the conflict mode, then issues one rclone invocation per source folder for files (see *Batching*) plus one per directory.
 - **`navigator-scan`** — long-lived worker. Handles `ScanCmd::List` (directory scan) and `ScanCmd::Search` (recursive search). Posts results back as `WMAPP_DIR_LISTED` / `WMAPP_SEARCH_RESULTS`.
 - **`navigator-plugin-nav`** — bridges plugin nav requests into `AppState::navigate` via a weak `Arc` so it dies with the app.
 - **`navigator-rclone-op` / `navigator-batch-op` / `navigator-batch-delete`** — short-lived per-operation threads. They hold a `WorkerCtx` (cheap clone of rclone driver, speech sender, scan sender, optional progress handle) — never borrow `AppState`.
@@ -94,9 +95,56 @@ The Extract worker deliberately does NOT call `state.refresh()`. The notify watc
 
 ### File operations invariant
 
-All mutations (copy, move, delete, rename) go through `navigator-rclone`. No `SHFileOperation`, no direct `DeleteFileW`. Overwrite decisions come from pre-flight (`--dry-run`) plus the `preflight` module's per-item prompt — never from `--ignore-existing` by default.
+All mutations (copy, move, delete, rename) go through `navigator-rclone`. No `SHFileOperation`, no direct `DeleteFileW`.
 
-The preflight TaskDialog offers three choices plus Cancel: `Overwrite`, `Skip`, and `Keep both (append number)`. `Keep both` maps to `ItemChoice::Rename` and delegates to `preflight::unique_numbered_path` to pick a fresh sibling like `foo (1).txt` (Explorer parity — multi-extension files become `archive.tar (1).gz`). For copy paths the batch worker uses `Operation::CopyTo { src, dst }`; for cut paths it reuses `Operation::Rename { src, dst }` with the new dst. `CopyTo` is distinct from `Copy { dest_dir, .. }` because `Copy` always keeps the source filename — don't shove a renamed destination through it.
+### Conflict handling is mode-based, not per-item
+
+There is **no per-file "this exists — replace it?" prompt**. rclone already knows how to compare two trees, so a paste carries a `ConflictMode` (in `navigator-core`, shared by config and rclone) and the question is asked once per batch, if at all:
+
+| Mode | rclone | Destructive? |
+|---|---|---|
+| `AddNewOnly` | `--ignore-existing` | no |
+| `Update` (default) | `--update` | yes |
+| `Replace` | `--ignore-times` | yes |
+| `Mirror` | verb becomes `sync` | yes, **deletes unselected destination files** |
+
+`Mirror` is the only mode that changes the verb; the rest are pure flags. A `Move` can never mirror (rclone has no verb that both prunes the destination and empties the source), so `op_args` degrades `Move` + `Mirror` to `Replace` — defined rather than surprising, and the UI hides Mirror for a cut clipboard anyway.
+
+**Ctrl+V only prompts when data would actually be lost.** `WorkerCtx::resolve_conflicts` (a worker method — it never borrows `AppState`) short-circuits hard, in this order: a non-destructive mode never asks; then `preflight::conflict_candidates` narrows the set, and if it comes back empty it returns without spawning rclone at all (the common case — zero dialogs, zero dry-runs). Only genuinely colliding items get a `RcloneDriver::conflicts` call. If that comes back empty (everything identical, or protected by `--update`'s newer-destination guard) the paste still runs silently.
+
+**`conflict_candidates` is local-vs-remote aware, and this matters.** For a local destination it is `top_level_conflicts` — a cheap `exists()` filter. For a **remote** destination it returns *every* source, because a remote `NavPath` is a synthetic `\\?\NavigatorRemote\…` string for which `Path::exists()` is always false. Using `exists()` to pre-filter a remote destination meant no candidates → no dry-run → **no conflict dialog ever** when pasting onto a remote, even though the two-pass diff itself is backend-agnostic. Don't reintroduce a bare `exists()` on that path.
+
+**Keep both is offered only for local destinations.** `unique_numbered_path` can only probe the local filesystem; on a remote it returns the name unchanged and the item quietly degrades to an additive copy (a skip) instead of keeping both. Both dialogs gate it on `!dest_dir.is_remote()`.
+
+**Undo may only delete destinations that did not exist before the paste.** `op_paste` filters `created`/`originals` as aligned pairs before pushing `UndoAction::Paste`. Every mode can decline to write an existing destination — `AddNewOnly` skips it, `Update` spares a newer one, `Replace` overwrites it with no backup, `KeepBoth` writes a numbered sibling — so an unfiltered `dest.join(name)` list made Ctrl+Z delete exactly the files the mode had protected, unrecoverably. Guarded by `undo_targets_exclude_preexisting_destinations`.
+
+**`RcloneDriver::conflicts` runs two `--dry-run` passes and diffs them** (`op::victims`): the caller's mode, then the same op forced to `AddNewOnly`. Anything in the first but not the second was excluded *purely because the destination exists* — that is the definition of a conflict. Diffing rather than probing the filesystem keeps it backend-agnostic: it works for a remote destination with no `lsjson` round-trip and no path arithmetic. `AddNewOnly` short-circuits without spawning.
+
+**Parse the `skipped` field, never `msg`.** rclone renamed the dry-run text from `Would copy` to `Skipped copy as --dry-run is set`, which silently broke the old substring match — `PreflightReport.would_overwrite` was permanently empty for releases. The structured `skipped` field (`"copy"` / `"move"` / `"delete"`) has been stable; `LogEvent::is_dry_run(verb)` wraps it. `sync --dry-run` reports prunes as `skipped: "delete"`, which is how Mirror's confirm lists what it would delete for free.
+
+**Keep both is deliberately coarse.** It renames the *selected* item — pasting `photos` onto an existing `photos` yields `photos (1)`, it does **not** number files inside a merged tree (near-impossible to undo or reason about). `preflight::top_level_conflicts` is what it acts on, and `unique_numbered_path` picks the sibling name (Explorer parity — `archive.tar.gz` → `archive.tar (1).gz`; extensionless names and directories just get ` (1)`). For copy paths the batch worker uses `Operation::CopyTo { src, dst }`; for cut paths `Operation::Rename { src, dst }`. `CopyTo` is distinct from `Copy { dest_dir, .. }` because `Copy` always keeps the source filename — don't shove a renamed destination through it. Non-colliding items in a Keep-both batch run as `AddNewOnly`, so that path cannot touch anything.
+
+**Ctrl+Shift+V (Paste special)** always asks, via a radio-group TaskDialog listing every mode plus Keep both. It's the only route to Mirror. A preset choice suppresses the after-the-fact confirm — the user already chose explicitly, so don't ask twice. Detection failure is **not** treated as "no conflict": `resolve_conflicts` falls back to naming the colliding top-level items so the user still confirms.
+
+The confirm dialog defaults to the *safe* button (`Add new only`), so an absent-minded Enter cannot destroy anything. `preflight::paste_summary` names the mode in the spoken summary — "done — 8 items, add new only" explains why a paste that looked like it should have changed something didn't.
+
+### Batching: one rclone invocation per source folder
+
+`Operation::Copy` reads only `sources.first()`, so a paste used to be one process per item — 200 files meant 200 sequential spawns, and `--transfers N` had a single file per process, i.e. nothing to parallelise. Measured through the driver: **28.98 s per-item vs 0.26 s batched, 112× ­**, essentially all of it process startup rather than I/O.
+
+`navigator-gui/src/batch.rs` splits a selection into `FileGroup`s (files sharing a parent → one `Operation::CopyBatch`/`MoveBatch` with `--files-from`) and singles. `partition` takes `is_dir` as a closure so it is pure and unit-testable with no filesystem. Both the transfer (`run_group`) and conflict detection (`resolve_conflicts`) batch — detection is two dry-run spawns per op, so overwriting 200 files would otherwise cost 400 spawns before a byte moves.
+
+Three hard rules, each with a test:
+
+- **Directories must never enter a `--files-from` list.** rclone reads a directory entry, transfers nothing, warns about nothing, and **exits 0** — a folder routed through a list is silently lost while the paste reports success. `files_from_silently_ignores_directories` in `navigator-rclone/tests/driver.rs` pins that rclone behaviour and tells you to revisit the partition rule if it ever changes.
+- **Mirror must never batch.** `sync --files-from` considers only the listed names and prunes everything else at the destination — an unannounced mass delete of files the user never selected. Callers gate it out; `op_args` additionally degrades a batched Mirror to Replace so a slip costs an overwrite, not a wipe (`batch_never_emits_sync_for_mirror`).
+- **The verb is `copy`/`move`, not `copyto`/`moveto`.** With `--files-from`, listed names reproduce directly under `dest_dir`; `copyto` would treat the destination as one target path and bury everything a level deep (`batch_uses_copy_not_copyto`).
+
+Names containing `\n`/`\r` fall back to singles — the list is newline-delimited, and a corrupted entry fails *silently* per rule one. Windows forbids those characters; rclone remotes need not.
+
+`run_group` verifies every expected destination exists afterward when the destination is local, because exit code 0 does not mean the files arrived. A remote destination skips the check (probing costs an `lsjson` round-trip per group, giving back the latency this path exists to remove) and trusts the exit code. `TempList` owns the list file and deletes it on drop; `BATCH_LIST_SEQ` keeps concurrent pastes from sharing a filename.
+
+Keep-both never batches — each item needs its own renamed destination.
 
 ### Clipboard + undo + trash
 
@@ -143,7 +191,7 @@ Pure computation (folder stats, extension histogram, TOML tree dump) lives in `p
 - `ConfigHandle::load_or_default()` is infallible — a corrupt `config.toml` logs a warning and returns defaults.
 - `config.toml`, `plugins/`, `clipboard.json`, `clipboard_history.json`, and `.trash/` all live next to the exe (or in the case of `.trash`, at each volume root). `navigator_config::exe_dir()` is the source of truth; don't hardcode.
 - Sort mode, filters (show hidden/system), shortcut bindings, hotspot slots, and per-column visibility (`general.columns`) all persist here.
-- **`[rclone]` section** holds `progress_window` (moved out of `[general]`) and `transfers` (default 8, clamped 1..=64 via `Rclone::transfers_clamped`). Options → Rclone tab writes both. `transfers` feeds rclone's `--transfers N`.
+- **`[rclone]` section** holds `progress_window` (moved out of `[general]`), `transfers` (default 8, clamped 1..=64 via `Rclone::transfers_clamped`), and `on_conflict` (default `"update"`). Options → Rclone tab writes all three. `transfers` feeds rclone's `--transfers N`. The `on_conflict` combo deliberately omits `Mirror` — a hand-edited config that sets it is honoured, and opening Options won't silently rewrite it (the commit only writes the mode when the combo has a real selection).
 - **`[extraction]` section** holds `delete_when_extracted` (default true) and `create_folder` (default true). Options → Extraction tab writes both. Read by `AppState::op_extract` per invocation so a config save applies to the next extract without a restart.
 - `Columns` defaults to all-on (Size/Type/Modified shown) so pre-existing configs keep the historical four-column view after upgrade. `SortMode::Type` was added alongside — sort works regardless of column visibility, so `type_key()` in `model.rs` is the source of truth and not the Type column label.
 - **TOML can't hold `None` in arrays.** `hotspots` is stored as `Vec<String>` (empty string = unset), not `Vec<Option<String>>` — the latter serializes `None` and fails with `UnsupportedNone`. Hotspot slots must be exactly `HOTSPOT_COUNT` long; the code trusts the file to have the right length (no runtime padding), so a hand-edited short vec can panic — delete `config.toml` if it does.
@@ -166,7 +214,7 @@ Jump reuses `AppState.pending_focus` + the existing `refocus_after_up` post-list
 
 ## Key bindings
 
-See `README.md` for the user-facing table. User-bound actions live under `shortcuts` in `config.toml`; `navigator_config::shortcuts::default_actions()` returns the seeded defaults (Copy/Cut/Paste/Append/CopyPaths/SelectAll/Rename/Refresh/ToggleHidden/ToggleSystem/Search/NavigateUp/Hist Back+Forward/Undo + Hotspot1..10 + HotspotSet1..10 + ShowProperties[Alt+Enter] + DumpTree[Alt+L] + NewFolder[Ctrl+N] + NewFile[Ctrl+Shift+N]). The accel table is rebuilt on startup and on shortcut-editor save via `window::rebuild_accels`.
+See `README.md` for the user-facing table. User-bound actions live under `shortcuts` in `config.toml`; `navigator_config::shortcuts::default_actions()` returns the seeded defaults (Copy/Cut/Paste/PasteSpecial[Ctrl+Shift+V]/Append/CopyPaths/SelectAll/Rename/Refresh/ToggleHidden/ToggleSystem/Search/NavigateUp/Hist Back+Forward/Undo + Hotspot1..10 + HotspotSet1..10 + ShowProperties[Alt+Enter] + DumpTree[Alt+L] + NewFolder[Ctrl+N] + NewFile[Ctrl+Shift+N]). The accel table is rebuilt on startup and on shortcut-editor save via `window::rebuild_accels`. `default_chords_are_unique` in `navigator-config/tests/config.rs` guards against a new default silently shadowing an existing chord — the accel table matches modifiers strictly, so a collision means one action never fires.
 
 The `new_folder.rs` dialog serves both `NewFolder` (Ctrl+N) and `NewFile` (Ctrl+Shift+N) via a `Kind` enum — `open` / `open_file` are the two entry points. `op_new_file` requires a non-empty segment after the final dot so ShellExecute can resolve a handler — `name.contains('.') && !name.ends_with('.')`, which accepts `notes.txt` and dotfiles like `.gitignore` but rejects `notes` / `notes.`. It creates the file with `Operation::Touch` (`rclone touch`, works local + remote), then opens it via `open_file`. A pre-existing local file is opened rather than clobbered.
 

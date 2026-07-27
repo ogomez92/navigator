@@ -110,6 +110,14 @@ const PRESETS: &[Preset] = &[
         args: &[],
         single: false,
     },
+    Preset {
+        label: "Built-in: Paste special (choose conflict mode)",
+        name: "Paste special",
+        internal: Some(InternalCommand::PasteSpecial),
+        command: "",
+        args: &[],
+        single: false,
+    },
     // OS-clipboard trio — CF_HDROP copy/cut plus a shell (SHFileOperation)
     // paste. The paste bypasses rclone so huge batches don't trip
     // antivirus heuristics.

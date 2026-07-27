@@ -38,7 +38,8 @@ Scalable, accessible Windows file explorer in Rust.
 
 - **Accessible first.** Native Win32 controls (`SysListView32`, standard edits, toolbars) — MSAA/UIA work without extra plumbing. Screen readers see the app as a regular Explorer-class window.
 - **Screen-reader output** via the [Prism](https://github.com/prismatoid/prism) C library (prebuilt and vendored in `crates/navigator-prism/vendor/`). Used for supplementary announcements (status, progress, warnings) on top of native a11y.
-- **File operations via `rclone`.** No `SHFileOperation`. Copy/cut/paste spawn `rclone copyto` / `moveto` with `--use-json-log` so we can parse errors and detect overwrites up-front with `--dry-run`.
+- **File operations via `rclone`.** No `SHFileOperation`. Copy/cut/paste spawn `rclone copyto` / `moveto` with `--use-json-log` so we can parse errors and detect up-front with `--dry-run` exactly what a paste would destroy.
+- **Paste asks a merge question, not a per-file one.** There's no "this file exists — replace it?" dialog for every collision. A paste runs in a mode (`Add new only`, `Update`, `Replace`, or `Mirror`) and only stops to confirm when a dry-run proves something at the destination would actually be lost — so pasting into a populated folder is usually silent. The default, `Update`, copies what differs and never replaces a destination file that's *newer* than the source. `Ctrl+Shift+V` picks the mode per paste and is the only route to `Mirror`, which makes the destination match the source exactly and deletes what the source doesn't have. Set the default under Options → Rclone.
 - **Extensible** through Rust plugins loaded as DLLs via a stable C ABI (`navigator-plugin-api`).
 - **Fast.** Directory listing via raw `FindFirstFileW`. Virtual `ListView` (LVS_OWNERDATA) so million-entry folders render instantly.
 
@@ -143,6 +144,7 @@ flow:
 | Alt + Left / Right           | History back / forward                              |
 | F5                           | Refresh                                             |
 | Ctrl + C / X / V             | Copy / cut / paste (via rclone)                     |
+| Ctrl + Shift + V             | Paste special — choose how existing items are handled |
 | Ctrl + Alt + C / X           | Append to copy / cut clipboard                      |
 | Ctrl + Shift + C             | Copy full path(s) to OS clipboard                   |
 | Alt + C / X                  | Copy / cut selection to OS clipboard (CF_HDROP)     |

@@ -50,6 +50,10 @@ pub enum InternalCommand {
     AppendCopy,
     AppendCut,
     Paste,
+    /// Paste, but choose the conflict mode first instead of using the
+    /// configured default. The only route to Mirror (`rclone sync`), which
+    /// deletes destination files the user never selected.
+    PasteSpecial,
     CopyPaths,
     Delete,
     Rename,
@@ -226,6 +230,7 @@ pub fn default_actions() -> Vec<ShortcutAction> {
         internal("Append to copy", AppendCopy, chord(true, false, true, "C")),
         internal("Append to cut", AppendCut, chord(true, false, true, "X")),
         internal("Paste", Paste, chord(true, false, false, "V")),
+        internal("Paste special", PasteSpecial, chord(true, true, false, "V")),
         internal("Copy paths", CopyPaths, chord(true, true, false, "C")),
         internal("Select all", SelectAll, chord(true, false, false, "A")),
         internal("Rename", Rename, chord(false, false, false, "F2")),

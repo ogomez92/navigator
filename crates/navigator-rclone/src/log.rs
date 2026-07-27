@@ -32,8 +32,24 @@ pub struct LogEvent {
     pub object: Option<String>,
     #[serde(default, rename = "objectType")]
     pub object_type: Option<String>,
+    /// Set on `--dry-run` records to the verb that *would* have run, e.g.
+    /// `"copy"` or `"delete"`. This is the reliable way to read a dry-run:
+    /// the human-readable `msg` has changed spelling across rclone
+    /// releases (it used to be "Would copy", it is now "Skipped copy as
+    /// --dry-run is set"), and matching on that text silently stopped
+    /// working. The structured field has been stable.
+    #[serde(default)]
+    pub skipped: Option<String>,
     #[serde(default)]
     pub stats: Option<Stats>,
+}
+
+impl LogEvent {
+    /// `true` if this is a dry-run record for `verb` (`"copy"`, `"move"`,
+    /// `"delete"`) carrying an object path.
+    pub fn is_dry_run(&self, verb: &str) -> bool {
+        self.skipped.as_deref() == Some(verb) && self.object.is_some()
+    }
 }
 
 /// The `stats` object attached to NOTICE-level stats log records.

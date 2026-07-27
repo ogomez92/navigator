@@ -1,6 +1,6 @@
 //! Config serialization and loader tests.
 
-use navigator_config::{Config, ShortcutAction, ShortcutChord};
+use navigator_config::{Config, PasteConflictMode, ShortcutAction, ShortcutChord};
 
 #[test]
 fn defaults_bind_common_editor_ops() {
@@ -264,4 +264,100 @@ fn sort_mode_type_roundtrips_through_toml() {
     let text = toml::to_string_pretty(&c).expect("serialize");
     let back: Config = toml::from_str(&text).expect("reparse");
     assert_eq!(back.general.sort_mode, navigator_config::SortMode::Type);
+}
+
+#[test]
+fn on_conflict_defaults_to_update() {
+    // Update is the only mode that both makes progress on a merge and
+    // cannot roll back a newer edit at the destination, which is what
+    // lets a plain Ctrl+V run without prompting. Guard the default.
+    let c = Config::default();
+    assert_eq!(c.rclone.on_conflict, PasteConflictMode::Update);
+}
+
+#[test]
+fn on_conflict_section_is_optional_in_toml() {
+    // Pre-existing configs have an [rclone] section with no on_conflict
+    // key — they must load as Update rather than failing.
+    let text = r#"
+        [rclone]
+        progress_window = true
+        transfers = 4
+    "#;
+    let c: Config = toml::from_str(text).expect("parse");
+    assert_eq!(c.rclone.on_conflict, PasteConflictMode::Update);
+    assert!(c.rclone.progress_window);
+    assert_eq!(c.rclone.transfers, 4);
+}
+
+#[test]
+fn on_conflict_roundtrips_every_mode_through_toml() {
+    // The mode is persisted as a snake_case string. Round-trip all four
+    // so a serde rename cannot silently reset a user's choice.
+    for mode in PasteConflictMode::ALL {
+        let mut c = Config::default();
+        c.rclone.on_conflict = mode;
+        let text = toml::to_string_pretty(&c).expect("serialize");
+        let back: Config = toml::from_str(&text).expect("reparse");
+        assert_eq!(
+            back.rclone.on_conflict, mode,
+            "mode {:?} did not survive",
+            mode
+        );
+    }
+}
+
+#[test]
+fn junk_on_conflict_value_falls_back_to_defaults() {
+    // A hand-edited config with a bogus mode must not wedge the app.
+    // `ConfigHandle::load_or_default` is infallible by design, so the
+    // parse failure here is what that path swallows — assert the parse
+    // does fail loudly at this level so the fallback is the only route.
+    let text = r#"
+        [rclone]
+        on_conflict = "obliterate"
+    "#;
+    assert!(
+        toml::from_str::<Config>(text).is_err(),
+        "an unknown mode must not silently deserialize to something"
+    );
+}
+
+#[test]
+fn default_chords_are_unique() {
+    // The accel table matches modifiers strictly, so two defaults on the
+    // same chord means one silently never fires. Adding a binding (this
+    // guard was written when Paste special claimed Ctrl+Shift+V) must not
+    // shadow an existing one.
+    use std::collections::HashMap;
+    let c = Config::default();
+    let mut seen: HashMap<(bool, bool, bool, String), String> = HashMap::new();
+    for a in &c.shortcuts {
+        let key = (
+            a.chord.ctrl,
+            a.chord.shift,
+            a.chord.alt,
+            a.chord.key.to_ascii_uppercase(),
+        );
+        if let Some(prev) = seen.insert(key.clone(), a.name.clone()) {
+            panic!(
+                "default chord collision on {:?}: {:?} and {:?}",
+                key, prev, a.name
+            );
+        }
+    }
+}
+
+#[test]
+fn paste_special_is_bound_by_default() {
+    use navigator_config::InternalCommand;
+    let c = Config::default();
+    let found = c.shortcuts.iter().any(|a| {
+        a.internal == Some(InternalCommand::PasteSpecial)
+            && a.chord.ctrl
+            && a.chord.shift
+            && !a.chord.alt
+            && a.chord.key.eq_ignore_ascii_case("v")
+    });
+    assert!(found, "default Ctrl+Shift+V → Paste special missing");
 }

@@ -8,14 +8,18 @@
 //!   * periodic progress (bytes / eta / current file)
 //!   * a natural place to hook cancellation (kill the child)
 //!
-//! A pre-flight `--dry-run` pass collects the set of destinations that
-//! already exist, so the UI can prompt before overwriting. We never pass
-//! `--ignore-existing` implicitly — the user's choice decides.
+//! Conflict handling is mode-based rather than per-item: a paste carries a
+//! [`navigator_core::ConflictMode`] which becomes rclone flags (or, for
+//! `Mirror`, the `sync` verb). [`RcloneDriver::conflicts`] runs two
+//! `--dry-run` passes and diffs them to find which existing destinations
+//! the chosen mode would actually destroy, so the UI can confirm only when
+//! data is genuinely at risk.
 
 pub mod log;
 pub mod op;
 
 pub use log::{LogEvent, LogLevel, Stats};
 pub use op::{
-    OpHandle, Operation, OverwritePolicy, PreflightReport, RcloneDriver, RemoteSize, RemoteStat,
+    ConflictReport, OpHandle, Operation, PreflightReport, RcloneDriver, RemoteSize, RemoteStat,
+    victims,
 };

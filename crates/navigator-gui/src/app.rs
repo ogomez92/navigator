@@ -12,10 +12,10 @@ use parking_lot::Mutex;
 use tracing::{error, warn};
 
 use navigator_config::ConfigHandle;
-use navigator_core::NavPath;
+use navigator_core::{ConflictMode, NavPath};
 use navigator_fs::read_dir;
 use navigator_plugin_api::host::HostCallbacks;
-use navigator_rclone::{Operation, OverwritePolicy, RcloneDriver, op::OpEvent};
+use navigator_rclone::{Operation, RcloneDriver, op::OpEvent};
 
 use crate::plugins::{Host as PluginHost, PluginRegistry};
 use crate::remote_cache::RemoteCache;
@@ -30,6 +30,11 @@ use crate::window::{
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+/// Disambiguates concurrent `--files-from` list files. Two pastes can be in
+/// flight at once (each batch op gets its own worker thread), and a shared
+/// filename would have one clobber the other's list mid-run.
+static BATCH_LIST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub struct AppConfig {
     pub initial_path: NavPath,
@@ -1083,6 +1088,40 @@ impl AppState {
     }
 
     pub fn op_paste(&self) {
+        // `None` mode = use the configured default and only prompt if the
+        // dry-run proves something would be destroyed.
+        self.paste_with_mode(None);
+    }
+
+    /// Paste special (Ctrl+Shift+V): ask for the conflict mode up front,
+    /// then paste in it without the after-the-fact confirmation — the user
+    /// has already made the destructive choice explicitly. Mirror is only
+    /// reachable from here, and only for a copy clipboard.
+    pub fn op_paste_special(&self) {
+        let Some(dest) = self.model.cwd() else {
+            return;
+        };
+        let clip = crate::clipboard::load_clip();
+        if clip.sources.is_empty() {
+            self.say("clipboard empty", false);
+            return;
+        }
+        let default = self.config.read().rclone.on_conflict;
+        match crate::preflight::prompt_mode(
+            self.hwnd(),
+            default,
+            /*allow_mirror=*/ !clip.cut,
+            /*allow_keep_both=*/ !dest.is_remote(),
+        ) {
+            crate::preflight::PasteChoice::Cancel => self.say("cancelled", false),
+            choice => self.paste_with_mode(Some(choice)),
+        }
+    }
+
+    /// Shared body of paste and paste-special. `choice` is `None` for a
+    /// plain paste (resolve later, only if needed) or `Some` when the user
+    /// has already picked explicitly.
+    fn paste_with_mode(&self, choice: Option<crate::preflight::PasteChoice>) {
         let Some(dest) = self.model.cwd() else {
             return;
         };
@@ -1112,13 +1151,29 @@ impl AppState {
         });
 
         // Record undo BEFORE spawning the worker so Ctrl+Z can target the
-        // paste even if it's still in flight. `run_batch` may skip
-        // individual items on user "Skip" — the undo attempt will just
-        // no-op on those missing paths.
-        let created: Vec<NavPath> = sources.iter().map(|s| dest.join(s.file_name())).collect();
+        // paste even if it's still in flight.
+        //
+        // **Undo may only ever delete a destination this paste created.**
+        // Destinations that already exist are filtered out here, because
+        // every conflict mode can decline to write one: `AddNewOnly` skips
+        // it, `Update` spares it when it is newer, `Replace` overwrites it
+        // (and we keep no backup, so undo cannot restore it anyway), and
+        // `KeepBoth` writes a numbered sibling and leaves it untouched.
+        // Without this filter Ctrl+Z deleted exactly the files the chosen
+        // mode had deliberately protected — the precise inverse of intent,
+        // and unrecoverable.
+        //
+        // Pairs are filtered together so `created[i]` / `originals[i]` stay
+        // aligned; `run_revert_paste` indexes them in lockstep for cut-mode
+        // restores.
+        let (created, undo_originals): (Vec<NavPath>, Vec<NavPath>) = sources
+            .iter()
+            .map(|s| (dest.join(s.file_name()), s.clone()))
+            .filter(|(d, _)| !d.as_path().exists())
+            .unzip();
         self.push_undo(UndoAction::Paste {
             created,
-            originals: sources.clone(),
+            originals: undo_originals,
             cut_mode: clip.cut,
         });
 
@@ -1126,10 +1181,20 @@ impl AppState {
         // keeps stats attribution clean and lets the progress window show
         // "file N of M" without having to rebuild rclone's stat stream.
         let cut = clip.cut;
+        // Mirror is never a plain-paste mode, even if `config.toml` names it.
+        // It deletes destination files the user never selected, so it has to
+        // come from an explicit Paste special choice — a stray Ctrl+V must
+        // not be able to trigger it because of a setting edited weeks ago.
+        // (It is also meaningless on a file selection: `rclone sync a.txt
+        // b.txt` just fails with "Failed to create file system".)
+        let default_mode = match self.config.read().rclone.on_conflict {
+            ConflictMode::Mirror => ConflictMode::Update,
+            m => m,
+        };
         let state = self.clone_for_worker();
         std::thread::Builder::new()
             .name("navigator-batch-op".into())
-            .spawn(move || state.run_batch(sources, dest, cut))
+            .spawn(move || state.run_batch(sources, dest, cut, default_mode, choice))
             .expect("spawn batch worker");
     }
 
@@ -1740,10 +1805,7 @@ impl AppState {
         let seven_zip = match crate::extract::find_7z() {
             Some(p) => p,
             None => {
-                self.say(
-                    "7z not found; install 7-Zip to extract archives",
-                    true,
-                );
+                self.say("7z not found; install 7-Zip to extract archives", true);
                 return;
             }
         };
@@ -2290,9 +2352,270 @@ impl WorkerCtx {
         self.refresh();
     }
 
-    fn run_batch(self, sources: Vec<NavPath>, dest_dir: NavPath, cut: bool) {
+    /// Decide how a plain paste should handle conflicts, prompting only if
+    /// the chosen mode would actually destroy something.
+    ///
+    /// Cheap in the common case. Only a source whose destination name
+    /// already exists can possibly conflict, so a paste with no name
+    /// collisions returns immediately without spawning rclone at all — and
+    /// a non-destructive mode never needs to ask. Dry-run passes are paid
+    /// for only on the handful of items that genuinely collide.
+    fn resolve_conflicts(
+        &self,
+        sources: &[NavPath],
+        dest_dir: &NavPath,
+        cut: bool,
+        mode: ConflictMode,
+    ) -> crate::preflight::PasteChoice {
+        use crate::preflight::{PasteChoice, conflict_candidates, prompt_conflicts};
+
+        if !mode.is_destructive() {
+            return PasteChoice::Mode(mode);
+        }
+        let candidates = conflict_candidates(sources, dest_dir);
+        if candidates.is_empty() {
+            return PasteChoice::Mode(mode);
+        }
+
+        let mut overwrites: Vec<String> = Vec::new();
+        let mut deletes: Vec<String> = Vec::new();
+        // If detection itself fails we must not assume "no conflict" — fall
+        // back to naming the colliding top-level items, which we know exist.
+        let mut detection_failed = false;
+
+        // Detection is two dry-run spawns per operation, so it has to batch
+        // for the same reason the transfer does: overwriting 200 files would
+        // otherwise cost 400 spawns before a single byte moves. Groups run
+        // as one `--files-from` dry-run pair; directories stay per-item.
+        // Mirror never batches (`sync --files-from` would report pruning
+        // everything unlisted), so it takes the per-item path here too.
+        let part = if mode == ConflictMode::Mirror {
+            crate::batch::Partition {
+                groups: Vec::new(),
+                singles: candidates.clone(),
+            }
+        } else {
+            // Must be `path_is_dir`, not `as_path().is_dir()`: the latter
+            // returns false for every remote path, so a remote *directory*
+            // would join a `--files-from` list, which rclone ignores
+            // silently — detection would report no conflicts and the real
+            // (correctly per-item) run would then overwrite the folder's
+            // contents with no dialog. Same predicate as `run_batch`.
+            crate::batch::partition(&candidates, |s| self.path_is_dir(s))
+        };
+
+        for group in &part.groups {
+            let seq = BATCH_LIST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Ok(list) = crate::batch::TempList::write(&group.names, seq) else {
+                detection_failed = true;
+                continue;
+            };
+            let op = if cut {
+                Operation::MoveBatch {
+                    src_root: group.src_root.clone(),
+                    list_file: list.path().to_path_buf(),
+                    dest_dir: dest_dir.clone(),
+                    mode,
+                }
+            } else {
+                Operation::CopyBatch {
+                    src_root: group.src_root.clone(),
+                    list_file: list.path().to_path_buf(),
+                    dest_dir: dest_dir.clone(),
+                    mode,
+                }
+            };
+            match self.rclone.conflicts(&op) {
+                Ok(report) => {
+                    // With --files-from the reported objects are the listed
+                    // names themselves, so they need no prefixing.
+                    overwrites.extend(
+                        report
+                            .overwrites
+                            .iter()
+                            .map(|p| p.to_string_lossy().into_owned()),
+                    );
+                    deletes.extend(
+                        report
+                            .deletes
+                            .iter()
+                            .map(|p| p.to_string_lossy().into_owned()),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("batched conflict detection failed: {}", e);
+                    detection_failed = true;
+                }
+            }
+        }
+
+        for src in &part.singles {
+            let op = if cut {
+                Operation::Move {
+                    sources: vec![src.clone()],
+                    dest_dir: dest_dir.clone(),
+                    mode,
+                }
+            } else {
+                Operation::Copy {
+                    sources: vec![src.clone()],
+                    dest_dir: dest_dir.clone(),
+                    mode,
+                }
+            };
+            match self.rclone.conflicts(&op) {
+                Ok(report) => {
+                    // rclone reports destination-relative object paths: the
+                    // bare filename for a single-file copy, or a path inside
+                    // the tree for a directory copy. Prefix the latter so the
+                    // dialog shows where the file actually lives.
+                    let is_dir = self.path_is_dir(src);
+                    let name = src.file_name().to_string();
+                    let render = |p: &std::path::PathBuf| -> String {
+                        let rel = p.to_string_lossy();
+                        if is_dir {
+                            format!("{}\\{}", name, rel.replace('/', "\\"))
+                        } else {
+                            name.clone()
+                        }
+                    };
+                    overwrites.extend(report.overwrites.iter().map(&render));
+                    deletes.extend(report.deletes.iter().map(&render));
+                }
+                Err(e) => {
+                    tracing::warn!("conflict detection failed for {}: {}", src, e);
+                    detection_failed = true;
+                }
+            }
+        }
+
+        if detection_failed && overwrites.is_empty() {
+            overwrites = candidates
+                .iter()
+                .map(|s| s.file_name().to_string())
+                .collect();
+        }
+        if overwrites.is_empty() && deletes.is_empty() {
+            // Everything that collides is either identical or protected by
+            // the mode (e.g. a newer destination under Update). Nothing to
+            // warn about — run without a dialog.
+            return PasteChoice::Mode(mode);
+        }
+        prompt_conflicts(
+            self.hwnd,
+            mode,
+            &overwrites,
+            &deletes,
+            // Keep-both needs a true existence check to pick `foo (1)`, and
+            // `unique_numbered_path` can only probe the local filesystem. On
+            // a remote destination it would return the name unchanged and
+            // the item would quietly fall through to an additive copy (i.e.
+            // skip) instead of keeping both — so don't offer it there.
+            /*keep_both_offered=*/
+            !dest_dir.is_remote(),
+        )
+    }
+
+    /// Copy or move one batchable group in a single rclone invocation.
+    ///
+    /// Returns `(all_landed, first_destination)`. The temp list file lives
+    /// exactly as long as this call — `TempList` removes it on drop.
+    ///
+    /// **Why the post-run verification.** `rclone copy --files-from` exits 0
+    /// when a listed entry produces nothing: a directory (silently ignored)
+    /// or a name that no longer resolves both look like success. The exit
+    /// code alone would let a paste report "done" having moved nothing.
+    /// `batch::partition` already keeps directories out, but for a local
+    /// destination a cheap `exists()` per name proves it rather than
+    /// trusting it. A remote destination skips the check — probing it means
+    /// an `lsjson` round-trip per group, which would give back the latency
+    /// this whole path exists to remove — and falls back to the exit code.
+    fn run_group(
+        &self,
+        group: &crate::batch::FileGroup,
+        dest_dir: &NavPath,
+        cut: bool,
+        mode: ConflictMode,
+        total: usize,
+    ) -> (bool, Option<NavPath>) {
+        let seq = BATCH_LIST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let list = match crate::batch::TempList::write(&group.names, seq) {
+            Ok(l) => l,
+            Err(e) => {
+                // Can't stage the list — report failure rather than
+                // silently falling back and copying nothing.
+                tracing::error!("could not write --files-from list: {e}");
+                self.say("could not stage batch list", true);
+                return (false, None);
+            }
+        };
+
+        let op = if cut {
+            Operation::MoveBatch {
+                src_root: group.src_root.clone(),
+                list_file: list.path().to_path_buf(),
+                dest_dir: dest_dir.clone(),
+                mode,
+            }
+        } else {
+            Operation::CopyBatch {
+                src_root: group.src_root.clone(),
+                list_file: list.path().to_path_buf(),
+                dest_dir: dest_dir.clone(),
+                mode,
+            }
+        };
+
+        let exit_ok = self.run_one(op);
+        let first = group
+            .names
+            .first()
+            .map(|n| dest_dir.join(n))
+            .filter(|p| p.as_path().exists() || dest_dir.is_remote());
+
+        if dest_dir.is_remote() {
+            return (exit_ok, first);
+        }
+        let missing: Vec<&String> = group
+            .names
+            .iter()
+            .filter(|n| !dest_dir.join(n).as_path().exists())
+            .collect();
+        if !missing.is_empty() {
+            tracing::error!(
+                "batch of {} reported exit ok={} but {} destination(s) are missing, e.g. {:?}",
+                group.names.len(),
+                exit_ok,
+                missing.len(),
+                missing.iter().take(3).collect::<Vec<_>>()
+            );
+            self.say(
+                format!("{} of {} items did not arrive", missing.len(), total),
+                true,
+            );
+            return (false, first);
+        }
+        (exit_ok, first)
+    }
+
+    /// Run a paste. `default_mode` is the configured [`ConflictMode`];
+    /// `preset` is `Some` when Paste special already asked the user, in
+    /// which case no further prompt appears.
+    ///
+    /// Conflict handling is decided once for the whole batch, not per item.
+    /// For a plain paste we ask rclone (via two `--dry-run` passes) what the
+    /// chosen mode would actually destroy; if the answer is "nothing", the
+    /// paste runs with no dialog at all, which is the common case.
+    fn run_batch(
+        self,
+        sources: Vec<NavPath>,
+        dest_dir: NavPath,
+        cut: bool,
+        default_mode: ConflictMode,
+        preset: Option<crate::preflight::PasteChoice>,
+    ) {
         let _guard = self.state.upgrade().map(|s| s.op_guard());
-        use crate::preflight::{BatchDecision, ItemChoice, prompt_item, unique_numbered_path};
+        use crate::preflight::{PasteChoice, top_level_conflicts, unique_numbered_path};
 
         let total = sources.len();
         let mut failed = 0u32;
@@ -2303,85 +2626,134 @@ impl WorkerCtx {
         // paste ended up. Rename-on-conflict stores the fresh sibling.
         let mut first_created: Option<NavPath> = None;
 
-        // Sticky decision after the user ticks "apply to all". `None` means
-        // we still ask per-conflict.
-        let mut sticky: Option<ItemChoice> = None;
-        // Count how many conflicts remain so the dialog can show progress.
-        let mut remaining_conflicts: usize = sources
-            .iter()
-            .filter(|s| dest_dir.join(s.file_name()).as_path().exists())
-            .count();
+        let choice = match preset {
+            // Paste special already got an explicit answer; don't second-
+            // guess it with another dialog.
+            Some(c) => c,
+            None => self.resolve_conflicts(&sources, &dest_dir, cut, default_mode),
+        };
+        let mode = match choice {
+            PasteChoice::Cancel => {
+                self.say("cancelled", false);
+                return;
+            }
+            PasteChoice::KeepBoth => None,
+            PasteChoice::Mode(m) => Some(m),
+        };
+
+        // Keep-both only renames the top-level items that actually collide;
+        // everything else pastes normally.
+        let colliding: std::collections::HashSet<String> = if mode.is_none() {
+            top_level_conflicts(&sources, &dest_dir)
+                .iter()
+                .map(|s| s.file_name().to_string())
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        // Collapse plain file copies into one `--files-from` invocation per
+        // source folder. Skipped entirely for Keep-both (every item needs
+        // its own renamed destination) and for Mirror (`sync --files-from`
+        // would prune everything unlisted at the destination). Directories
+        // always stay per-item: `--files-from` ignores them silently.
+        //
+        // `done` carries the batched count so the per-item narration below
+        // keeps counting against the original `total` rather than restarting
+        // at 1 for the leftovers.
+        let mut done = 0usize;
+        let sources = match mode {
+            Some(m) if m != ConflictMode::Mirror => {
+                let part = crate::batch::partition(&sources, |s| self.path_is_dir(s));
+                for group in &part.groups {
+                    let n = group.names.len();
+                    self.say(
+                        format!("copying {} items from {}", n, group.src_root.file_name()),
+                        false,
+                    );
+                    let (ok, first) = self.run_group(group, &dest_dir, cut, m, total);
+                    if ok {
+                        if first_created.is_none() {
+                            first_created = first;
+                        }
+                    } else {
+                        failed += n as u32;
+                    }
+                    done += n;
+                }
+                if !part.groups.is_empty() {
+                    tracing::info!(
+                        "paste batched {} items into {} rclone invocation(s)",
+                        total,
+                        part.invocations()
+                    );
+                }
+                part.singles
+            }
+            _ => sources,
+        };
 
         for (i, src) in sources.into_iter().enumerate() {
+            let i = i + done;
             let dst_name = src.file_name().to_string();
             let dst = dest_dir.join(&dst_name);
-            let dst_exists = dst.as_path().exists();
 
-            let choice = if !dst_exists {
-                ItemChoice::Overwrite // no conflict
-            } else if let Some(s) = sticky {
-                s
-            } else {
-                let BatchDecision { choice, sticky: s } =
-                    prompt_item(self.hwnd, &src, &dst, remaining_conflicts);
-                if s {
-                    sticky = Some(choice);
-                }
-                remaining_conflicts = remaining_conflicts.saturating_sub(1);
-                choice
-            };
-
-            match choice {
-                ItemChoice::Cancel => {
-                    self.say("cancelled", true);
-                    break;
-                }
-                ItemChoice::Skip => {
-                    if dst_exists {
-                        skipped += 1;
-                        self.say(format!("skipped {}", dst_name), false);
-                    }
-                    continue;
-                }
-                ItemChoice::Overwrite | ItemChoice::Rename => { /* fall through */ }
-            }
-
-            let (op, effective_name) = if matches!(choice, ItemChoice::Rename) && dst_exists {
-                // Pick a fresh sibling name and drive the op through
-                // Rename/CopyTo so rclone writes to the new path instead
-                // of clobbering the existing one.
-                let new_dst_pb = unique_numbered_path(dst.as_path());
-                match NavPath::new(new_dst_pb.clone()) {
-                    Ok(new_dst) => {
-                        let new_name = new_dst.file_name().to_string();
-                        renamed += 1;
-                        let op = if cut {
-                            Operation::Rename { src, dst: new_dst }
-                        } else {
-                            Operation::CopyTo { src, dst: new_dst }
-                        };
-                        (op, new_name)
-                    }
-                    Err(_) => {
-                        // Could not construct a valid NavPath — skip this
-                        // item so we don't accidentally overwrite.
-                        skipped += 1;
-                        self.say(format!("skipped {} (rename failed)", dst_name), false);
-                        continue;
+            let (op, effective_name) = match mode {
+                // Keep both: give this item a fresh numbered sibling name
+                // and drive it through Rename/CopyTo so rclone writes to the
+                // new path instead of merging into the existing one.
+                None if colliding.contains(&dst_name) => {
+                    let new_dst_pb = unique_numbered_path(dst.as_path());
+                    match NavPath::new(new_dst_pb.clone()) {
+                        Ok(new_dst) => {
+                            let new_name = new_dst.file_name().to_string();
+                            renamed += 1;
+                            let op = if cut {
+                                Operation::Rename { src, dst: new_dst }
+                            } else {
+                                Operation::CopyTo { src, dst: new_dst }
+                            };
+                            (op, new_name)
+                        }
+                        Err(_) => {
+                            // Could not construct a valid NavPath — skip so
+                            // we cannot accidentally overwrite.
+                            skipped += 1;
+                            self.say(format!("skipped {} (rename failed)", dst_name), false);
+                            continue;
+                        }
                     }
                 }
-            } else {
-                let policy = OverwritePolicy::Always;
-                let op = if cut {
-                    Operation::Rename { src, dst }
-                } else {
-                    Operation::Copy {
-                        sources: vec![src],
-                        dest_dir: dest_dir.clone(),
-                        policy,
-                    }
-                };
-                (op, dst_name)
+                // Non-colliding item under Keep-both: a plain additive copy
+                // is exactly right, and cannot touch anything.
+                None => {
+                    let op = if cut {
+                        Operation::Rename { src, dst }
+                    } else {
+                        Operation::Copy {
+                            sources: vec![src],
+                            dest_dir: dest_dir.clone(),
+                            mode: ConflictMode::AddNewOnly,
+                        }
+                    };
+                    (op, dst_name)
+                }
+                Some(m) => {
+                    let op = if cut {
+                        Operation::Move {
+                            sources: vec![src],
+                            dest_dir: dest_dir.clone(),
+                            mode: m,
+                        }
+                    } else {
+                        Operation::Copy {
+                            sources: vec![src],
+                            dest_dir: dest_dir.clone(),
+                            mode: m,
+                        }
+                    };
+                    (op, dst_name)
+                }
             };
 
             self.say(format!("{} of {}: {}", i + 1, total, effective_name), false);
@@ -2397,22 +2769,10 @@ impl WorkerCtx {
         if let (Some(state), Some(target)) = (self.state.upgrade(), first_created) {
             state.set_pending_focus(target);
         }
-        let msg = match (failed, skipped, renamed) {
-            (0, 0, 0) => format!("done — {} items", total),
-            (0, 0, r) => format!("done — {} items, {} renamed", total, r),
-            (0, s, 0) => format!("done — {} items, {} skipped", total - s as usize, s),
-            (0, s, r) => format!(
-                "done — {} items, {} skipped, {} renamed",
-                total - s as usize,
-                s,
-                r
-            ),
-            (f, s, _) => format!(
-                "finished with {} failures, {} skipped, out of {}",
-                f, s, total
-            ),
-        };
-        self.say(msg, failed > 0);
+        self.say(
+            crate::preflight::paste_summary(mode, total, failed, skipped, renamed),
+            failed > 0,
+        );
         self.refresh();
     }
 
