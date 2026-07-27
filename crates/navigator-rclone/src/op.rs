@@ -240,18 +240,53 @@ pub fn victims(full: &[PathBuf], additive: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
+/// One `--stats` tick, lifted out of rclone's JSON log record.
+///
+/// Everything here describes *one* rclone invocation. A single user action
+/// can span several (see `navigator-gui`'s batching), so the GUI aggregates
+/// these into a job-level view rather than showing them raw.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Progress {
+    pub bytes_done: u64,
+    /// `0` until rclone has finished scanning — treat as "unknown", not
+    /// "nothing to do".
+    pub bytes_total: u64,
+    /// Files fully transferred so far in this invocation.
+    pub files_done: u64,
+    /// Files this invocation expects to transfer, as far as rclone knows.
+    pub files_total: u64,
+    pub speed_bps: f64,
+    /// Seconds rclone thinks are left. `None` while it has no estimate.
+    pub eta_secs: Option<u64>,
+    /// Object named on the stats record, when rclone attaches one. Usually
+    /// absent under `--stats-one-line`; the GUI falls back to the last
+    /// object seen on a plain log record.
+    pub current: Option<String>,
+}
+
+impl Progress {
+    /// How far along this invocation is, `0.0..=1.0`, or `None` when
+    /// rclone hasn't reported anything to divide by yet.
+    ///
+    /// Bytes are preferred over file counts because they advance smoothly:
+    /// a file count only moves when a transfer *completes*, so a single
+    /// large file would sit at zero for its whole duration.
+    pub fn fraction(&self) -> Option<f64> {
+        if self.bytes_total > 0 {
+            return Some((self.bytes_done as f64 / self.bytes_total as f64).clamp(0.0, 1.0));
+        }
+        if self.files_total > 0 {
+            return Some((self.files_done as f64 / self.files_total as f64).clamp(0.0, 1.0));
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum OpEvent {
     Log(LogEvent),
-    Progress {
-        bytes_done: u64,
-        bytes_total: u64,
-        current: Option<String>,
-    },
-    Done {
-        success: bool,
-        stderr_tail: String,
-    },
+    Progress(Progress),
+    Done { success: bool, stderr_tail: String },
 }
 
 /// Handle returned by [`RcloneDriver::spawn`]. Dropping it does *not* kill
@@ -265,10 +300,39 @@ pub struct OpHandle {
 
 impl OpHandle {
     pub fn cancel(&self) {
+        self.canceller().cancel();
+    }
+
+    /// Cancel side of this handle, detached so it can be handed to the
+    /// progress window's Cancel button while the worker thread keeps
+    /// draining `events`. Cloning the two `Arc`s is the whole trick — the
+    /// handle itself has to stay put because it owns the receiver.
+    pub fn canceller(&self) -> Canceller {
+        Canceller {
+            child: Arc::clone(&self.child),
+            cancelled: Arc::clone(&self.cancelled),
+        }
+    }
+}
+
+/// Kill switch for an in-flight operation. `Send + Clone` so the UI thread
+/// can hold one while the worker owns the [`OpHandle`].
+#[derive(Clone)]
+pub struct Canceller {
+    child: Arc<Mutex<Option<Child>>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Canceller {
+    pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         if let Some(mut c) = self.child.lock().take() {
             let _ = c.kill();
         }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
 }
 
@@ -840,11 +904,24 @@ fn forward_line(tx: &Sender<OpEvent>, line: &str) {
     };
 
     if let Some(s) = ev.stats.as_ref() {
-        let _ = tx.send(OpEvent::Progress {
+        let _ = tx.send(OpEvent::Progress(Progress {
             bytes_done: s.bytes,
             bytes_total: s.totalBytes,
-            current: ev.object.clone(),
-        });
+            files_done: s.transfers,
+            files_total: s.totalTransfers,
+            speed_bps: s.speed,
+            // rclone reports `eta: null` while it has no estimate, and 0
+            // once it thinks it's done — neither is worth showing.
+            eta_secs: s.eta.filter(|e| *e > 0),
+            // Stats records never carry a top-level `object`; the file
+            // actually moving is in `transferring`.
+            current: s
+                .transferring
+                .first()
+                .map(|t| t.name.clone())
+                .filter(|n| !n.is_empty())
+                .or_else(|| ev.object.clone()),
+        }));
     }
     let _ = tx.send(OpEvent::Log(ev));
 }
@@ -1340,5 +1417,85 @@ mod tests {
         let stats = r#"{"level":"notice","msg":"Transferred: 11 B","stats":{"bytes":11}}"#;
         let ev: LogEvent = serde_json::from_str(stats).unwrap();
         assert!(!ev.is_dry_run("copy"));
+    }
+
+    /// The GUI narrates a copy from the file counts and ETA on the stats
+    /// record, not just the byte totals. Dropping any of these fields on
+    /// the floor is silent — progress simply stops being informative — so
+    /// pin the whole lift here.
+    #[test]
+    fn stats_records_become_a_full_progress_event() {
+        let (tx, rx) = unbounded::<OpEvent>();
+        forward_line(
+            &tx,
+            r#"{"level":"notice","msg":"Transferred: 45 MiB","stats":{"bytes":47185920,"totalBytes":104857600,"transfers":9,"totalTransfers":20,"speed":5242880.0,"eta":11,"errors":0}}"#,
+        );
+        let OpEvent::Progress(p) = rx.recv().unwrap() else {
+            panic!("a stats record must produce a Progress event");
+        };
+        assert_eq!(p.bytes_done, 47_185_920);
+        assert_eq!(p.bytes_total, 104_857_600);
+        assert_eq!(p.files_done, 9);
+        assert_eq!(p.files_total, 20);
+        assert_eq!(p.eta_secs, Some(11));
+        assert_eq!(p.fraction(), Some(0.45));
+        // The record is still forwarded as a log line for the op log.
+        assert!(matches!(rx.recv().unwrap(), OpEvent::Log(_)));
+    }
+
+    /// A verbatim stats record from rclone 1.73.5, trimmed only of the
+    /// second `transferring` entry. Two things it pins that a hand-written
+    /// fixture would not: the record has **no top-level `object`**, so the
+    /// "current file" has to come out of `transferring`, and `eta` really
+    /// is `null` for the first seconds of a copy.
+    #[test]
+    fn a_real_rclone_stats_line_parses_end_to_end() {
+        let (tx, rx) = unbounded::<OpEvent>();
+        forward_line(
+            &tx,
+            r#"{"time":"2026-07-27T10:47:53.3371482+02:00","level":"notice","msg":"      444 KiB / 17.166 MiB, 3%, 0 B/s, ETA - (xfr#0/6)\n","stats":{"bytes":454656,"checks":0,"deletedDirs":0,"deletes":0,"elapsedTime":0.1988474,"errors":0,"eta":null,"fatalError":false,"listed":6,"renames":0,"retryError":false,"serverSideCopies":0,"speed":0,"totalBytes":18000000,"totalChecks":0,"totalTransfers":6,"transferTime":0.1988474,"transferring":[{"bytes":454656,"eta":null,"group":"global_stats","name":"f1.bin","percentage":15,"size":3000000,"speed":2292396.29}],"transfers":0},"source":"slog/logger.go:256"}"#,
+        );
+        let OpEvent::Progress(p) = rx.recv().unwrap() else {
+            panic!("expected Progress");
+        };
+        assert_eq!(p.bytes_done, 454_656);
+        assert_eq!(p.bytes_total, 18_000_000);
+        assert_eq!(p.files_total, 6);
+        assert_eq!(p.eta_secs, None);
+        assert_eq!(
+            p.current.as_deref(),
+            Some("f1.bin"),
+            "the moving file lives in `transferring`, not `object`"
+        );
+    }
+
+    /// rclone reports `eta` as null while scanning and 0 once it believes
+    /// the transfer is finished. Neither is worth showing, and a literal
+    /// "0 seconds remaining" on a still-running copy reads as a hang.
+    #[test]
+    fn useless_eta_values_are_dropped() {
+        let (tx, rx) = unbounded::<OpEvent>();
+        forward_line(
+            &tx,
+            r#"{"level":"notice","msg":"x","stats":{"bytes":1,"totalBytes":2,"eta":0}}"#,
+        );
+        let OpEvent::Progress(p) = rx.recv().unwrap() else {
+            panic!("expected Progress");
+        };
+        assert_eq!(p.eta_secs, None);
+    }
+
+    /// With no byte totals yet (rclone still scanning) the file counts have
+    /// to carry the fraction, otherwise a many-file copy shows nothing at
+    /// all for its first seconds.
+    #[test]
+    fn fraction_falls_back_to_file_counts() {
+        let p = Progress {
+            files_done: 3,
+            files_total: 4,
+            ..Default::default()
+        };
+        assert_eq!(p.fraction(), Some(0.75));
+        assert_eq!(Progress::default().fraction(), None);
     }
 }

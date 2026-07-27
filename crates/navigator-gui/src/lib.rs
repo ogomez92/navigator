@@ -21,6 +21,7 @@ pub mod extract;
 pub mod history;
 pub mod listview;
 pub mod model;
+pub mod narrate;
 pub mod new_folder;
 pub mod ops_window;
 pub mod options;

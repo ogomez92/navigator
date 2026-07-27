@@ -30,6 +30,10 @@ use windows::core::{PCWSTR, w};
 pub const WMAPP_PROGRESS_STATUS: u32 = WM_APP + 100;
 pub const WMAPP_PROGRESS_LOG: u32 = WM_APP + 101;
 pub const WMAPP_PROGRESS_DONE: u32 = WM_APP + 102;
+/// Start of a new job. The window is a reused singleton, so without this
+/// the second operation of a session opens showing the first one's log,
+/// its "Done." label and a dead Cancel button.
+pub const WMAPP_PROGRESS_BEGIN: u32 = WM_APP + 103;
 
 const IDC_LOG: u16 = 303;
 const IDC_BTN_CANCEL: u16 = 304;
@@ -54,11 +58,42 @@ pub struct ProgressHandle {
 unsafe impl Send for ProgressHandle {}
 unsafe impl Sync for ProgressHandle {}
 
+/// One frame of the progress window, computed on the worker thread so the
+/// UI thread only has to paint it.
+///
+/// The split matters: `title` and `detail` come from
+/// [`crate::narrate`], which knows about the *job* (all of its rclone
+/// invocations), while the window itself only ever sees one frame at a
+/// time and must not try to aggregate anything.
+pub struct Status {
+    /// Window caption — carries the percentage so a screen reader's
+    /// read-title command answers "how far along?".
+    pub title: String,
+    /// File rclone is working on right now, if known.
+    pub current: String,
+    /// Counts / bytes / rate / ETA, already formatted.
+    pub detail: String,
+    /// Whole-percent completion, or `None` while it is unknowable.
+    pub percent: Option<u32>,
+}
+
 impl ProgressHandle {
-    pub fn post_status(&self, current: &str, done: u64, total: u64) {
-        // Payload is a heap-leaked Box<(String, u64, u64)> reclaimed by the
-        // window proc.
-        let payload = Box::into_raw(Box::new((current.to_string(), done, total)));
+    /// Reset the window for a new job and give it an initial caption.
+    pub fn post_begin(&self, title: &str) {
+        let payload = Box::into_raw(Box::new(title.to_string()));
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(self.hwnd),
+                WMAPP_PROGRESS_BEGIN,
+                WPARAM(0),
+                LPARAM(payload as isize),
+            );
+        }
+    }
+
+    pub fn post_status(&self, status: Status) {
+        // Payload is a heap-leaked Box reclaimed by the window proc.
+        let payload = Box::into_raw(Box::new(status));
         unsafe {
             let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                 Some(self.hwnd),
@@ -94,6 +129,13 @@ impl ProgressHandle {
 
     pub fn set_cancel<F: FnMut() + Send + 'static>(&self, f: F) {
         *self.cancel_flag.lock().unwrap() = Some(Box::new(f));
+    }
+
+    /// Drop the installed cancel callback. The window is a singleton that
+    /// outlives the operation, so a stale callback would let a Cancel
+    /// click try to kill a process that finished minutes ago.
+    pub fn clear_cancel(&self) {
+        *self.cancel_flag.lock().unwrap() = None;
     }
 }
 
@@ -241,38 +283,66 @@ fn build_children(parent: HWND, cancel_flag: CancelSlot) -> Data {
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
-        WMAPP_PROGRESS_STATUS => unsafe {
+        WMAPP_PROGRESS_BEGIN => unsafe {
+            let title: Box<String> = Box::from_raw(lp.0 as *mut _);
             let Some(d) = data(hwnd) else {
                 return LRESULT(0);
             };
-            let payload: Box<(String, u64, u64)> = Box::from_raw(lp.0 as *mut _);
-            let (current, done, total) = *payload;
-            set_text(d.label_current, &format!("Current: {current}"));
-            let stats = if total > 0 {
-                format!(
-                    "{} / {} ({}%)",
-                    fmt_bytes(done),
-                    fmt_bytes(total),
-                    (done as f64 / total as f64 * 100.0) as u32
-                )
-            } else {
-                fmt_bytes(done).to_string()
-            };
-            set_text(d.label_stats, &stats);
-            let percent = if total > 0 {
-                ((done as u128 * 100) / total as u128).min(100) as usize
-            } else {
-                0
-            };
+            d.finished = false;
+            set_caption(hwnd, &title);
+            // rclone is still scanning at this point — there is no current
+            // file and no percentage worth showing.
+            set_text(d.label_current, "Preparing…");
+            set_text(d.label_stats, "");
+            // EM_SETSEL(0, -1) + EM_REPLACESEL("") clears the edit.
+            SendMessageW(d.log, 0x00B1, Some(WPARAM(0)), Some(LPARAM(-1)));
+            let empty: [u16; 1] = [0];
+            SendMessageW(
+                d.log,
+                0x00C2,
+                Some(WPARAM(0)),
+                Some(LPARAM(empty.as_ptr() as isize)),
+            );
             // PBM_SETPOS = 0x0402
-            SendMessageW(d.progbar, 0x0402, Some(WPARAM(percent)), Some(LPARAM(0)));
+            SendMessageW(d.progbar, 0x0402, Some(WPARAM(0)), Some(LPARAM(0)));
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(d.btn_cancel, true);
+            LRESULT(0)
+        },
+        WMAPP_PROGRESS_STATUS => unsafe {
+            let payload: Box<Status> = Box::from_raw(lp.0 as *mut _);
+            let Some(d) = data(hwnd) else {
+                return LRESULT(0);
+            };
+            // A late status frame from a finished job would undo the
+            // "Done." label and re-arm a Cancel button with nothing to
+            // cancel. Ops post asynchronously, so this happens.
+            if d.finished {
+                return LRESULT(0);
+            }
+            set_caption(hwnd, &payload.title);
+            if payload.current.is_empty() {
+                set_text(d.label_current, &payload.title);
+            } else {
+                set_text(d.label_current, &format!("Current: {}", payload.current));
+            }
+            set_text(d.label_stats, &payload.detail);
+            // PBM_SETPOS = 0x0402
+            SendMessageW(
+                d.progbar,
+                0x0402,
+                Some(WPARAM(payload.percent.unwrap_or(0) as usize)),
+                Some(LPARAM(0)),
+            );
             LRESULT(0)
         },
         WMAPP_PROGRESS_LOG => unsafe {
+            // Reclaim the payload before anything can return early — a
+            // bail-out that skipped this leaked one heap String per log
+            // line, and rclone emits one per file.
+            let payload: Box<String> = Box::from_raw(lp.0 as *mut _);
             let Some(d) = data(hwnd) else {
                 return LRESULT(0);
             };
-            let payload: Box<String> = Box::from_raw(lp.0 as *mut _);
             append_log(d.log, &payload);
             LRESULT(0)
         },
@@ -281,14 +351,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 return LRESULT(0);
             };
             d.finished = true;
-            set_text(
-                d.label_current,
-                if wp.0 == 1 {
-                    "Done."
-                } else {
-                    "Finished with errors."
-                },
-            );
+            let text = if wp.0 == 1 {
+                "Done."
+            } else {
+                "Finished with errors."
+            };
+            set_text(d.label_current, text);
+            set_caption(hwnd, text.trim_end_matches('.'));
+            // A completed job is 100% even if rclone's last stats tick
+            // landed at 98 — leaving the bar short reads as "stuck".
+            if wp.0 == 1 {
+                SendMessageW(d.progbar, 0x0402, Some(WPARAM(100)), Some(LPARAM(0)));
+            }
             // Disable Cancel since there's nothing to cancel anymore.
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(d.btn_cancel, false);
             LRESULT(0)
@@ -337,6 +411,13 @@ unsafe fn data<'a>(hwnd: HWND) -> Option<&'a mut Data> {
     }
 }
 
+/// Set the window caption. Keeps the app name out of `narrate`, which
+/// produces the same string for the in-window status label where " —
+/// navigator" would only be noise.
+fn set_caption(hwnd: HWND, headline: &str) {
+    set_text(hwnd, &format!("{headline} — navigator"));
+}
+
 fn set_text(hwnd: HWND, s: &str) {
     let w: Vec<u16> = s.encode_utf16().chain([0]).collect();
     unsafe {
@@ -362,10 +443,6 @@ fn append_log(hwnd: HWND, line: &str) {
         );
         SendMessageW(hwnd, 0x00B7, Some(WPARAM(0)), Some(LPARAM(0)));
     }
-}
-
-fn fmt_bytes(n: u64) -> String {
-    crate::listview::format_size(n)
 }
 
 // --- control builders -----------------------------------------------------

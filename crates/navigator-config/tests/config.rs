@@ -32,7 +32,15 @@ fn defaults_have_flags_off() {
     assert!(!c.general.show_hidden);
     assert!(!c.general.show_system);
     assert!(!c.rclone.progress_window);
-    assert_eq!(c.general.announce_interval_secs, 0);
+}
+
+/// Progress narration is on out of the box. It used to default to `0`
+/// (off) and that was survivable only because a paste narrated its own
+/// item loop; batching removed the loop, so a fresh install with `0` here
+/// would run a ten-minute copy in total silence.
+#[test]
+fn progress_announcements_are_on_by_default() {
+    assert_eq!(Config::default().general.announce_interval_secs, 5);
 }
 
 #[test]

@@ -72,4 +72,19 @@ pub struct Stats {
     pub elapsedTime: f64,
     #[serde(default)]
     pub errors: u64,
+    /// Files moving right now. A stats record carries no top-level
+    /// `object` — that only appears on the per-file INFO records, which
+    /// fire when a transfer *ends* — so this is the only source for "what
+    /// is it working on at this instant".
+    #[serde(default)]
+    pub transferring: Vec<Transferring>,
+}
+
+/// One in-flight transfer inside a [`Stats`] record. rclone reports far
+/// more per entry (size, speed, percentage, both filesystems); the name is
+/// all the progress window needs.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Transferring {
+    #[serde(default)]
+    pub name: String,
 }

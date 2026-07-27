@@ -18,8 +18,8 @@
 pub mod log;
 pub mod op;
 
-pub use log::{LogEvent, LogLevel, Stats};
+pub use log::{LogEvent, LogLevel, Stats, Transferring};
 pub use op::{
-    ConflictReport, OpHandle, Operation, PreflightReport, RcloneDriver, RemoteSize, RemoteStat,
-    victims,
+    Canceller, ConflictReport, OpHandle, Operation, PreflightReport, Progress, RcloneDriver,
+    RemoteSize, RemoteStat, victims,
 };

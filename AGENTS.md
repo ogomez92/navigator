@@ -106,6 +106,8 @@ Multi-file pastes collapse into one `rclone copy --files-from` invocation per so
 
 **Undo may only delete destinations that did not exist before the paste.** `op_paste` filters the undo record accordingly; without it Ctrl+Z deletes precisely the files the chosen mode protected.
 
+**Progress is reported per user action, not per rclone invocation.** `navigator_gui::narrate` holds a `Meter` (weighted, monotonic across every invocation the action takes) and a `Cadence` (silent for the first interval, one utterance per interval, never repeating itself); `OpProgress` in `app.rs` drives them, the progress window and the cancel flag. `run_op` runs one invocation against a job-level `OpProgress` and must **not** post completion — that belongs to the job. `general.announce_interval_secs` defaults to 5. See CLAUDE.md's *Progress reporting* section.
+
 ### Clipboard + undo + trash
 
 - **Clipboard is file-backed**, not the Windows clipboard. `<exe_dir>/clipboard.json` holds `{sources, cut, ts}`; written by copy/cut/append, read by paste. Two running navigator instances share it automatically. The OS clipboard is untouched except by `op_copy_paths` (CF_UNICODETEXT on purpose).

@@ -146,6 +146,28 @@ Names containing `\n`/`\r` fall back to singles — the list is newline-delimite
 
 Keep-both never batches — each item needs its own renamed destination.
 
+### Progress reporting: the job, not the invocation
+
+**A user action is not an rclone invocation, and progress must be reported at the action level.** Batching broke this: a paste used to narrate its own item loop (`"1 of 200: a.txt"`, `"2 of 200: b.txt"`, …), and collapsing 200 items into one `--files-from` call deleted the loop and every utterance with it. Reporting per invocation is equally wrong the other way — a three-folder paste would run 0–100% three times.
+
+`navigator-gui/src/narrate.rs` owns the model, and is pure + unit-tested:
+
+- **`Meter`** aggregates N invocations into one monotonic 0–100%. Each invocation declares a **weight in job units** (a `--files-from` group weighs `names.len()`, a directory weighs 1, a trash-rename weighs 1) and contributes `weight × its own fraction`. `set_fraction` only ever moves forward, because rclone's `totalBytes` grows while it scans and a raw fraction dips. `percent()` divides the *unfloored* total, so a one-unit job (a single big file) still climbs; `units_done()` floors, so it only claims finished items.
+- **`Cadence`** decides *when*. Nothing at all for the first interval — a copy that finishes inside it says only its summary — then at most one utterance per interval, and never the same sentence twice running, so a stalled transfer goes quiet and resumes the moment the numbers move.
+- **`phrase`** returns `None` at 100%: every caller already follows completion with a summary (`"done — 200 items, update"`), and rclone's closing stats tick would otherwise squeeze `"100 percent, 200 of 200"` in just ahead of it.
+
+`OpProgress` in `app.rs` is the impure driver: one per user action, holding the meter, the cadence, the progress-window handle and the cancel flag. `WorkerCtx::run_op(op, &mut prog)` runs a single invocation against it; `run_one` is the one-shot wrapper that builds a 1-unit job for renames / mkdir / touch. Callers bracket each invocation with `prog.begin(weight)` / `prog.end()`, account for items they decline to run with `prog.skip(n)` (otherwise the percentage stalls short of 100), and call `prog.finish(ok)` **once** at the end.
+
+**`run_op` must not post completion to the progress window.** It used to: `post_done` fired per invocation, so the first group of a multi-group paste flipped the window to "Done." and disabled Cancel while the rest were still running. Completion belongs to the job.
+
+Speech and window carry deliberately different detail. Speech is terse (`"45 percent, 90 of 200"`) — it's spoken over whatever the user is doing, and the filename is exactly what batching exists to stop announcing. The window gets counts, bytes, rate and ETA, plus the in-flight filename, plus the percentage in its **caption** so a screen reader's read-title command answers "how far along?".
+
+**The in-flight filename comes from `stats.transferring[0].name`, not `object`.** rclone's stats records carry no top-level `object` — that appears only on the per-file INFO records, which fire when a transfer *ends*. Reading `object` off a stats record left the window's "Current:" line permanently blank. `a_real_rclone_stats_line_parses_end_to_end` pins a verbatim 1.73.5 record against both facts.
+
+Cancel works now: `OpHandle::canceller()` hands out a `Send + Clone` kill switch, `OpProgress::arm_cancel` re-installs it per invocation, and the flag is checked between items so cancelling a 200-item paste stops the paste rather than one file. A cancelled child exits non-zero — `run_op` returns early on `prog.cancelled()` so that never becomes an error dialog or a UAC retry prompt.
+
+`general.announce_interval_secs` defaults to **5**, not 0. Per the no-migration rule below, an existing `config.toml` keeps whatever it has — set it in Options → Speech or delete the file. `0` still means "no periodic speech"; the completion summary and the window are unaffected.
+
 ### Clipboard + undo + trash
 
 - **Clipboard is file-backed**, not the Windows clipboard. `<exe_dir>/clipboard.json` holds `{sources, cut, ts}`; written by copy/cut/append, read by paste. Two running navigator instances share it automatically. The OS clipboard is untouched except by `op_copy_paths` (CF_UNICODETEXT on purpose).
@@ -191,6 +213,7 @@ Pure computation (folder stats, extension histogram, TOML tree dump) lives in `p
 - `ConfigHandle::load_or_default()` is infallible — a corrupt `config.toml` logs a warning and returns defaults.
 - `config.toml`, `plugins/`, `clipboard.json`, `clipboard_history.json`, and `.trash/` all live next to the exe (or in the case of `.trash`, at each volume root). `navigator_config::exe_dir()` is the source of truth; don't hardcode.
 - Sort mode, filters (show hidden/system), shortcut bindings, hotspot slots, and per-column visibility (`general.columns`) all persist here.
+- **`[general] announce_interval_secs`** (default 5) is the spoken-progress cadence — see *Progress reporting* above. Options → Speech writes it.
 - **`[rclone]` section** holds `progress_window` (moved out of `[general]`), `transfers` (default 8, clamped 1..=64 via `Rclone::transfers_clamped`), and `on_conflict` (default `"update"`). Options → Rclone tab writes all three. `transfers` feeds rclone's `--transfers N`. The `on_conflict` combo deliberately omits `Mirror` — a hand-edited config that sets it is honoured, and opening Options won't silently rewrite it (the commit only writes the mode when the combo has a real selection).
 - **`[extraction]` section** holds `delete_when_extracted` (default true) and `create_folder` (default true). Options → Extraction tab writes both. Read by `AppState::op_extract` per invocation so a config save applies to the next extract without a restart.
 - `Columns` defaults to all-on (Size/Type/Modified shown) so pre-existing configs keep the historical four-column view after upgrade. `SortMode::Type` was added alongside — sort works regardless of column visibility, so `type_key()` in `model.rs` is the source of truth and not the Type column label.

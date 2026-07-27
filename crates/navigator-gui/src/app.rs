@@ -2,9 +2,10 @@
 //! background scan worker, and the clipboard for cut/copy.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Sender, unbounded};
 use once_cell::sync::OnceCell;
@@ -2313,6 +2314,191 @@ struct WorkerCtx {
     state: Weak<AppState>,
 }
 
+/// Progress reporting for one *user action*, across every rclone
+/// invocation that action takes.
+///
+/// This is the piece batching removed. A paste used to narrate its own
+/// item loop (`"1 of 200: a.txt"`, `"2 of 200: b.txt"`, …); collapsing 200
+/// items into one `--files-from` call deleted the loop and with it every
+/// utterance between "copying" and "done". Reporting per invocation
+/// instead would be just as wrong in the other direction — a three-folder
+/// paste would run 0–100% three times.
+///
+/// So the meter belongs to the job: each invocation declares its weight in
+/// job units and feeds its own fraction in, and [`crate::narrate`] turns
+/// that into one monotonic percentage, one spoken cadence, and one window.
+struct OpProgress {
+    /// Present-tense verb for the window caption ("Copying").
+    verb: &'static str,
+    window: Option<crate::progress::ProgressHandle>,
+    speech: Sender<crate::speech::Utterance>,
+    meter: crate::narrate::Meter,
+    /// `None` when periodic speech is switched off; the window (and the
+    /// caller's completion summary) still report.
+    cadence: Option<crate::narrate::Cadence>,
+    /// Set by the progress window's Cancel button. Checked between
+    /// invocations so cancelling a 200-item paste stops the paste, not
+    /// just the file in flight.
+    cancelled: Arc<AtomicBool>,
+    /// File the window's "Current:" line shows. Primary source is the
+    /// stats record's `transferring` list (what is moving *now*); ordinary
+    /// log records fill in between ticks with the last file that finished.
+    /// Reading the stats record's top-level `object` — which does not
+    /// exist — is what left this line permanently blank.
+    current_file: String,
+    stats: navigator_rclone::Progress,
+}
+
+impl OpProgress {
+    fn new(ctx: &WorkerCtx, verb: &'static str, total_units: u64) -> Self {
+        let cadence = match ctx.announce_interval_secs {
+            0 => None,
+            n => Some(crate::narrate::Cadence::new(
+                Duration::from_secs(n as u64),
+                Instant::now(),
+            )),
+        };
+        let me = Self {
+            verb,
+            window: ctx.progress.clone(),
+            speech: ctx.speech.clone(),
+            meter: crate::narrate::Meter::new(total_units),
+            cadence,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            current_file: String::new(),
+            stats: navigator_rclone::Progress::default(),
+        };
+        if let Some(w) = me.window.as_ref() {
+            w.post_begin(&crate::narrate::window_title(verb, &me.meter));
+        }
+        me
+    }
+
+    /// Speak the opening line. Immediate feedback that the keystroke
+    /// registered, before rclone has produced a single statistic.
+    fn opening(&self, gerund: &str, first: Option<&str>) {
+        let _ = self.speech.try_send(crate::speech::Utterance {
+            text: crate::narrate::opening(gerund, self.meter.total(), first),
+            interrupt: false,
+        });
+    }
+
+    /// Start an invocation worth `weight` job units.
+    fn begin(&mut self, weight: u64) {
+        self.meter.begin(weight);
+        self.stats = navigator_rclone::Progress::default();
+        self.current_file.clear();
+    }
+
+    /// Fold the finished invocation into the job total. Called for
+    /// failures too — a failed item is one the user is no longer waiting
+    /// on, and freezing the percentage on it would be a worse lie than
+    /// counting it.
+    fn end(&mut self) {
+        self.meter.finish();
+        self.emit();
+    }
+
+    /// Account for units the job decided not to run at all (a skipped
+    /// item, a missing source). Without this the percentage stalls short
+    /// of 100 on a job that did everything it meant to.
+    fn skip(&mut self, units: u64) {
+        self.begin(units);
+        self.end();
+    }
+
+    fn on_progress(&mut self, p: navigator_rclone::Progress) {
+        if let Some(f) = p.fraction() {
+            self.meter.set_fraction(f);
+        }
+        if let Some(name) = p.current.as_deref().filter(|n| !n.is_empty()) {
+            self.current_file = name.to_string();
+        }
+        self.stats = p;
+        self.emit();
+    }
+
+    /// Feed one rclone log record. Returns the line to append to the
+    /// window's log pane, or `None` for records that would only be noise —
+    /// the once-a-second stats ticks, which the labels already render.
+    fn on_log(&mut self, ev: &navigator_rclone::LogEvent) -> Option<String> {
+        if ev.stats.is_some() {
+            return None;
+        }
+        if let Some(obj) = ev.object.as_deref().filter(|o| !o.is_empty()) {
+            self.current_file = obj.to_string();
+        }
+        Some(format!(
+            "[{:?}] {}",
+            ev.level.unwrap_or(navigator_rclone::LogLevel::Info),
+            ev.msg
+        ))
+    }
+
+    /// Push the current state to the window and, if the cadence allows,
+    /// to speech.
+    fn emit(&mut self) {
+        if let Some(w) = self.window.as_ref() {
+            w.post_status(crate::progress::Status {
+                title: crate::narrate::window_title(self.verb, &self.meter),
+                current: self.current_file.clone(),
+                detail: crate::narrate::window_status(&self.meter, &self.stats),
+                percent: self.meter.percent(),
+            });
+        }
+        let (Some(cadence), Some(text)) =
+            (self.cadence.as_mut(), crate::narrate::phrase(&self.meter))
+        else {
+            return;
+        };
+        if cadence.due(Instant::now(), &text) {
+            let _ = self.speech.try_send(crate::speech::Utterance {
+                text,
+                interrupt: false,
+            });
+        }
+    }
+
+    fn log_line(&self, line: &str) {
+        if let Some(w) = self.window.as_ref() {
+            w.post_log(line);
+        }
+    }
+
+    /// Wire the window's Cancel button to this invocation's child process.
+    /// Re-armed per invocation: the button has to kill whichever rclone is
+    /// running *now*, and set the job flag so the loop stops rather than
+    /// marching on to the next item.
+    fn arm_cancel(&self, canceller: navigator_rclone::Canceller) {
+        let Some(w) = self.window.as_ref() else {
+            return;
+        };
+        let flag = Arc::clone(&self.cancelled);
+        w.set_cancel(move || {
+            flag.store(true, Ordering::Release);
+            canceller.cancel();
+        });
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Close the job out in the window. Called once, by whoever owns the
+    /// job — never by `run_op`, which would flip the window to "Done."
+    /// after the first of several invocations.
+    ///
+    /// A cancelled job is never "Done." no matter what the last invocation
+    /// returned, so the flag overrides the caller's verdict here rather
+    /// than at each of the four call sites.
+    fn finish(&self, success: bool) {
+        if let Some(w) = self.window.as_ref() {
+            w.clear_cancel();
+            w.post_done(success && !self.cancelled());
+        }
+    }
+}
+
 impl WorkerCtx {
     fn say(&self, text: impl Into<String>, interrupt: bool) {
         let _ = self.speech.try_send(crate::speech::Utterance {
@@ -2382,6 +2568,12 @@ impl WorkerCtx {
         // If detection itself fails we must not assume "no conflict" — fall
         // back to naming the colliding top-level items, which we know exist.
         let mut detection_failed = false;
+
+        // We are about to spawn dry-runs, and rclone has to scan both trees
+        // before either answers. On a large or remote paste that is seconds
+        // of silence between Ctrl+V and anything happening, which reads as
+        // a dropped keystroke — say what we're waiting for.
+        self.say("checking destination", false);
 
         // Detection is two dry-run spawns per operation, so it has to batch
         // for the same reason the transfer does: overwriting 200 files would
@@ -2537,14 +2729,18 @@ impl WorkerCtx {
         cut: bool,
         mode: ConflictMode,
         total: usize,
+        prog: &mut OpProgress,
     ) -> (bool, Option<NavPath>) {
         let seq = BATCH_LIST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let list = match crate::batch::TempList::write(&group.names, seq) {
             Ok(l) => l,
             Err(e) => {
                 // Can't stage the list — report failure rather than
-                // silently falling back and copying nothing.
+                // silently falling back and copying nothing. The group's
+                // units still have to leave the meter, or the paste's
+                // percentage stalls short of 100 forever.
                 tracing::error!("could not write --files-from list: {e}");
+                prog.skip(group.names.len() as u64);
                 self.say("could not stage batch list", true);
                 return (false, None);
             }
@@ -2566,7 +2762,12 @@ impl WorkerCtx {
             }
         };
 
-        let exit_ok = self.run_one(op);
+        // The group is worth one job unit per listed file, so its internal
+        // progress moves the job's percentage in proportion to the share
+        // of the paste it actually carries.
+        prog.begin(group.names.len() as u64);
+        let exit_ok = self.run_op(op, prog);
+        prog.end();
         let first = group
             .names
             .first()
@@ -2641,6 +2842,15 @@ impl WorkerCtx {
             PasteChoice::Mode(m) => Some(m),
         };
 
+        // One meter for the whole paste, however many rclone invocations it
+        // turns into below. Armed after the conflict decision so a paste the
+        // user cancels never announces itself as starting.
+        let mut prog = OpProgress::new(&self, if cut { "Moving" } else { "Copying" }, total as u64);
+        prog.opening(
+            if cut { "moving" } else { "copying" },
+            sources.first().map(|s| s.file_name()),
+        );
+
         // Keep-both only renames the top-level items that actually collide;
         // everything else pastes normally.
         let colliding: std::collections::HashSet<String> = if mode.is_none() {
@@ -2657,21 +2867,15 @@ impl WorkerCtx {
         // its own renamed destination) and for Mirror (`sync --files-from`
         // would prune everything unlisted at the destination). Directories
         // always stay per-item: `--files-from` ignores them silently.
-        //
-        // `done` carries the batched count so the per-item narration below
-        // keeps counting against the original `total` rather than restarting
-        // at 1 for the leftovers.
-        let mut done = 0usize;
         let sources = match mode {
             Some(m) if m != ConflictMode::Mirror => {
                 let part = crate::batch::partition(&sources, |s| self.path_is_dir(s));
                 for group in &part.groups {
+                    if prog.cancelled() {
+                        break;
+                    }
                     let n = group.names.len();
-                    self.say(
-                        format!("copying {} items from {}", n, group.src_root.file_name()),
-                        false,
-                    );
-                    let (ok, first) = self.run_group(group, &dest_dir, cut, m, total);
+                    let (ok, first) = self.run_group(group, &dest_dir, cut, m, total, &mut prog);
                     if ok {
                         if first_created.is_none() {
                             first_created = first;
@@ -2679,7 +2883,6 @@ impl WorkerCtx {
                     } else {
                         failed += n as u32;
                     }
-                    done += n;
                 }
                 if !part.groups.is_empty() {
                     tracing::info!(
@@ -2693,8 +2896,10 @@ impl WorkerCtx {
             _ => sources,
         };
 
-        for (i, src) in sources.into_iter().enumerate() {
-            let i = i + done;
+        for src in sources.into_iter() {
+            if prog.cancelled() {
+                break;
+            }
             let dst_name = src.file_name().to_string();
             let dst = dest_dir.join(&dst_name);
 
@@ -2719,6 +2924,7 @@ impl WorkerCtx {
                             // Could not construct a valid NavPath — skip so
                             // we cannot accidentally overwrite.
                             skipped += 1;
+                            prog.skip(1);
                             self.say(format!("skipped {} (rename failed)", dst_name), false);
                             continue;
                         }
@@ -2756,8 +2962,12 @@ impl WorkerCtx {
                 }
             };
 
-            self.say(format!("{} of {}: {}", i + 1, total, effective_name), false);
-            if !self.run_one(op) {
+            // A directory is one job unit no matter how many files rclone
+            // finds inside it; its own byte fraction moves that unit.
+            prog.begin(1);
+            let ok = self.run_op(op, &mut prog);
+            prog.end();
+            if !ok {
                 failed += 1;
             } else if first_created.is_none() {
                 first_created = Some(dest_dir.join(&effective_name));
@@ -2769,6 +2979,13 @@ impl WorkerCtx {
         if let (Some(state), Some(target)) = (self.state.upgrade(), first_created) {
             state.set_pending_focus(target);
         }
+        if prog.cancelled() {
+            prog.finish(false);
+            self.say("cancelled", true);
+            self.refresh();
+            return;
+        }
+        prog.finish(failed == 0);
         self.say(
             crate::preflight::paste_summary(mode, total, failed, skipped, renamed),
             failed > 0,
@@ -2786,9 +3003,19 @@ impl WorkerCtx {
         let total = created.len();
         let mut failed = 0u32;
         let mut skipped = 0u32;
+        let mut prog = OpProgress::new(
+            &self,
+            if cut_mode { "Moving" } else { "Deleting" },
+            total as u64,
+        );
+        prog.opening("undoing", created.first().map(|c| c.file_name()));
         for (i, c) in created.iter().enumerate() {
+            if prog.cancelled() {
+                break;
+            }
             if !c.as_path().exists() {
                 skipped += 1;
+                prog.skip(1);
                 continue;
             }
             let op = if cut_mode {
@@ -2802,14 +3029,14 @@ impl WorkerCtx {
                     is_dir: self.path_is_dir(c),
                 }
             };
-            self.say(
-                format!("undo {} of {}: {}", i + 1, total, c.file_name()),
-                false,
-            );
-            if !self.run_one(op) {
+            prog.begin(1);
+            let ok = self.run_op(op, &mut prog);
+            prog.end();
+            if !ok {
                 failed += 1;
             }
         }
+        prog.finish(failed == 0);
         let msg = if failed == 0 && skipped == 0 {
             format!("undo done — {} items", total)
         } else if failed == 0 {
@@ -2835,19 +3062,31 @@ impl WorkerCtx {
         let _guard = self.state.upgrade().map(|s| s.op_guard());
         let total = pairs.len();
         let mut failed = 0u32;
-        for (i, (trash, original)) in pairs.into_iter().enumerate() {
-            self.say(
-                format!("deleting {} of {}: {}", i + 1, total, original.file_name()),
-                false,
-            );
+        // Each rename is instant and moves no bytes, so rclone has no
+        // stats to report — the meter runs purely on completed items,
+        // which is what makes "120 of 200" the only sensible narration
+        // here.
+        let mut prog = OpProgress::new(&self, "Deleting", total as u64);
+        prog.opening(
+            "deleting",
+            pairs.first().map(|(_, original)| original.file_name()),
+        );
+        for (trash, original) in pairs.into_iter() {
+            if prog.cancelled() {
+                break;
+            }
             let op = Operation::Rename {
                 src: original,
                 dst: trash,
             };
-            if !self.run_one(op) {
+            prog.begin(1);
+            let ok = self.run_op(op, &mut prog);
+            prog.end();
+            if !ok {
                 failed += 1;
             }
         }
+        prog.finish(failed == 0);
         let msg = if failed == 0 {
             format!("deleted {} items (undoable)", total)
         } else {
@@ -2869,29 +3108,42 @@ impl WorkerCtx {
         // after the refresh so the user lands back on (one of) the
         // undeleted items.
         let mut first_restored: Option<NavPath> = None;
-        for (i, (trash, original)) in pairs.into_iter().enumerate() {
+        let mut prog = OpProgress::new(&self, "Restoring", total as u64);
+        prog.opening(
+            "restoring",
+            pairs.first().map(|(_, original)| original.file_name()),
+        );
+        for (trash, original) in pairs.into_iter() {
+            if prog.cancelled() {
+                break;
+            }
             if !trash.as_path().exists() {
                 skipped += 1;
+                prog.skip(1);
                 continue;
             }
             if original.as_path().exists() {
                 // New item at original path — don't overwrite.
                 skipped += 1;
+                prog.skip(1);
                 continue;
             }
-            self.say(
-                format!("restoring {} of {}: {}", i + 1, total, original.file_name()),
-                false,
+            prog.begin(1);
+            let ok = self.run_op(
+                Operation::Rename {
+                    src: trash,
+                    dst: original.clone(),
+                },
+                &mut prog,
             );
-            if !self.run_one(Operation::Rename {
-                src: trash,
-                dst: original.clone(),
-            }) {
+            prog.end();
+            if !ok {
                 failed += 1;
             } else if first_restored.is_none() {
                 first_restored = Some(original);
             }
         }
+        prog.finish(failed == 0);
         let msg = if failed == 0 && skipped == 0 {
             format!("restored {} items", total)
         } else if failed == 0 {
@@ -2933,10 +3185,31 @@ impl WorkerCtx {
             .unwrap_or(false)
     }
 
-    /// Run one rclone process synchronously. Returns `true` on success.
+    /// Run one rclone process synchronously as a whole, self-contained
+    /// job. Returns `true` on success.
+    ///
+    /// For anything that takes more than one invocation — a paste, a batch
+    /// delete — use [`run_op`](Self::run_op) with a job-level
+    /// [`OpProgress`] instead, so the progress the user hears counts the
+    /// action rather than restarting at each process.
+    fn run_one(&self, op: Operation) -> bool {
+        let mut prog = OpProgress::new(self, op_verb(&op), 1);
+        prog.begin(1);
+        let ok = self.run_op(op, &mut prog);
+        prog.end();
+        prog.finish(ok);
+        ok
+    }
+
+    /// Run one rclone process synchronously, reporting into an existing
+    /// job. The caller owns `prog`: it must have called
+    /// [`OpProgress::begin`] with this invocation's weight beforehand and
+    /// [`OpProgress::end`] afterwards, and it — not this function — posts
+    /// the job's completion.
+    ///
     /// Errors are always surfaced via a modal dialog, regardless of the
     /// progress-window preference.
-    fn run_one(&self, op: Operation) -> bool {
+    fn run_op(&self, op: Operation, prog: &mut OpProgress) -> bool {
         let op_for_retry = op.clone();
         let handle = match self.rclone.spawn(op) {
             Ok(h) => h,
@@ -2947,68 +3220,17 @@ impl WorkerCtx {
                 return false;
             }
         };
-
-        // Wire the progress window if enabled. We can't open windows from
-        // a worker thread, so the UI thread opens it via a synchronous
-        // SendMessage when the first op starts — but for now we just
-        // route via the handle which the caller attached before spawn.
-        let progress = self.progress.clone();
-
-        // Throttle periodic speech announcements. `0` = disabled, only
-        // emit the final outcome; otherwise announce once per interval.
-        let interval = if self.announce_interval_secs == 0 {
-            None
-        } else {
-            Some(std::time::Duration::from_secs(
-                self.announce_interval_secs as u64,
-            ))
-        };
-        let mut last_spoken = std::time::Instant::now();
+        // Point the window's Cancel button at this child. Re-armed every
+        // invocation; without it the button was decorative — nothing ever
+        // installed a callback.
+        prog.arm_cancel(handle.canceller());
 
         for ev in handle.events.iter() {
             match ev {
-                navigator_rclone::op::OpEvent::Progress {
-                    bytes_done,
-                    bytes_total,
-                    current,
-                } => {
-                    if let Some(p) = progress.as_ref() {
-                        p.post_status(current.as_deref().unwrap_or(""), bytes_done, bytes_total);
-                    }
-                    if let Some(iv) = interval {
-                        let now = std::time::Instant::now();
-                        if now.duration_since(last_spoken) >= iv {
-                            last_spoken = now;
-                            let msg = if bytes_total > 0 {
-                                let pct = (bytes_done as f64 / bytes_total as f64 * 100.0) as u32;
-                                match current.as_deref() {
-                                    Some(name) if !name.is_empty() => {
-                                        format!("{} percent, {}", pct, name)
-                                    }
-                                    _ => format!("{} percent", pct),
-                                }
-                            } else {
-                                match current.as_deref() {
-                                    Some(name) if !name.is_empty() => name.to_string(),
-                                    _ => String::new(),
-                                }
-                            };
-                            if !msg.is_empty() {
-                                let _ = self.speech.try_send(crate::speech::Utterance {
-                                    text: msg,
-                                    interrupt: false,
-                                });
-                            }
-                        }
-                    }
-                }
+                navigator_rclone::op::OpEvent::Progress(p) => prog.on_progress(p),
                 navigator_rclone::op::OpEvent::Log(ev) => {
-                    if let Some(p) = progress.as_ref() {
-                        p.post_log(&format!(
-                            "[{:?}] {}",
-                            ev.level.unwrap_or(navigator_rclone::log::LogLevel::Info),
-                            ev.msg,
-                        ));
+                    if let Some(line) = prog.on_log(&ev) {
+                        prog.log_line(&line);
                     }
                 }
                 navigator_rclone::op::OpEvent::Done {
@@ -3017,10 +3239,13 @@ impl WorkerCtx {
                 } => {
                     if success {
                         prune_empty_src_dirs(&op_for_retry);
-                        if let Some(p) = progress.as_ref() {
-                            p.post_done(true);
-                        }
                         return true;
+                    }
+                    // A cancelled child exits non-zero. That is the user's
+                    // own doing, so it gets neither an error dialog nor a
+                    // UAC retry.
+                    if prog.cancelled() {
+                        return false;
                     }
                     // Failed. If the tail looks like a Windows ACL
                     // denial (writes to C:\, Program Files, etc.), retry
@@ -3057,15 +3282,9 @@ impl WorkerCtx {
                         match crate::elevated::run(&self.rclone, &op_for_retry) {
                             Ok(out) if out.success => {
                                 prune_empty_src_dirs(&op_for_retry);
-                                if let Some(p) = progress.as_ref() {
-                                    p.post_done(true);
-                                }
                                 return true;
                             }
                             Ok(out) => {
-                                if let Some(p) = progress.as_ref() {
-                                    p.post_done(false);
-                                }
                                 let elev_tail = out
                                     .log_tail
                                     .lines()
@@ -3102,9 +3321,6 @@ impl WorkerCtx {
                         }
                     }
 
-                    if let Some(p) = progress.as_ref() {
-                        p.post_done(false);
-                    }
                     crate::dialogs::show_error(
                         self.hwnd,
                         "File operation failed",
@@ -3119,6 +3335,23 @@ impl WorkerCtx {
             }
         }
         false
+    }
+}
+
+/// Present-tense verb for the progress window's caption. Used for one-off
+/// operations, where the op itself is the only clue about what the user
+/// asked for; batch jobs name their own verb up front.
+fn op_verb(op: &Operation) -> &'static str {
+    match op {
+        Operation::Copy { .. } | Operation::CopyBatch { .. } | Operation::CopyTo { .. } => {
+            "Copying"
+        }
+        Operation::Move { .. } | Operation::MoveBatch { .. } => "Moving",
+        // A rename is how we stage a trash-delete and how we undo one, so
+        // "Moving" is the honest label for all of them.
+        Operation::Rename { .. } => "Moving",
+        Operation::Delete { .. } => "Deleting",
+        Operation::Mkdir { .. } | Operation::Touch { .. } => "Creating",
     }
 }
 

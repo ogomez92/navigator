@@ -82,8 +82,15 @@ impl Default for Config {
 pub struct General {
     pub show_hidden: bool,
     pub show_system: bool,
-    /// Seconds between periodic progress announcements through prism.
-    /// `0` = only announce on completion.
+    /// Seconds between periodic progress announcements through prism
+    /// while a file operation runs. `0` = say nothing until it finishes.
+    ///
+    /// Defaults to 5, not 0: batching a paste into one rclone invocation
+    /// removed the per-item narration that used to make a long copy
+    /// audible, and this is what replaces it. An operation that completes
+    /// inside one interval still says nothing beyond its summary, so the
+    /// cadence only ever costs speech on operations long enough to want
+    /// it.
     pub announce_interval_secs: u32,
     /// Display times as "5 minutes ago" instead of "2026-04-22 14:07".
     pub show_relative_dates: bool,
@@ -107,7 +114,9 @@ impl Default for General {
         Self {
             show_hidden: false,
             show_system: false,
-            announce_interval_secs: 0,
+            // Roughly two utterances' worth of speech plus breathing room,
+            // so progress never queues up behind itself.
+            announce_interval_secs: 5,
             show_relative_dates: false,
             new_items_at_bottom: true,
             sort_mode: SortMode::Name,
