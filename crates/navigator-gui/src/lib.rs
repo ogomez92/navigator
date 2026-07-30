@@ -33,6 +33,7 @@ pub mod props;
 pub mod remote_cache;
 pub mod search;
 pub mod shortcut_editor;
+pub mod sound;
 pub mod speech;
 pub mod viewer;
 pub mod watcher;

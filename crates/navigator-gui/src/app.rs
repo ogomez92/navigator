@@ -12,7 +12,7 @@ use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use tracing::{error, warn};
 
-use navigator_config::ConfigHandle;
+use navigator_config::{ConfigHandle, SoundEvent};
 use navigator_core::{ConflictMode, NavPath};
 use navigator_fs::read_dir;
 use navigator_plugin_api::host::HostCallbacks;
@@ -23,6 +23,7 @@ use crate::remote_cache::RemoteCache;
 
 use crate::history::History;
 use crate::model::{Filter, Model};
+use crate::sound::SoundPlayer;
 use crate::speech::SpeechSink;
 use crate::window::{
     HwndSend, WMAPP_DIR_ERROR, WMAPP_DIR_LISTED, WMAPP_SEARCH_RESULTS, create as create_window,
@@ -68,6 +69,10 @@ pub struct AppState {
     pub initial_path: NavPath,
     pub model: Model,
     pub speech: SpeechSink,
+    /// Event-sound player. Resolves `SoundEvent` → `.wav` through the same
+    /// `ConfigHandle` on every call, so an Options change applies to the
+    /// very next event with no restart and no re-wiring.
+    pub sound: SoundPlayer,
     pub rclone: RcloneDriver,
     pub config: ConfigHandle,
     plugin_reg: OnceCell<Arc<PluginRegistry>>,
@@ -84,6 +89,13 @@ pub struct AppState {
     /// Set by `navigate_up` so Backspace / Alt+Up returns the caret to
     /// the folder the user just left, the way Explorer does.
     pending_focus: Mutex<Option<NavPath>>,
+    /// Sound the *next* `navigate` should play, consumed and reset to
+    /// [`SoundEvent::Navigate`] on every call. Every route into a folder
+    /// funnels through `navigate`, so "went up" / "went back" / "went
+    /// forward" can only be told apart by the caller — same reason
+    /// `suppress_history` exists two fields up, and set at the same call
+    /// sites.
+    next_nav_sound: Mutex<SoundEvent>,
     /// Incremental type-ahead prefix for the listview. We drive type-ahead
     /// ourselves instead of letting `SysListView32` accumulate chars in
     /// its private buffer — that buffer can't be cleared externally, so
@@ -216,6 +228,7 @@ impl AppState {
             initial_path: cfg.initial_path.clone(),
             model,
             speech: SpeechSink::start(),
+            sound: SoundPlayer::start(cfg.config.clone()),
             rclone: RcloneDriver::from_path().with_transfers(transfers),
             config: cfg.config.clone(),
             plugin_reg: OnceCell::new(),
@@ -225,6 +238,11 @@ impl AppState {
             suppress_history: Mutex::new(false),
             watcher: Mutex::new(None),
             pending_focus: Mutex::new(None),
+            // Seeded with Startup rather than Navigate: window creation
+            // navigates to the initial path, and that first listing *is*
+            // the app starting. Playing both would mean the startup chime
+            // and the folder chime cutting each other off on every launch.
+            next_nav_sound: Mutex::new(SoundEvent::Startup),
             type_ahead: Mutex::new((String::new(), std::time::Instant::now())),
             undo_stack: Mutex::new(Vec::new()),
             self_weak: OnceCell::new(),
@@ -459,11 +477,35 @@ impl AppState {
         self.speech.say(text, interrupt);
     }
 
+    /// Play the sound mapped to `ev`, if any. No-op when sounds are off or
+    /// the event has no file assigned.
+    pub fn play(&self, ev: SoundEvent) {
+        self.sound.play(ev);
+    }
+
+    /// Arm the sound the next `navigate` will play instead of the default
+    /// [`SoundEvent::Navigate`]. Set by `navigate_up` / `go_back` /
+    /// `go_forward` immediately before they call `navigate`.
+    fn set_next_nav_sound(&self, ev: SoundEvent) {
+        *self.next_nav_sound.lock() = ev;
+    }
+
     pub fn navigate(&self, path: NavPath) {
         let Some(hwnd) = self.hwnd() else {
             warn!("navigate before hwnd set; dropping");
             return;
         };
+        // Consume the armed cue unconditionally — even on the silent
+        // paths below — so a refresh can never leave a stale "went back"
+        // primed for the next real navigation.
+        let cue = std::mem::replace(&mut *self.next_nav_sound.lock(), SoundEvent::Navigate);
+        // `refresh()`, the sort/filter toggles and the Options View page
+        // all re-navigate to the folder already on screen. That is a
+        // redraw, not a move, and chiming on it would make every F5 and
+        // every completed file operation sound like a navigation.
+        if self.model.cwd().as_ref() != Some(&path) {
+            self.play(cue);
+        }
         // Clear type-ahead prefix so a letter pressed in the new folder
         // doesn't resume the previous folder's search buffer.
         self.reset_type_ahead();
@@ -551,6 +593,7 @@ impl AppState {
         match target {
             Some(p) => {
                 *self.suppress_history.lock() = true;
+                self.set_next_nav_sound(SoundEvent::Back);
                 self.navigate(p);
             }
             None => self.say("no previous folder", false),
@@ -562,6 +605,7 @@ impl AppState {
         match target {
             Some(p) => {
                 *self.suppress_history.lock() = true;
+                self.set_next_nav_sound(SoundEvent::Forward);
                 self.navigate(p);
             }
             None => self.say("no forward folder", false),
@@ -660,6 +704,7 @@ impl AppState {
             // on it. Matching for folders is by name; for drive roots →
             // This PC we match via `drive_path_from_display` inverse.
             *self.pending_focus.lock() = Some(cwd.clone());
+            self.set_next_nav_sound(SoundEvent::NavigateUp);
             if let Some(parent) = cwd.parent() {
                 self.navigate(parent);
             } else {
@@ -979,6 +1024,7 @@ impl AppState {
             ts: crate::clipboard::now_ts(),
         });
         self.push_undo(UndoAction::ClipChange { prev });
+        self.play(SoundEvent::Copy);
         self.say(&format!("{} items copied to clipboard", n), false);
     }
 
@@ -1003,6 +1049,7 @@ impl AppState {
             ts: crate::clipboard::now_ts(),
         });
         self.push_undo(UndoAction::ClipChange { prev });
+        self.play(SoundEvent::Cut);
         self.say(&format!("{} items cut to clipboard", n), false);
     }
 
@@ -1040,6 +1087,11 @@ impl AppState {
                 dest: None,
                 ts: crate::clipboard::now_ts(),
             });
+            self.play(if cut_mode {
+                SoundEvent::Cut
+            } else {
+                SoundEvent::Copy
+            });
             self.say(
                 &format!(
                     "{} items {} to clipboard",
@@ -1076,6 +1128,11 @@ impl AppState {
                 ts: crate::clipboard::now_ts(),
             });
             self.push_undo(UndoAction::ClipChange { prev });
+            self.play(if cut_mode {
+                SoundEvent::Cut
+            } else {
+                SoundEvent::Copy
+            });
         }
         self.say(
             &format!(
@@ -1396,6 +1453,7 @@ impl AppState {
     fn spawn_remote_purge(&self, targets: Vec<(NavPath, bool)>) {
         let rclone = self.rclone.clone();
         let speech = self.speech.handle();
+        let sound = self.sound.clone();
         let state_weak = self.self_weak.get().cloned().unwrap_or_else(Weak::new);
         let parent_hint = targets.first().and_then(|(p, _)| p.parent());
 
@@ -1436,6 +1494,11 @@ impl AppState {
                         }
                     }
                 }
+                sound.play(if fail_count == 0 {
+                    SoundEvent::DeleteDone
+                } else {
+                    SoundEvent::Error
+                });
                 let _ = speech.send(crate::speech::Utterance {
                     text: if fail_count == 0 {
                         format!("deleted {} remote item(s)", ok_count)
@@ -1560,6 +1623,7 @@ impl AppState {
         WorkerCtx {
             rclone: self.rclone.clone().with_transfers(transfers),
             speech: self.speech.handle(),
+            sound: self.sound.clone(),
             scan_tx: self.scan_tx.clone(),
             refresh_target: self.model.cwd(),
             hwnd: self.hwnd(),
@@ -1812,11 +1876,12 @@ impl AppState {
         };
         let opts = self.config.read().extraction;
         let speech = self.speech.handle();
+        let sound = self.sound.clone();
         let total = extractable.len();
         self.say(&format!("extracting {} archive(s)", total), false);
         std::thread::Builder::new()
             .name("navigator-extract".into())
-            .spawn(move || crate::extract::run_extract(extractable, opts, seven_zip, speech))
+            .spawn(move || crate::extract::run_extract(extractable, opts, seven_zip, speech, sound))
             .expect("spawn extract worker");
     }
 
@@ -1858,11 +1923,12 @@ impl AppState {
             .filter(|p| local.iter().any(|l| l == p))
             .unwrap_or_else(|| local[0].clone());
         let speech = self.speech.handle();
+        let sound = self.sound.clone();
         let total = local.len();
         self.say(&format!("zipping {} item(s)", total), false);
         std::thread::Builder::new()
             .name("navigator-zip".into())
-            .spawn(move || crate::extract::run_zip(local, primary, seven_zip, speech))
+            .spawn(move || crate::extract::run_zip(local, primary, seven_zip, speech, sound))
             .expect("spawn zip worker");
     }
 
@@ -2300,6 +2366,9 @@ fn post_viewer(hwnd: HwndSend, title: String, body: String) {
 struct WorkerCtx {
     rclone: RcloneDriver,
     speech: Sender<crate::speech::Utterance>,
+    /// Event sounds. Carried by value like the speech sender so a worker
+    /// never has to upgrade the `Weak<AppState>` just to chime.
+    sound: SoundPlayer,
     scan_tx: Sender<ScanCmd>,
     refresh_target: Option<NavPath>,
     hwnd: Option<HwndSend>,
@@ -2507,6 +2576,22 @@ impl WorkerCtx {
         });
     }
 
+    fn play(&self, ev: SoundEvent) {
+        self.sound.play(ev);
+    }
+
+    /// Sound for a finished job: the outcome always wins over the verb, so
+    /// a failed or cancelled copy can never chime like a successful one.
+    fn play_outcome(&self, cancelled: bool, failed: bool, done: SoundEvent) {
+        self.play(if cancelled {
+            SoundEvent::Cancelled
+        } else if failed {
+            SoundEvent::Error
+        } else {
+            done
+        });
+    }
+
     fn refresh(&self) {
         if let (Some(path), Some(hwnd)) = (self.refresh_target.clone(), self.hwnd) {
             let _ = self.scan_tx.send(ScanCmd::List(path, hwnd));
@@ -2515,7 +2600,17 @@ impl WorkerCtx {
 
     fn run_single(self, op: Operation) {
         let _guard = self.state.upgrade().map(|s| s.op_guard());
+        // Pick the completion sound before the op consumes it. `Mkdir` and
+        // `Touch` are both "something new appeared"; `Rename` is its own
+        // event because F2 is a distinct enough gesture to want distinct
+        // feedback.
+        let done = match &op {
+            Operation::Rename { .. } => SoundEvent::RenameDone,
+            Operation::Mkdir { .. } | Operation::Touch { .. } => SoundEvent::NewItem,
+            _ => SoundEvent::CopyDone,
+        };
         let ok = self.run_one(op);
+        self.play_outcome(/*cancelled=*/ false, !ok, done);
         self.say(if ok { "done" } else { "operation failed" }, !ok);
         self.refresh();
     }
@@ -2527,6 +2622,7 @@ impl WorkerCtx {
     fn run_new_file(self, file: NavPath) {
         let _guard = self.state.upgrade().map(|s| s.op_guard());
         let ok = self.run_one(Operation::Touch { file: file.clone() });
+        self.play_outcome(/*cancelled=*/ false, !ok, SoundEvent::NewItem);
         if ok {
             self.say(format!("created {}", file.file_name()), false);
             if let Some(state) = self.state.upgrade() {
@@ -2835,12 +2931,17 @@ impl WorkerCtx {
         };
         let mode = match choice {
             PasteChoice::Cancel => {
+                self.play(SoundEvent::Cancelled);
                 self.say("cancelled", false);
                 return;
             }
             PasteChoice::KeepBoth => None,
             PasteChoice::Mode(m) => Some(m),
         };
+        // Announced only once the paste is actually going ahead — a paste
+        // the user backs out of at the conflict dialog must not have
+        // chimed as if it started.
+        self.play(SoundEvent::PasteStart);
 
         // One meter for the whole paste, however many rclone invocations it
         // turns into below. Armed after the conflict decision so a paste the
@@ -2979,13 +3080,20 @@ impl WorkerCtx {
         if let (Some(state), Some(target)) = (self.state.upgrade(), first_created) {
             state.set_pending_focus(target);
         }
+        let done = if cut {
+            SoundEvent::MoveDone
+        } else {
+            SoundEvent::CopyDone
+        };
         if prog.cancelled() {
             prog.finish(false);
+            self.play_outcome(/*cancelled=*/ true, failed > 0, done);
             self.say("cancelled", true);
             self.refresh();
             return;
         }
         prog.finish(failed == 0);
+        self.play_outcome(/*cancelled=*/ false, failed > 0, done);
         self.say(
             crate::preflight::paste_summary(mode, total, failed, skipped, renamed),
             failed > 0,
@@ -3037,6 +3145,7 @@ impl WorkerCtx {
             }
         }
         prog.finish(failed == 0);
+        self.play_outcome(prog.cancelled(), failed > 0, SoundEvent::UndoDone);
         let msg = if failed == 0 && skipped == 0 {
             format!("undo done — {} items", total)
         } else if failed == 0 {
@@ -3087,6 +3196,7 @@ impl WorkerCtx {
             }
         }
         prog.finish(failed == 0);
+        self.play_outcome(prog.cancelled(), failed > 0, SoundEvent::DeleteDone);
         let msg = if failed == 0 {
             format!("deleted {} items (undoable)", total)
         } else {
@@ -3144,6 +3254,7 @@ impl WorkerCtx {
             }
         }
         prog.finish(failed == 0);
+        self.play_outcome(prog.cancelled(), failed > 0, SoundEvent::UndoDone);
         let msg = if failed == 0 && skipped == 0 {
             format!("restored {} items", total)
         } else if failed == 0 {

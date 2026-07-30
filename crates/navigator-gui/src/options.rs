@@ -62,6 +62,11 @@ const ID_BTN_HOTSPOT_CLEAR_ALL: u16 = 502;
 const ID_CHECK_COL_SIZE: u16 = 600;
 const ID_CHECK_COL_TYPE: u16 = 601;
 const ID_CHECK_COL_MODIFIED: u16 = 602;
+const ID_CHECK_SOUNDS: u16 = 900;
+const ID_LIST_SOUND_EVENTS: u16 = 901;
+const ID_COMBO_SOUND_FILE: u16 = 902;
+const ID_BTN_SOUND_FOLDER: u16 = 903;
+const ID_BTN_SOUND_RESCAN: u16 = 904;
 
 /// Open the Options property sheet as a modal. Blocks until user closes.
 pub fn open(parent: HWND, state: Arc<AppState>) -> windows::core::Result<()> {
@@ -77,6 +82,7 @@ pub fn open(parent: HWND, state: Arc<AppState>) -> windows::core::Result<()> {
     let title_speech: Vec<u16> = "Speech\0".encode_utf16().collect();
     let title_rclone: Vec<u16> = "Rclone\0".encode_utf16().collect();
     let title_extract: Vec<u16> = "Extraction\0".encode_utf16().collect();
+    let title_sounds: Vec<u16> = "Sounds\0".encode_utf16().collect();
     let title_plugins: Vec<u16> = "Plugins\0".encode_utf16().collect();
     let title_hotspots: Vec<u16> = "Hotspots\0".encode_utf16().collect();
 
@@ -129,6 +135,13 @@ pub fn open(parent: HWND, state: Arc<AppState>) -> windows::core::Result<()> {
             &title_extract,
             hinstance,
             Some(page_extract_proc),
+            make_lparam(),
+        ),
+        make_page(
+            &page_template,
+            &title_sounds,
+            hinstance,
+            Some(page_sounds_proc),
             make_lparam(),
         ),
         make_page(
@@ -765,6 +778,289 @@ unsafe extern "system" fn page_extract_proc(
     }
 }
 
+// --- Sounds page ----------------------------------------------------------
+
+struct SoundsData {
+    state: Arc<AppState>,
+    check_enabled: HWND,
+    list_events: HWND,
+    combo_files: HWND,
+    /// `.wav` filenames currently in the sounds folder, in combo order.
+    /// Combo index 0 is "(none)", so a file at `files[i]` sits at combo
+    /// index `i + 1`.
+    files: Vec<String>,
+    /// Pending assignment per [`SoundEvent::ALL`] slot; empty = silent.
+    /// Edits live here until PSN_APPLY so Cancel really cancels — the only
+    /// thing that happens immediately is the preview playback.
+    assignments: Vec<String>,
+}
+
+/// Combo index 0 is the "no sound" entry; real files start at 1.
+const SOUND_NONE_LABEL: &str = "(none)";
+
+unsafe extern "system" fn page_sounds_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    use windows::Win32::UI::WindowsAndMessaging::{CBN_SELCHANGE, LBN_SELCHANGE};
+
+    match msg {
+        WM_INITDIALOG => unsafe {
+            let state = take_state_from_init(lp);
+
+            let lbl_dir = create_label(hwnd, "WAV files are read from:", 12, 12, 440);
+            let dir_text = navigator_config::sounds_dir().display().to_string();
+            let lbl_path = create_label(hwnd, &dir_text, 12, 32, 440);
+            let check_enabled =
+                create_checkbox(hwnd, "&Enable event sounds", 12, 58, ID_CHECK_SOUNDS);
+            let lbl_events = create_label(hwnd, "&Events:", 12, 88, 440);
+            let list_events = create_listbox(hwnd, 12, 108, 440, 170, ID_LIST_SOUND_EVENTS);
+            let lbl_combo = create_label(
+                hwnd,
+                "&Sound for the selected event (plays when chosen):",
+                12,
+                288,
+                440,
+            );
+            let combo_files = create_combo(hwnd, 12, 308, 440, ID_COMBO_SOUND_FILE, &[], 0);
+            let btn_folder = create_button(
+                hwnd,
+                "&Open sounds folder",
+                12,
+                340,
+                170,
+                26,
+                ID_BTN_SOUND_FOLDER,
+            );
+            let btn_rescan = create_button(
+                hwnd,
+                "&Rescan folder",
+                192,
+                340,
+                130,
+                26,
+                ID_BTN_SOUND_RESCAN,
+            );
+
+            for h in [
+                lbl_dir,
+                lbl_path,
+                check_enabled,
+                lbl_events,
+                list_events,
+                lbl_combo,
+                combo_files,
+                btn_folder,
+                btn_rescan,
+            ] {
+                apply_font_to(h);
+            }
+
+            let (enabled, assignments) = {
+                let cfg = state.config.read();
+                (
+                    cfg.sounds.enabled,
+                    navigator_config::SoundEvent::ALL
+                        .iter()
+                        .map(|ev| cfg.sounds.file_for(*ev).unwrap_or("").to_string())
+                        .collect::<Vec<String>>(),
+                )
+            };
+            set_check(check_enabled, enabled);
+
+            let data = Box::new(SoundsData {
+                state,
+                check_enabled,
+                list_events,
+                combo_files,
+                files: Vec::new(),
+                assignments,
+            });
+            let raw = Box::into_raw(data);
+            SetWindowLongPtrW(hwnd, DWLP_USER, raw as isize);
+
+            let d = &mut *raw;
+            reload_sound_files(d);
+            refresh_sound_event_list(d);
+            // Land on the first event so the combo below is never showing a
+            // selection that belongs to nothing.
+            listbox_set_selection(d.list_events, Some(0));
+            sync_sound_combo(d);
+            1
+        },
+        WM_COMMAND => unsafe {
+            let raw = GetWindowLongPtrW(hwnd, DWLP_USER);
+            if raw == 0 {
+                return 0;
+            }
+            let d = &mut *(raw as *mut SoundsData);
+            let id = (wp.0 & 0xFFFF) as u16;
+            let code = ((wp.0 >> 16) & 0xFFFF) as u32;
+            match (id, code) {
+                // A different event is selected — show what it is mapped to.
+                (ID_LIST_SOUND_EVENTS, LBN_SELCHANGE) => {
+                    sync_sound_combo(d);
+                    1
+                }
+                // A file was chosen — assign it and play it straight away.
+                (ID_COMBO_SOUND_FILE, CBN_SELCHANGE) => {
+                    assign_selected_sound(d);
+                    1
+                }
+                (ID_BTN_SOUND_FOLDER, _) => {
+                    open_sounds_folder();
+                    1
+                }
+                (ID_BTN_SOUND_RESCAN, _) => {
+                    reload_sound_files(d);
+                    refresh_sound_event_list(d);
+                    sync_sound_combo(d);
+                    1
+                }
+                _ => 0,
+            }
+        },
+        WM_NOTIFY => unsafe {
+            let hdr = &*(lp.0 as *const NMHDR);
+            if hdr.code == PSN_APPLY {
+                let raw = GetWindowLongPtrW(hwnd, DWLP_USER);
+                if raw != 0 {
+                    let d = &mut *(raw as *mut SoundsData);
+                    let enabled = get_check(d.check_enabled);
+                    let assignments = d.assignments.clone();
+                    d.state.config.with_mut(|c| {
+                        c.sounds.enabled = enabled;
+                        for (ev, file) in navigator_config::SoundEvent::ALL.iter().zip(&assignments)
+                        {
+                            c.sounds.set(*ev, Some(file.as_str()));
+                        }
+                    });
+                    let _ = d.state.config.save();
+                }
+                set_apply_ok(hwnd);
+                return 1;
+            }
+            0
+        },
+        0x0002 => unsafe {
+            let raw = GetWindowLongPtrW(hwnd, DWLP_USER);
+            if raw != 0 {
+                let _ = Box::from_raw(raw as *mut SoundsData);
+                SetWindowLongPtrW(hwnd, DWLP_USER, 0);
+            }
+            0
+        },
+        _ => 0,
+    }
+}
+
+/// Re-read the sounds folder and rebuild the combo's item list. Called on
+/// open and from Rescan, so a user can drop WAVs in with Options still up.
+fn reload_sound_files(d: &mut SoundsData) {
+    d.files = navigator_config::list_sounds();
+    combo_reset(d.combo_files);
+    combo_add(d.combo_files, SOUND_NONE_LABEL);
+    for f in &d.files {
+        combo_add(d.combo_files, f);
+    }
+}
+
+/// Rebuild the event listbox, preserving the selected row so a rescan or
+/// an assignment doesn't move the user's place.
+fn refresh_sound_event_list(d: &SoundsData) {
+    let prev = listbox_selection(d.list_events);
+    listbox_reset(d.list_events);
+    for (i, ev) in navigator_config::SoundEvent::ALL.iter().enumerate() {
+        listbox_add(d.list_events, &sound_event_row(d, i, *ev));
+    }
+    if let Some(p) = prev.filter(|p| *p < navigator_config::SoundEvent::ALL.len()) {
+        listbox_set_selection(d.list_events, Some(p));
+    }
+}
+
+/// One listbox row: the event and what it currently plays. An assignment
+/// naming a file that isn't in the folder is flagged rather than silently
+/// shown as configured — it will not play, and that should be visible here
+/// rather than discovered when the event fires and nothing happens.
+fn sound_event_row(d: &SoundsData, idx: usize, ev: navigator_config::SoundEvent) -> String {
+    match d.assignments.get(idx).map(String::as_str) {
+        Some("") | None => format!("{} — {}", ev.label(), SOUND_NONE_LABEL),
+        Some(f) if d.files.iter().any(|x| x == f) => format!("{} — {}", ev.label(), f),
+        Some(f) => format!("{} — {} (missing)", ev.label(), f),
+    }
+}
+
+/// Point the combo at whatever the selected event currently plays.
+fn sync_sound_combo(d: &SoundsData) {
+    let Some(idx) = listbox_selection(d.list_events) else {
+        combo_set_selection(d.combo_files, 0);
+        return;
+    };
+    let assigned = d.assignments.get(idx).map(String::as_str).unwrap_or("");
+    let pos = d
+        .files
+        .iter()
+        .position(|f| f == assigned)
+        // +1 to skip the "(none)" row; an assignment we can't find on disk
+        // falls back to "(none)" so the combo never claims a file it can't
+        // play — the listbox row is where the missing name is reported.
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    combo_set_selection(d.combo_files, pos);
+}
+
+/// Apply the combo's current file to the selected event and preview it.
+/// Preview ignores the enabled checkbox on purpose: auditioning a file is
+/// how you decide whether to switch sounds on at all.
+fn assign_selected_sound(d: &mut SoundsData) {
+    let Some(ev_idx) = listbox_selection(d.list_events) else {
+        return;
+    };
+    let Some(combo_idx) = combo_selection(d.combo_files) else {
+        return;
+    };
+    let file = if combo_idx == 0 {
+        String::new()
+    } else {
+        match d.files.get(combo_idx - 1) {
+            Some(f) => f.clone(),
+            None => return,
+        }
+    };
+    if let Some(slot) = d.assignments.get_mut(ev_idx) {
+        *slot = file.clone();
+    }
+    refresh_sound_event_list(d);
+    if !file.is_empty()
+        && let Some(path) = navigator_config::sound_path(&file)
+    {
+        d.state.sound.play_file(path);
+    }
+}
+
+/// Create the sounds folder if needed and open it in the shell, so the
+/// user can drop WAVs in without hunting for the install directory.
+fn open_sounds_folder() {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let dir = navigator_config::sounds_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let w: Vec<u16> = dir
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(w.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
 // --- Plugins page ---------------------------------------------------------
 
 struct PluginsData {
@@ -1103,6 +1399,78 @@ fn combo_selection(h: HWND) -> Option<usize> {
     let r = unsafe { SendMessageW(h, CB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))) };
     // CB_ERR (-1) means no selection.
     if r.0 < 0 { None } else { Some(r.0 as usize) }
+}
+
+fn combo_reset(h: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::CB_RESETCONTENT;
+    unsafe {
+        SendMessageW(h, CB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
+    }
+}
+
+fn combo_add(h: HWND, text: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::CB_ADDSTRING;
+    let w: Vec<u16> = text.encode_utf16().chain([0]).collect();
+    unsafe {
+        SendMessageW(
+            h,
+            CB_ADDSTRING,
+            Some(WPARAM(0)),
+            Some(LPARAM(w.as_ptr() as isize)),
+        );
+    }
+}
+
+/// Set a combo's selection *without* generating `CBN_SELCHANGE` — that
+/// notification is reserved for user action. Sending it programmatically
+/// (as `CB_SETCURSEL` deliberately does not) would make selecting an event
+/// in the listbox re-assign and replay its own sound.
+fn combo_set_selection(h: HWND, idx: usize) {
+    use windows::Win32::UI::WindowsAndMessaging::CB_SETCURSEL;
+    unsafe {
+        SendMessageW(h, CB_SETCURSEL, Some(WPARAM(idx)), Some(LPARAM(0)));
+    }
+}
+
+fn listbox_reset(h: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::LB_RESETCONTENT;
+    unsafe {
+        SendMessageW(h, LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
+    }
+}
+
+fn listbox_add(h: HWND, text: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::LB_ADDSTRING;
+    let w: Vec<u16> = text.encode_utf16().chain([0]).collect();
+    unsafe {
+        SendMessageW(
+            h,
+            LB_ADDSTRING,
+            Some(WPARAM(0)),
+            Some(LPARAM(w.as_ptr() as isize)),
+        );
+    }
+}
+
+/// Selected index of a single-selection listbox, or `None` (LB_ERR).
+fn listbox_selection(h: HWND) -> Option<usize> {
+    use windows::Win32::UI::WindowsAndMessaging::LB_GETCURSEL;
+    let r = unsafe { SendMessageW(h, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))) };
+    if r.0 < 0 { None } else { Some(r.0 as usize) }
+}
+
+/// Set (or with `None`, clear) a listbox selection. Like `CB_SETCURSEL`
+/// this does not raise `LBN_SELCHANGE`, so callers that need the combo
+/// resynced must call [`sync_sound_combo`] themselves.
+fn listbox_set_selection(h: HWND, idx: Option<usize>) {
+    use windows::Win32::UI::WindowsAndMessaging::LB_SETCURSEL;
+    let w = match idx {
+        Some(i) => i,
+        None => usize::MAX, // (WPARAM)-1 clears the selection
+    };
+    unsafe {
+        SendMessageW(h, LB_SETCURSEL, Some(WPARAM(w)), Some(LPARAM(0)));
+    }
 }
 
 fn create_label(parent: HWND, text: &str, x: i32, y: i32, w: i32) -> HWND {

@@ -12,9 +12,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 pub mod shortcuts;
+pub mod sounds;
 
 pub use navigator_core::ConflictMode as PasteConflictMode;
 pub use shortcuts::{HOTSPOT_COUNT, InternalCommand, ShortcutAction, ShortcutChord};
+pub use sounds::{SOUNDS_DIR_NAME, SoundEvent, Sounds, list_sounds, sound_path, sounds_dir};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -46,6 +48,7 @@ pub struct Config {
     pub plugins: Plugins,
     pub rclone: Rclone,
     pub extraction: Extraction,
+    pub sounds: Sounds,
     pub recent_paths: Vec<String>,
     #[serde(default = "shortcuts::default_actions")]
     pub shortcuts: Vec<ShortcutAction>,
@@ -70,6 +73,7 @@ impl Default for Config {
             plugins: Plugins::default(),
             rclone: Rclone::default(),
             extraction: Extraction::default(),
+            sounds: Sounds::default(),
             recent_paths: Vec::new(),
             shortcuts: shortcuts::default_actions(),
             hotspots: default_hotspots(),

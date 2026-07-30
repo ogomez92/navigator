@@ -41,6 +41,7 @@ Scalable, accessible Windows file explorer in Rust.
 - **File operations via `rclone`.** No `SHFileOperation`. Copy/cut/paste spawn `rclone copyto` / `moveto` with `--use-json-log` so we can parse errors and detect up-front with `--dry-run` exactly what a paste would destroy.
 - **Paste asks a merge question, not a per-file one.** There's no "this file exists — replace it?" dialog for every collision. A paste runs in a mode (`Add new only`, `Update`, `Replace`, or `Mirror`) and only stops to confirm when a dry-run proves something at the destination would actually be lost — so pasting into a populated folder is usually silent. The default, `Update`, copies what differs and never replaces a destination file that's *newer* than the source. `Ctrl+Shift+V` picks the mode per paste and is the only route to `Mirror`, which makes the destination match the source exactly and deletes what the source doesn't have. Set the default under Options → Rclone.
 - **Progress you can listen to, without a file-by-file monologue.** A long copy or delete announces where it is every few seconds — "45 percent, 90 of 200" — and nothing at all if it finishes faster than that. It counts the whole operation, not whichever `rclone` process happens to be running, so the number only ever climbs. Change the cadence (or switch it off with `0`) under Options → Speech. Options → Rclone can also open a progress window with the current file, transfer rate, ETA and a working Cancel button.
+- **Event sounds.** Every major event — folder opened, went up, went back, copy/move/delete finished, extraction done, something failed — can play a `.wav`. Drop files in `navigator_sounds/` next to the exe and map them under Options → Sounds; picking one in the combo plays it straight away so you can audition without leaving the dialog. Nothing is bundled, so it's silent until you set it up. See [Sounds](#sounds).
 - **Extensible** through Rust plugins loaded as DLLs via a stable C ABI (`navigator-plugin-api`).
 - **Fast.** Directory listing via raw `FindFirstFileW`. Virtual `ListView` (LVS_OWNERDATA) so million-entry folders render instantly.
 
@@ -131,6 +132,54 @@ flow:
    No leaves the staged copy alone.
 4. Staged files are never auto-purged. Same stance as `.trash/`: if you
    want to free disk, delete `.remote-cache/` manually.
+
+## Sounds
+
+navigator can play a short `.wav` when something happens. It's off the shelf
+silent — no sounds ship with the app — so setting it up is two steps:
+
+1. Put `.wav` files in **`navigator_sounds/`** next to the exe (Options →
+   Sounds → **Open sounds folder** creates it and opens it for you).
+2. Open **Options → Sounds**, pick an event in the list, then pick a file from
+   the combo below it. **The file plays the moment you select it**, including
+   when you arrow through the combo, so you can audition the whole folder
+   without clicking anything. Choose `(none)` to silence an event.
+
+Assignments are staged until you press OK — Cancel discards them. **Rescan
+folder** re-reads the directory if you add files while the dialog is open, and
+an event pointing at a file that's no longer there is shown as `(missing)`
+rather than quietly failing when it fires.
+
+The events:
+
+| Group      | Events                                                                     |
+|------------|----------------------------------------------------------------------------|
+| Lifecycle  | Application started                                                        |
+| Navigation | Opened a folder · Went up one folder · Went back / forward in history       |
+| Clipboard  | Copied to clipboard · Cut to clipboard · Paste started                      |
+| Operations | Copy / Move / Delete / Rename / Undo finished · New file or folder created  |
+| Archives   | Extraction finished · Zip finished                                          |
+| Other      | Search finished · Operation cancelled · Operation failed                    |
+
+A failed or cancelled operation always plays *its* sound rather than the
+success one, so a copy that didn't work can never sound like a copy that did.
+Only one sound plays at a time: a new event cuts off whatever was still
+ringing, so what you hear is always the most recent thing that happened.
+
+Stored under `[sounds]` in `config.toml`:
+
+```toml
+[sounds]
+enabled = true      # master mute; keeps assignments
+
+[sounds.events]
+copy_done = "done.wav"
+navigate  = "tick.wav"
+error     = "uhoh.wav"
+```
+
+Filenames are resolved inside `navigator_sounds/` only — a path or `..` in the
+value is rejected.
 
 ## Key bindings
 

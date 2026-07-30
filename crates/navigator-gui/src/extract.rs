@@ -226,6 +226,7 @@ pub fn run_extract(
     opts: Extraction,
     seven_zip: PathBuf,
     speech: Sender<Utterance>,
+    sound: crate::sound::SoundPlayer,
 ) {
     let total = sources.len();
     let mut ok = 0usize;
@@ -320,6 +321,11 @@ pub fn run_extract(
         }
     }
 
+    sound.play(if failed == 0 {
+        navigator_config::SoundEvent::ExtractDone
+    } else {
+        navigator_config::SoundEvent::Error
+    });
     let summary = if failed == 0 {
         format!("extracted {} of {}", ok, total)
     } else {
@@ -407,6 +413,7 @@ pub fn run_zip(
     primary: NavPath,
     seven_zip: PathBuf,
     speech: Sender<Utterance>,
+    sound: crate::sound::SoundPlayer,
 ) {
     let item_paths: Vec<PathBuf> = items.iter().map(|p| p.as_path().to_path_buf()).collect();
     let single_folder = item_paths.len() == 1 && item_paths[0].is_dir();
@@ -434,6 +441,7 @@ pub fn run_zip(
 
     match cmd.status() {
         Ok(s) if s.success() => {
+            sound.play(navigator_config::SoundEvent::ZipDone);
             let _ = speech.try_send(Utterance {
                 text: format!("created {}", dest_label),
                 interrupt: false,
@@ -441,6 +449,7 @@ pub fn run_zip(
         }
         Ok(s) => {
             warn!("7z zip exit {} into {:?}", s.code().unwrap_or(-1), dest);
+            sound.play(navigator_config::SoundEvent::Error);
             let _ = speech.try_send(Utterance {
                 text: "zip failed".into(),
                 interrupt: true,
@@ -448,6 +457,7 @@ pub fn run_zip(
         }
         Err(e) => {
             warn!("7z spawn: {}", e);
+            sound.play(navigator_config::SoundEvent::Error);
             let _ = speech.try_send(Utterance {
                 text: format!("7z failed to start: {}", e),
                 interrupt: true,

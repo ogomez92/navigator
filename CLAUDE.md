@@ -17,7 +17,7 @@ cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
 
-Personal install: `./r.sh` (Git Bash / WSL) or `r.cmd` (PowerShell / cmd) builds `--release` and copies `target/release/navigator.exe` to a personal bin dir as `x.exe`. Destination defaults to `~/stuff/bin/x.exe` (`%USERPROFILE%\stuff\bin\x.exe`) and is overridable via the `NAVIGATOR_INSTALL` env var.
+Personal install: `./r.sh` (Git Bash / WSL) or `r.cmd` (PowerShell / cmd) builds `--release` and copies `target/release/navigator.exe` to a personal bin dir as `x.exe`. Destination defaults to `~/stuff/bin/x.exe` (`%USERPROFILE%\stuff\bin\x.exe`) and is overridable via the `NAVIGATOR_INSTALL` env var. Both scripts then `rclone sync` the repo's `navigator_sounds/` into `<exe_dir>/navigator_sounds` — `sync`, not `copy`, so deleting a `.wav` from the repo folder also removes it from the install. That makes the repo folder the source of truth: a `.wav` dropped straight into the installed folder is wiped on the next build.
 
 Runtime env: `NAVIGATOR_LOG` sets the `tracing` `EnvFilter` (default `info`).
 
@@ -55,6 +55,7 @@ One UI thread (the Win32 message loop) and several workers. All cross-thread com
 - **`navigator-plugin-nav`** — bridges plugin nav requests into `AppState::navigate` via a weak `Arc` so it dies with the app.
 - **`navigator-rclone-op` / `navigator-batch-op` / `navigator-batch-delete`** — short-lived per-operation threads. They hold a `WorkerCtx` (cheap clone of rclone driver, speech sender, scan sender, optional progress handle) — never borrow `AppState`.
 - **Speech sink** — `SpeechSink` owns its own thread; everything (plugins, workers, UI) just sends `Utterance` messages.
+- **Sound player** — `SoundPlayer` (`sound.rs`) owns its own thread; same shape as the speech sink but carries a `ConfigHandle` so it can resolve `SoundEvent` → filename per call. Cheap to clone, so it lives on `AppState` *and* on every `WorkerCtx`.
 - **File watcher** — `notify::RecommendedWatcher` in `AppState.watcher`. Replaced on each navigation; dropping unsubscribes.
 
 ### Virtual ListView
@@ -177,6 +178,52 @@ Cancel works now: `OpHandle::canceller()` hands out a `Send + Clone` kill switch
 - **Delete → trash, not purge.** `op_delete` renames each target to `<volume_root>/.trash/<unix_ts>_<counter>/<basename>` on the *same* drive (derived via `volume_root_of`) so the move is atomic — no cross-drive copy. The worker is `run_trash_batch`; undo is `run_revert_delete`, which skips targets whose original path is now re-occupied rather than clobbering. On successful undo the worker arms `AppState::set_pending_focus` with the first restored path, so the subsequent refresh lands the caret back on the recovered row — the worker reaches into `AppState` via the `Weak<AppState>` stored on `WorkerCtx.state` (set up in `AppState::new` via `self_weak: OnceCell<Weak<Self>>` so methods on `&self` can still hand workers a route back). Trash is never auto-purged; closing the app orphans the undo handle but the staged files remain.
 - **Clipboard path validity is checked at paste/restore, not at copy.** `op_paste` filters sources via `NavPath::new`; `op_restore_from_history` partitions by `Path::exists()` and announces missing-count without touching the clip file if *all* paths are gone.
 
+### Event sounds
+
+`SoundEvent` (in `navigator-config/src/sounds.rs`) enumerates the ~19 events a
+`.wav` can be attached to; `Sounds` maps `event key -> filename` and lives at
+`[sounds]` in `config.toml`. Files are read from `<exe_dir>/navigator_sounds`
+(`SOUNDS_DIR_NAME`) — nothing is bundled, so a fresh install is silent.
+
+- **The map is keyed by string, not a struct field per event.** An assignment
+  naming an event we later rename (or one a newer build added) is ignored
+  rather than failing the whole `config.toml` parse and taking every other
+  setting down with it. `SoundEvent::key()` is therefore an on-disk contract —
+  `keys_are_stable` pins the ones that shipped.
+- **`sound_path` only accepts a bare filename.** Anything containing a
+  separator or `..` is rejected, so a hand-edited config can't aim the player
+  at an arbitrary file. Don't "helpfully" join raw config strings onto
+  `sounds_dir()` elsewhere.
+- **Playback is `PlaySoundW` + `SND_ASYNC` on a dedicated thread.** That API is
+  a single process-wide channel: a new sound stops the previous one, which is
+  what you want for event feedback (the user always hears the most recent
+  thing). The thread exists because `PlaySoundW` still parses the WAV header
+  synchronously — a file on a cold or network drive would otherwise stall the
+  UI thread — and because the UTF-16 filename must outlive the call.
+  `SND_NODEFAULT` means a missing file is silent instead of a system beep.
+- **Outcome beats verb.** Workers call `WorkerCtx::play_outcome(cancelled,
+  failed, done)`, never `play(done)` directly, so a failed or cancelled copy
+  can't chime like a successful one.
+- **`AppState.next_nav_sound` is how navigation events stay distinguishable.**
+  Every route into a folder funnels through `AppState::navigate`, so
+  `navigate_up` / `go_back` / `go_forward` arm the cue immediately before
+  calling it — the same pattern as `suppress_history`, set at the same call
+  sites. `navigate` consumes it unconditionally (resetting to `Navigate`) so a
+  refresh can't leave a stale "went back" primed, and stays **silent when the
+  target equals the current cwd** — that covers `refresh()`, the sort/filter
+  toggles and the Options → View re-navigate, none of which are a move. The
+  field is seeded with `Startup` rather than `Navigate` because window creation
+  navigates to the initial path: that first listing *is* the app starting, and
+  playing both would have the two sounds cutting each other off every launch.
+
+Options → Sounds stages edits in a local `Vec<String>` and only writes them on
+`PSN_APPLY`, so Cancel really cancels; the only thing that happens immediately
+is the preview. Preview deliberately ignores `sounds.enabled` — auditioning a
+file is how you decide whether to switch sounds on. Note `CB_SETCURSEL` /
+`LB_SETCURSEL` do **not** raise `CBN_SELCHANGE` / `LBN_SELCHANGE`; that is
+load-bearing here, since selecting an event in the listbox programmatically
+re-points the combo and a notification would re-assign and replay its sound.
+
 ### Text viewer (Alt+Enter / Alt+L)
 
 `viewer.rs` is a singleton top-level window with a readonly multiline EDIT + Close button. Used for any "here is a block of text, copy what you need" screen — currently `op_show_properties` (Alt+Enter) and `op_dump_tree` (Alt+L). Workers compute the text off the UI thread and post `WMAPP_VIEWER_SHOW` with a `Box<(title, body)>` payload; the window proc reclaims the box and calls `viewer::show`. On open the edit takes focus and gets `EM_SETSEL(0, -1)` so Ctrl+C copies immediately.
@@ -215,6 +262,7 @@ Pure computation (folder stats, extension histogram, TOML tree dump) lives in `p
 - Sort mode, filters (show hidden/system), shortcut bindings, hotspot slots, and per-column visibility (`general.columns`) all persist here.
 - **`[general] announce_interval_secs`** (default 5) is the spoken-progress cadence — see *Progress reporting* above. Options → Speech writes it.
 - **`[rclone]` section** holds `progress_window` (moved out of `[general]`), `transfers` (default 8, clamped 1..=64 via `Rclone::transfers_clamped`), and `on_conflict` (default `"update"`). Options → Rclone tab writes all three. `transfers` feeds rclone's `--transfers N`. The `on_conflict` combo deliberately omits `Mirror` — a hand-edited config that sets it is honoured, and opening Options won't silently rewrite it (the commit only writes the mode when the combo has a real selection).
+- **`[sounds]` section** holds `enabled` (default true — a master mute that keeps assignments) and the `[sounds.events]` table. See *Event sounds* above. `navigator_sounds/` sits next to the exe like everything else; it is created on demand by Options → Sounds, never at startup.
 - **`[extraction]` section** holds `delete_when_extracted` (default true) and `create_folder` (default true). Options → Extraction tab writes both. Read by `AppState::op_extract` per invocation so a config save applies to the next extract without a restart.
 - `Columns` defaults to all-on (Size/Type/Modified shown) so pre-existing configs keep the historical four-column view after upgrade. `SortMode::Type` was added alongside — sort works regardless of column visibility, so `type_key()` in `model.rs` is the source of truth and not the Type column label.
 - **TOML can't hold `None` in arrays.** `hotspots` is stored as `Vec<String>` (empty string = unset), not `Vec<Option<String>>` — the latter serializes `None` and fails with `UnsupportedNone`. Hotspot slots must be exactly `HOTSPOT_COUNT` long; the code trusts the file to have the right length (no runtime padding), so a hand-edited short vec can panic — delete `config.toml` if it does.

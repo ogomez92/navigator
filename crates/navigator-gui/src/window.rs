@@ -941,6 +941,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             set_address_text(data.address, &format!("Search: {}", query));
             set_status_text(data.status,
                 &format!("{} match{} for {:?}", n, if n == 1 { "" } else { "es" }, query));
+            data.state.play(navigator_config::SoundEvent::SearchDone);
             data.state.say(
                 &format!("{} results for {}", n, query),
                 true,
