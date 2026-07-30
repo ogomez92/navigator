@@ -94,7 +94,9 @@ The Extract worker deliberately does NOT call `state.refresh()`. The notify watc
 
 ### File operations invariant
 
-All mutations (copy, move, delete, rename) go through `navigator-rclone`. No `SHFileOperation`, no direct `DeleteFileW`.
+All mutations (copy, move, delete, rename) go through `navigator-rclone`. No direct `DeleteFileW`.
+
+The one exception is Ctrl+Alt+V (paste from the OS clipboard), which runs `SHFileOperationW` in a **detached child process** (`navigator --shell-op …`, see `shell_op.rs`) so the copy neither blocks the message pump nor dies when navigator closes. `CLAUDE.md`'s *Detached shell copy* section is authoritative.
 
 > **This section is a summary. `CLAUDE.md` is the authoritative version** — see its *Conflict handling is mode-based, not per-item* and *Batching* sections. The per-item `Overwrite` / `Skip` prompt described in older revisions of this file no longer exists; `ItemChoice`, `prompt_item`, `BatchDecision` and `OverwritePolicy` were all deleted.
 

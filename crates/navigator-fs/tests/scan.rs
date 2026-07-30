@@ -10,7 +10,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use navigator_core::{EntryKind, NavPath};
-use navigator_fs::read_dir;
+use navigator_fs::{read_dir, stat_entry};
 
 fn make_absolute(p: &Path) -> NavPath {
     NavPath::new(p.to_path_buf()).expect("tempdir is absolute")
@@ -115,4 +115,54 @@ fn dot_entries_excluded() {
     let entries = read_dir(&make_absolute(dir.path())).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "one");
+}
+
+/// The watcher path depends on `stat_entry` reporting exactly what a
+/// `read_dir` of the parent would have reported for that one child —
+/// same name, kind, size and attributes. If they ever diverge, a file
+/// folded in by the watcher would render differently from the same file
+/// after a refresh.
+#[test]
+fn stat_entry_matches_the_read_dir_entry_for_the_same_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = b"twelve bytes";
+    fs::write(dir.path().join("s.txt"), body).unwrap();
+    fs::create_dir(dir.path().join("kid")).unwrap();
+
+    let listed = read_dir(&make_absolute(dir.path())).unwrap();
+
+    let file = stat_entry(&dir.path().join("s.txt")).expect("file must stat");
+    let from_listing = listed.iter().find(|e| e.name == "s.txt").unwrap();
+    assert_eq!(file.name, from_listing.name);
+    assert_eq!(file.kind, from_listing.kind);
+    assert_eq!(file.size, from_listing.size);
+    assert_eq!(file.attrs, from_listing.attrs);
+    assert_eq!(file.modified, from_listing.modified);
+    assert_eq!(file.size, body.len() as u64);
+
+    let sub = stat_entry(&dir.path().join("kid")).expect("dir must stat");
+    assert_eq!(sub.name, "kid");
+    assert_eq!(sub.kind, EntryKind::Directory);
+}
+
+/// A trailing separator makes `FindFirstFileExW` fail with
+/// ERROR_INVALID_NAME. Watcher paths and `NavPath::join` can both hand
+/// one over, so `stat_entry` normalises it away rather than reporting the
+/// file as gone.
+#[test]
+fn stat_entry_tolerates_a_trailing_separator() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("kid")).unwrap();
+    let with_sep = dir.path().join("kid").to_string_lossy().into_owned() + "\\";
+    let e = stat_entry(Path::new(&with_sep)).expect("trailing slash must still stat");
+    assert_eq!(e.name, "kid");
+}
+
+/// The overwhelmingly common watcher race: a file is created and removed
+/// before the notification is drained. `None`, not a panic or a stale
+/// entry.
+#[test]
+fn stat_entry_returns_none_for_a_missing_path() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(stat_entry(&dir.path().join("never_existed_4a91")).is_none());
 }

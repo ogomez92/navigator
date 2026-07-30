@@ -18,7 +18,7 @@ pub struct Filter {
     pub show_system: bool,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Sort {
     pub mode: SortMode,
     pub descending: bool,
@@ -89,13 +89,14 @@ impl Model {
         self.0.read().sort
     }
 
+    /// Record the sort preference. Deliberately does **not** re-sort the
+    /// loaded entries: every caller follows this with a `refresh()`, and
+    /// the rescan carries the new preference to the scan worker, which
+    /// sorts off the UI thread. Sorting here as well would do the same
+    /// n log n twice, the first time in the message pump.
     pub fn set_sort(&self, sort: Sort) -> usize {
         let mut g = self.0.write();
         g.sort = sort;
-        if !g.search_mode {
-            sort_entries(&mut g.all, sort);
-            rebuild_visible(&mut g);
-        }
         g.visible.len()
     }
 
@@ -103,11 +104,32 @@ impl Model {
         self.0.read().search_mode
     }
 
-    /// Replace the raw listing. Returns the new visible length so the caller
-    /// can update the ListView's virtual item count in one call.
-    pub fn set_listing(&self, cwd: NavPath, mut entries: Vec<Entry>) -> usize {
+    /// Replace the raw listing with entries in arbitrary order, sorting
+    /// them here. Returns the new visible length so the caller can update
+    /// the ListView's virtual item count in one call.
+    pub fn set_listing(&self, cwd: NavPath, entries: Vec<Entry>) -> usize {
+        self.set_listing_presorted(cwd, entries, None)
+    }
+
+    /// Replace the raw listing with a vector the producer has already
+    /// ordered. `sorted_as` is the order it used.
+    ///
+    /// The scan worker sorts before posting so a large folder doesn't
+    /// spend its n log n inside the message pump, where the window is
+    /// unresponsive. When the tag matches the current preference the
+    /// vector is installed as-is. It can fail to match — the user is free
+    /// to change the sort mode while a scan is in flight — and then this
+    /// is the cheap correctness net that re-sorts.
+    pub fn set_listing_presorted(
+        &self,
+        cwd: NavPath,
+        mut entries: Vec<Entry>,
+        sorted_as: Option<Sort>,
+    ) -> usize {
         let sort = self.0.read().sort;
-        sort_entries(&mut entries, sort);
+        if sorted_as != Some(sort) {
+            sort_entries(&mut entries, sort);
+        }
         let mut g = self.0.write();
         g.cwd = Some(cwd);
         g.all = entries;
@@ -250,24 +272,79 @@ fn rebuild_visible(inner: &mut ModelInner) {
 /// Directories first, then the chosen key. Explorer-style: folders always
 /// cluster at the top regardless of key, flipping `descending` only
 /// reverses the within-kind order.
+///
+/// **Keys are computed once per entry, not once per comparison.** The
+/// Name and Type comparators need a case-folded name, and building it
+/// inside the closure meant two `String` allocations on every one of the
+/// n log n comparisons — for a 200k-entry folder, several million
+/// allocations for a sort that only needs 200k. Decorating up front makes
+/// it linear in allocations and lets the comparison itself be a plain
+/// memcmp on borrowed slices.
 pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
     use std::cmp::Ordering;
-    entries.sort_by(|a, b| match (a.is_dir(), b.is_dir()) {
-        (true, false) => Ordering::Less,
-        (false, true) => Ordering::Greater,
-        _ => {
-            let key = match sort.mode {
-                SortMode::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                SortMode::Size => a.size.cmp(&b.size),
-                SortMode::Type => type_key(a)
-                    .cmp(&type_key(b))
-                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
-                SortMode::Modified => a.modified.cmp(&b.modified),
-                SortMode::Created => a.created.cmp(&b.created),
-            };
-            if sort.descending { key.reverse() } else { key }
+
+    // Only the key-bearing modes need a decoration pass; Size / Modified
+    // / Created compare integers already in the Entry.
+    let folded: Vec<(String, String)> = match sort.mode {
+        SortMode::Name => entries
+            .iter()
+            .map(|e| (e.name.to_lowercase(), String::new()))
+            .collect(),
+        SortMode::Type => entries
+            .iter()
+            .map(|e| (e.name.to_lowercase(), type_key(e)))
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    // Sort an index permutation so the (possibly large) Entry values move
+    // exactly once, at the end, instead of on every swap.
+    let mut order: Vec<u32> = (0..entries.len() as u32).collect();
+    order.sort_by(|&ia, &ib| {
+        let (a, b) = (&entries[ia as usize], &entries[ib as usize]);
+        match (a.is_dir(), b.is_dir()) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => {
+                let key = match sort.mode {
+                    SortMode::Name => folded[ia as usize].0.cmp(&folded[ib as usize].0),
+                    SortMode::Size => a.size.cmp(&b.size),
+                    SortMode::Type => folded[ia as usize]
+                        .1
+                        .cmp(&folded[ib as usize].1)
+                        .then_with(|| folded[ia as usize].0.cmp(&folded[ib as usize].0)),
+                    SortMode::Modified => a.modified.cmp(&b.modified),
+                    SortMode::Created => a.created.cmp(&b.created),
+                };
+                if sort.descending { key.reverse() } else { key }
+            }
         }
     });
+
+    apply_permutation(entries, &order);
+}
+
+/// Reorder `entries` in place so that afterwards `entries[i]` is whatever
+/// used to live at `order[i]`. Walks each permutation cycle once, so it is
+/// O(n) moves and needs no second `Vec<Entry>`.
+fn apply_permutation(entries: &mut [Entry], order: &[u32]) {
+    debug_assert_eq!(entries.len(), order.len());
+    // `pos[j]` tracks where the element originally at j currently sits, so
+    // a cycle can be rotated with plain swaps.
+    let mut pos: Vec<u32> = (0..entries.len() as u32).collect();
+    let mut at: Vec<u32> = (0..entries.len() as u32).collect();
+    for i in 0..order.len() {
+        let want = order[i];
+        let cur = pos[want as usize] as usize;
+        if cur == i {
+            continue;
+        }
+        entries.swap(i, cur);
+        let displaced = at[i];
+        at.swap(i, cur);
+        pos[want as usize] = i as u32;
+        pos[displaced as usize] = cur as u32;
+    }
 }
 
 /// Type-sort key for a single entry: the file extension (lowercased).
@@ -298,6 +375,155 @@ mod tests {
             hidden: false,
             system: false,
         }
+    }
+
+    fn sized(name: &str, size: u64, is_dir: bool) -> Entry {
+        Entry {
+            name: name.into(),
+            kind: if is_dir {
+                EntryKind::Directory
+            } else {
+                EntryKind::File
+            },
+            size,
+            modified: FileTime(size),
+            created: FileTime(size),
+            attrs: 0,
+            hidden: false,
+            system: false,
+        }
+    }
+
+    /// The straightforward comparator the decorate/permute version
+    /// replaced. Kept in the tests as the oracle: whatever the fast path
+    /// does, it must land on exactly the order this produces.
+    fn reference_sort(entries: &mut [Entry], sort: Sort) {
+        use std::cmp::Ordering;
+        entries.sort_by(|a, b| match (a.is_dir(), b.is_dir()) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => {
+                let key = match sort.mode {
+                    SortMode::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                    SortMode::Size => a.size.cmp(&b.size),
+                    SortMode::Type => type_key(a)
+                        .cmp(&type_key(b))
+                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                    SortMode::Modified => a.modified.cmp(&b.modified),
+                    SortMode::Created => a.created.cmp(&b.created),
+                };
+                if sort.descending { key.reverse() } else { key }
+            }
+        });
+    }
+
+    /// `sort_entries` now decorates keys up front and permutes an index
+    /// vector rather than comparing (and re-lowercasing) entries directly.
+    /// That is a pure speed change — the resulting order must be
+    /// byte-identical to the old comparator for every mode and direction,
+    /// including the folders-first tiebreak and duplicate keys.
+    #[test]
+    fn fast_sort_matches_the_reference_comparator_for_every_mode() {
+        let input = vec![
+            sized("Zebra.txt", 30, false),
+            sized("alpha.rs", 10, false),
+            sized("docs", 0, true),
+            sized("BETA.rs", 10, false),
+            sized("Archive", 0, true),
+            sized("readme", 5, false),
+            sized("gamma.txt", 30, false),
+            sized("alpha.rs", 99, false), // duplicate name, different size
+            sized("zeta", 1, false),
+        ];
+
+        for mode in [
+            SortMode::Name,
+            SortMode::Size,
+            SortMode::Type,
+            SortMode::Modified,
+            SortMode::Created,
+        ] {
+            for descending in [false, true] {
+                let sort = Sort { mode, descending };
+                let mut fast = input.clone();
+                sort_entries(&mut fast, sort);
+                let mut slow = input.clone();
+                reference_sort(&mut slow, sort);
+
+                let fast_names: Vec<(&str, u64)> =
+                    fast.iter().map(|e| (e.name.as_str(), e.size)).collect();
+                let slow_names: Vec<(&str, u64)> =
+                    slow.iter().map(|e| (e.name.as_str(), e.size)).collect();
+                assert_eq!(
+                    fast_names, slow_names,
+                    "mode={mode:?} descending={descending} diverged from the reference order"
+                );
+            }
+        }
+    }
+
+    /// `apply_permutation` rotates cycles in place with swaps. A long
+    /// single cycle and a fully reversed input are the two shapes most
+    /// likely to expose an index-bookkeeping slip, so pin both — a wrong
+    /// permutation silently scrambles the listing rather than erroring.
+    #[test]
+    fn permutation_survives_long_cycles_and_full_reversal() {
+        let names: Vec<String> = (0..64).map(|i| format!("f{i:03}")).collect();
+
+        // Full reversal: every element moves, one long cycle pair-wise.
+        let mut entries: Vec<Entry> = names.iter().map(|n| file(n)).collect();
+        let order: Vec<u32> = (0..64u32).rev().collect();
+        apply_permutation(&mut entries, &order);
+        let got: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        let want: Vec<&str> = names.iter().rev().map(|s| s.as_str()).collect();
+        assert_eq!(got, want, "reversal permutation");
+
+        // Rotate-by-one: a single 64-long cycle.
+        let mut entries: Vec<Entry> = names.iter().map(|n| file(n)).collect();
+        let order: Vec<u32> = (0..64u32).map(|i| (i + 1) % 64).collect();
+        apply_permutation(&mut entries, &order);
+        let got: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        let want: Vec<&str> = (0..64).map(|i| names[(i + 1) % 64].as_str()).collect();
+        assert_eq!(got, want, "rotation permutation");
+    }
+
+    /// The scan worker pre-sorts, so a listing tagged with the order it
+    /// already carries must be installed untouched — that is the whole
+    /// point of moving the work off the UI thread. But a preference the
+    /// user changed mid-scan has to be honoured, so a mismatched tag
+    /// re-sorts.
+    #[test]
+    fn presorted_listing_is_trusted_only_when_the_tag_matches() {
+        let m = Model::new();
+        let cwd = NavPath::new(std::path::PathBuf::from(if cfg!(windows) {
+            r"C:\tmp\nav"
+        } else {
+            "/tmp/nav"
+        }))
+        .unwrap();
+        let by_name = Sort {
+            mode: SortMode::Name,
+            descending: false,
+        };
+        m.set_sort(by_name);
+
+        // Tagged with the active sort but deliberately out of order: the
+        // model must take our word for it and not re-sort.
+        m.set_listing_presorted(cwd.clone(), vec![file("zzz"), file("aaa")], Some(by_name));
+        let got: Vec<String> = (0..m.len()).map(|i| m.get(i).unwrap().name).collect();
+        assert_eq!(got, vec!["zzz", "aaa"], "matching tag must be trusted");
+
+        // Same entries tagged with a different sort → re-sorted here.
+        m.set_listing_presorted(
+            cwd,
+            vec![file("zzz"), file("aaa")],
+            Some(Sort {
+                mode: SortMode::Size,
+                descending: false,
+            }),
+        );
+        let got: Vec<String> = (0..m.len()).map(|i| m.get(i).unwrap().name).collect();
+        assert_eq!(got, vec!["aaa", "zzz"], "stale tag must trigger a re-sort");
     }
 
     /// `append_entries` is the path the Extract worker relies on (via the

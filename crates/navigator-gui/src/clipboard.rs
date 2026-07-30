@@ -91,7 +91,77 @@ pub fn load_history() -> Vec<HistoryEntry> {
 }
 
 /// Push a new entry at the front, cap at `MAX_HISTORY`.
+///
+/// **Queued, not written inline.** Every copy / cut / paste / delete calls
+/// this from the UI thread, and the write is a read-modify-write of the
+/// *whole* file: each of the 20 retained entries holds the complete source
+/// list of its operation, so a user who copies 50k files a few times is
+/// asking the message pump to parse and re-serialise millions of path
+/// strings on the next Ctrl+C. The work goes to a single dedicated thread
+/// instead, which keeps the writes ordered — a per-call `thread::spawn`
+/// would race and could drop entries.
+///
+/// Readers (`load_history`, the File menu, the ops window) may therefore
+/// miss an entry that is still in flight. That is already true of the
+/// peer-instance case the file format exists to support, and the window
+/// is one file write wide.
 pub fn push_history(entry: HistoryEntry) {
+    let _ = history_writer().send(HistoryCmd::Push(entry));
+}
+
+/// Block until every queued history entry has hit disk, or `timeout`
+/// elapses. Called once on shutdown: the process exits via
+/// `std::process::exit`, which kills the writer thread where it stands, so
+/// without this a copy immediately followed by Alt+F4 would lose its
+/// history entry. Bounded because a stuck disk must not stop the app from
+/// closing.
+pub fn flush_history(timeout: std::time::Duration) {
+    // Peek rather than `history_writer()`: a session that never touched
+    // the clipboard has no writer, and starting one purely to flush it
+    // would spawn a thread on the way out the door.
+    let Some(tx) = HISTORY_TX.get() else {
+        return;
+    };
+    let (ack_tx, ack_rx) = crossbeam_channel::bounded::<()>(1);
+    if tx.send(HistoryCmd::Flush(ack_tx)).is_err() {
+        return;
+    }
+    let _ = ack_rx.recv_timeout(timeout);
+}
+
+enum HistoryCmd {
+    Push(HistoryEntry),
+    /// Replied to once every `Push` queued ahead of it has been written.
+    Flush(crossbeam_channel::Sender<()>),
+}
+
+static HISTORY_TX: std::sync::OnceLock<crossbeam_channel::Sender<HistoryCmd>> =
+    std::sync::OnceLock::new();
+
+/// Sender into the history-writer thread, started on first use.
+fn history_writer() -> &'static crossbeam_channel::Sender<HistoryCmd> {
+    HISTORY_TX.get_or_init(|| {
+        let (tx, rx) = crossbeam_channel::unbounded::<HistoryCmd>();
+        std::thread::Builder::new()
+            .name("navigator-history".into())
+            .spawn(move || {
+                while let Ok(cmd) = rx.recv() {
+                    match cmd {
+                        HistoryCmd::Push(entry) => write_history_entry(entry),
+                        HistoryCmd::Flush(ack) => {
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+            })
+            .expect("spawn history writer");
+        tx
+    })
+}
+
+/// The actual read-modify-write. Separated from [`push_history`] so it can
+/// be exercised synchronously in tests without going through the thread.
+fn write_history_entry(entry: HistoryEntry) {
     let mut entries = load_history();
     entries.insert(0, entry);
     if entries.len() > MAX_HISTORY {

@@ -262,6 +262,50 @@ pub fn drive_path_from_display(display: &str) -> Option<String> {
     }
 }
 
+/// Stat a single path and return its [`Entry`]. One `FindFirstFileExW`
+/// against the exact path — **no directory enumeration**, so the cost is
+/// independent of how many siblings the file has.
+///
+/// This exists for the file watcher, which fires once per changed file.
+/// Answering each event with a `read_dir` of the parent made a paste or
+/// extract of N files into a folder of M entries cost N×M work on the UI
+/// thread; a folder with a few thousand entries froze the window solid
+/// for the duration. Keep this O(1) — do not "simplify" it back into a
+/// scan-and-find.
+///
+/// Returns `None` for a path that no longer exists (the common race: the
+/// file was created and deleted before we got the notification), for a
+/// bare drive root (`FindFirstFile` cannot stat one), and for `.` / `..`.
+pub fn stat_entry(path: &Path) -> Option<Entry> {
+    // A trailing separator makes FindFirstFile fail with
+    // ERROR_INVALID_NAME — normalise before encoding.
+    let mut wide: Vec<u16> = to_long_path(path);
+    while matches!(wide.last(), Some(&c) if c == b'\\' as u16 || c == b'/' as u16) {
+        wide.pop();
+    }
+    if wide.is_empty() {
+        return None;
+    }
+    wide.push(0);
+
+    let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    let handle = unsafe {
+        FindFirstFileExW(
+            wide.as_ptr(),
+            FindExInfoBasic,
+            (&raw mut data).cast(),
+            FindExSearchNameMatch,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    unsafe { FindClose(handle) };
+    entry_from_find_data(&data)
+}
+
 /// Recursively search `root` for entries whose filename matches `query`
 /// (ASCII case-insensitive). Returned entries have `name` set to the
 /// path *relative* to `root`, using `\\` as separator — so the GUI can

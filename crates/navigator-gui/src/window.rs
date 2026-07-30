@@ -64,6 +64,12 @@ pub const WMAPP_VIEWER_SHOW: u32 = WM_APP + 8;
 /// (the staged local path). Handler prompts "upload back?" and, on yes,
 /// spawns an rclone worker. Posted from the remote-cache watcher thread.
 pub const WMAPP_REMOTE_EDIT: u32 = WM_APP + 9;
+/// Empty-trash survey finished. Payload is
+/// `Box<(Vec<PathBuf>, String)>` — the trash directories found and the
+/// pre-rendered confirmation body. Posted from a worker because sizing
+/// the trash means walking every staged file on every drive, which is
+/// unbounded work that must not happen in the message pump.
+pub const WMAPP_EMPTY_TRASH_SURVEYED: u32 = WM_APP + 10;
 
 const IDC_LISTVIEW: u16 = 1001;
 const IDC_ADDRESS: u16 = 1002;
@@ -886,9 +892,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
 
         WMAPP_DIR_LISTED => unsafe {
             let Some(data) = window_data(hwnd) else { return LRESULT(0) };
-            let payload: Box<(NavPath, Vec<Entry>)> = Box::from_raw(lp.0 as *mut _);
-            let (path, entries) = *payload;
-            let count = data.state.model.set_listing(path.clone(), entries);
+            let payload: Box<(NavPath, Vec<Entry>, crate::model::Sort)> = Box::from_raw(lp.0 as *mut _);
+            let (path, entries, sorted_as) = *payload;
+            let count = data.state.model.set_listing_presorted(path.clone(), entries, Some(sorted_as));
             data.listview.set_item_count(count);
             set_address_text(data.address, &address_display(&path));
             set_status_text(data.status, &format!("{} items", count));
@@ -958,6 +964,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let count = data.state.model.len();
             data.listview.set_item_count(count);
             refresh_status_selection(data);
+            LRESULT(0)
+        },
+
+        WMAPP_EMPTY_TRASH_SURVEYED => unsafe {
+            let Some(data) = window_data(hwnd) else { return LRESULT(0) };
+            let payload: Box<(Vec<std::path::PathBuf>, String, u64)> = Box::from_raw(lp.0 as *mut _);
+            let (dirs, body, total) = *payload;
+            data.state.confirm_empty_trash_survey(dirs, body, total);
             LRESULT(0)
         },
 

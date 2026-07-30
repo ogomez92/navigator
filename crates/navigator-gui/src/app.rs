@@ -55,7 +55,11 @@ impl AppConfig {
 }
 
 enum ScanCmd {
-    List(NavPath, HwndSend),
+    /// Directory listing. The `Sort` rides along so the worker can order
+    /// the entries before posting them — sorting a large folder is n log n
+    /// with a case-folding pass, and doing it in the `WMAPP_DIR_LISTED`
+    /// handler stalled the message pump for exactly as long.
+    List(NavPath, HwndSend, crate::model::Sort),
     Search {
         root: NavPath,
         query: String,
@@ -144,6 +148,40 @@ impl Drop for OpGuard {
 
 const UNDO_STACK_MAX: usize = 50;
 
+/// The undo targets for one paste, published by the paste worker.
+///
+/// Undo may only ever delete a destination the paste itself created, so
+/// the list has to be filtered by "did this already exist?" — one stat per
+/// clipboard entry. That pass used to run on the UI thread inside
+/// `Ctrl+V`, which is exactly the stall the user feels when pasting a
+/// large clipboard or pasting onto a slow share.
+///
+/// It cannot simply be dropped, and it cannot be deferred to the end of
+/// the paste either: once files start landing, "already existed" answers
+/// yes for the paste's own output. So the worker runs it as its first act
+/// and publishes the result here, while the undo entry itself is pushed
+/// before the worker spawns — preserving the rule that Ctrl+Z can reach
+/// an in-flight paste. An undo that lands in the gap gets told to try
+/// again rather than being handed an unfiltered list, because an
+/// unfiltered list deletes precisely the files the conflict mode chose to
+/// protect.
+#[derive(Debug, Default)]
+struct PastePlan(Mutex<Option<(Vec<NavPath>, Vec<NavPath>)>>);
+
+impl PastePlan {
+    /// Publish the filtered `(created, originals)` pairs. Called once, by
+    /// the worker, before any transfer starts.
+    fn publish(&self, created: Vec<NavPath>, originals: Vec<NavPath>) {
+        *self.0.lock() = Some((created, originals));
+    }
+
+    /// `None` until the worker has published — the caller must then leave
+    /// the undo entry in place and ask the user to retry.
+    fn targets(&self) -> Option<(Vec<NavPath>, Vec<NavPath>)> {
+        self.0.lock().clone()
+    }
+}
+
 /// Record enough to reverse a prior operation. Paste reversal shells out
 /// to a worker thread like the forward op does, so the UI stays
 /// responsive and progress announcements flow through the usual channel.
@@ -152,12 +190,11 @@ enum UndoAction {
     /// Reverse a copy / cut / append-clipboard — just restore the
     /// previous clip file.
     ClipChange { prev: crate::clipboard::ClipFile },
-    /// Reverse a paste. `created[i]` is the new path at dest for
-    /// `originals[i]`. Copy-mode undo deletes `created`; cut-mode undo
-    /// moves each `created[i]` back to `originals[i]`.
+    /// Reverse a paste. `plan` resolves to `created[i]` — the new path at
+    /// dest for `originals[i]`. Copy-mode undo deletes `created`; cut-mode
+    /// undo moves each `created[i]` back to `originals[i]`.
     Paste {
-        created: Vec<NavPath>,
-        originals: Vec<NavPath>,
+        plan: Arc<PastePlan>,
         cut_mode: bool,
     },
     /// Reverse a delete. Each `(trash_path, original)` pair was the
@@ -173,21 +210,28 @@ pub fn volume_root_of(path: &std::path::Path) -> Option<std::path::PathBuf> {
     path.ancestors().last().map(|p| p.to_path_buf())
 }
 
-/// Create a fresh trash subdirectory on the same drive/volume as `path`,
+/// Name a fresh trash subdirectory on the same drive/volume as `path`,
 /// e.g. `C:\.trash\<ts>_<n>\`. Keeping trash on the same volume means
 /// `Operation::Rename` is a true O(1) move instead of a cross-drive
 /// copy+delete, and keeps each drive self-contained (unplugging the
 /// drive doesn't strand trash on another volume). Dir name is
 /// `<unix_ts>_<counter>` — counter is monotonic within the process so
 /// rapid successive deletes don't collide.
-fn make_trash_dir_on_volume_of(path: &NavPath) -> Option<NavPath> {
+///
+/// **Naming only — no IO.** `op_delete` needs these paths on the UI
+/// thread (they go into the undo entry before the worker spawns), but
+/// creating them there meant one `create_dir_all` syscall per selected
+/// item inside the message pump; deleting a few thousand files visibly
+/// hung the window before the delete had even started. The directory is
+/// created by the worker in `run_trash_batch`, immediately before the
+/// rename that needs it.
+fn trash_dir_on_volume_of(path: &NavPath) -> Option<NavPath> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let ts = crate::clipboard::now_ts();
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let root = volume_root_of(path.as_path())?;
     let dir = root.join(".trash").join(format!("{}_{}", ts, n));
-    std::fs::create_dir_all(&dir).ok()?;
     NavPath::new(dir).ok()
 }
 
@@ -518,7 +562,9 @@ impl AppState {
             self.history.lock().push(path.clone());
         }
         drop(suppress);
-        let _ = self.scan_tx.send(ScanCmd::List(path, hwnd));
+        let _ = self
+            .scan_tx
+            .send(ScanCmd::List(path, hwnd, self.model.sort()));
     }
 
     /// Wipe the incremental type-ahead prefix. Called on navigation so a
@@ -974,11 +1020,17 @@ impl AppState {
                     false,
                 );
             }
-            UndoAction::Paste {
-                created,
-                originals,
-                cut_mode,
-            } => {
+            UndoAction::Paste { plan, cut_mode } => {
+                let Some((created, originals)) = plan.targets() else {
+                    // The worker has not finished deciding which
+                    // destinations this paste is allowed to remove. Put
+                    // the entry back so the next Ctrl+Z gets it, rather
+                    // than reverting a superset and deleting files the
+                    // conflict mode deliberately spared.
+                    self.push_undo(UndoAction::Paste { plan, cut_mode });
+                    self.say("paste still starting — try undo again in a moment", true);
+                    return;
+                };
                 self.say(
                     &format!("undo: reverting paste of {} items", created.len(),),
                     false,
@@ -1212,26 +1264,22 @@ impl AppState {
         // paste even if it's still in flight.
         //
         // **Undo may only ever delete a destination this paste created.**
-        // Destinations that already exist are filtered out here, because
+        // Destinations that already exist have to be filtered out, because
         // every conflict mode can decline to write one: `AddNewOnly` skips
         // it, `Update` spares it when it is newer, `Replace` overwrites it
         // (and we keep no backup, so undo cannot restore it anyway), and
         // `KeepBoth` writes a numbered sibling and leaves it untouched.
-        // Without this filter Ctrl+Z deleted exactly the files the chosen
+        // Without that filter Ctrl+Z deleted exactly the files the chosen
         // mode had deliberately protected — the precise inverse of intent,
         // and unrecoverable.
         //
-        // Pairs are filtered together so `created[i]` / `originals[i]` stay
-        // aligned; `run_revert_paste` indexes them in lockstep for cut-mode
-        // restores.
-        let (created, undo_originals): (Vec<NavPath>, Vec<NavPath>) = sources
-            .iter()
-            .map(|s| (dest.join(s.file_name()), s.clone()))
-            .filter(|(d, _)| !d.as_path().exists())
-            .unzip();
+        // The filter itself is a stat per clipboard entry, so it runs on
+        // the paste worker (see [`PastePlan`]) — one Ctrl+V should not
+        // block the message pump for the length of the clipboard. What is
+        // pushed here is the empty plan the worker fills in.
+        let plan = Arc::new(PastePlan::default());
         self.push_undo(UndoAction::Paste {
-            created,
-            originals: undo_originals,
+            plan: plan.clone(),
             cut_mode: clip.cut,
         });
 
@@ -1252,7 +1300,7 @@ impl AppState {
         let state = self.clone_for_worker();
         std::thread::Builder::new()
             .name("navigator-batch-op".into())
-            .spawn(move || state.run_batch(sources, dest, cut, default_mode, choice))
+            .spawn(move || state.run_batch(sources, dest, cut, default_mode, choice, plan))
             .expect("spawn batch worker");
     }
 
@@ -1317,11 +1365,14 @@ impl AppState {
 
         // Move each local target to `<volume_root>/.trash/<ts>_<n>/<basename>`
         // on the same drive. Same-volume keeps the rename atomic.
+        // Naming only; `run_trash_batch` creates each directory just
+        // before the rename that lands in it. Doing the `create_dir_all`
+        // here cost one syscall per selected item on the UI thread.
         let mut pairs: Vec<(NavPath, NavPath)> = Vec::with_capacity(local.len());
         for p in &local {
-            let Some(trash_dir) = make_trash_dir_on_volume_of(p) else {
+            let Some(trash_dir) = trash_dir_on_volume_of(p) else {
                 self.say(
-                    &format!("failed to create trash dir for {}", p.file_name()),
+                    &format!("failed to resolve trash dir for {}", p.file_name()),
                     true,
                 );
                 continue;
@@ -1344,66 +1395,92 @@ impl AppState {
             .expect("spawn delete batch");
     }
 
-    /// Permanently delete every `<drive>\.trash` directory on every
-    /// connected local drive. Walks each candidate trash to compute the
-    /// space it occupies, surfaces a per-drive breakdown in a Yes/No
-    /// confirmation, and on Yes spawns a worker that runs
-    /// `remove_dir_all` per drive. After completion any in-memory
-    /// `UndoAction::Delete` entries are dropped because their staged
-    /// paths no longer exist. This is the one path that bypasses the
-    /// usual rclone-driven mutation flow — trash dirs are an internal
-    /// implementation detail, not user-visible files, so a direct
-    /// `std::fs` call is fine and avoids spinning rclone up just to
-    /// purge a local folder.
+    /// Survey every `<drive>\.trash` so the confirmation can name what it
+    /// is about to destroy, then hand the result to the UI thread.
+    ///
+    /// The survey walks every staged file on every drive to total up the
+    /// reclaimable space — unbounded work, and it used to run inline on
+    /// the UI thread with the app frozen until it finished. It now runs on
+    /// a worker and posts [`WMAPP_EMPTY_TRASH_SURVEYED`] back; the
+    /// confirmation and the deletion itself continue from
+    /// [`Self::confirm_empty_trash_survey`].
     pub fn op_empty_trash(&self) {
-        let drives = navigator_fs::list_drives();
-        let mut entries: Vec<(PathBuf, String, u64)> = Vec::new();
-        let mut total: u64 = 0;
-        for d in drives {
-            let Some(root_str) = navigator_fs::drive_path_from_display(&d.name) else {
-                continue;
-            };
-            let trash = PathBuf::from(&root_str).join(".trash");
-            if !trash.exists() {
-                continue;
-            }
-            let nav = match NavPath::new(&trash) {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-            let stats = crate::props::compute_folder_stats(&nav);
-            total = total.saturating_add(stats.total_size);
-            entries.push((trash, d.name, stats.total_size));
-        }
+        let Some(hwnd) = self.hwnd() else {
+            return;
+        };
+        let speech = self.speech.handle();
+        self.say("checking trash…", false);
+        std::thread::Builder::new()
+            .name("navigator-trash-survey".into())
+            .spawn(move || {
+                let drives = navigator_fs::list_drives();
+                let mut entries: Vec<(PathBuf, String, u64)> = Vec::new();
+                let mut total: u64 = 0;
+                for d in drives {
+                    let Some(root_str) = navigator_fs::drive_path_from_display(&d.name) else {
+                        continue;
+                    };
+                    let trash = PathBuf::from(&root_str).join(".trash");
+                    if !trash.exists() {
+                        continue;
+                    }
+                    let nav = match NavPath::new(&trash) {
+                        Ok(n) => n,
+                        Err(_) => continue,
+                    };
+                    let stats = crate::props::compute_folder_stats(&nav);
+                    total = total.saturating_add(stats.total_size);
+                    entries.push((trash, d.name, stats.total_size));
+                }
 
-        if entries.is_empty() {
-            self.say(".trash is already empty on all drives", false);
+                if entries.is_empty() {
+                    let _ = speech.send(crate::speech::Utterance {
+                        text: ".trash is already empty on all drives".into(),
+                        interrupt: false,
+                    });
+                    return;
+                }
+
+                let mut body = String::from(
+                    "Permanently delete .trash on the following drives?\n\
+                     This cannot be undone.\n\n",
+                );
+                for (_, label, size) in &entries {
+                    body.push_str(&format!(
+                        "• {} — {}\n",
+                        label,
+                        crate::listview::format_size(*size),
+                    ));
+                }
+                body.push_str(&format!(
+                    "\nTotal to free: {}",
+                    crate::listview::format_size(total),
+                ));
+
+                let dirs: Vec<PathBuf> = entries.into_iter().map(|(p, _, _)| p).collect();
+                post_empty_trash_survey(hwnd, dirs, body, total);
+            })
+            .expect("spawn trash-survey worker");
+    }
+
+    /// UI-thread half of [`Self::op_empty_trash`]: confirm the surveyed
+    /// breakdown and, on Yes, spawn the worker that runs `remove_dir_all`
+    /// per drive. After completion any in-memory `UndoAction::Delete`
+    /// entries are dropped because their staged paths no longer exist.
+    /// This is the one path that bypasses the usual rclone-driven mutation
+    /// flow — trash dirs are an internal implementation detail, not
+    /// user-visible files, so a direct `std::fs` call is fine and avoids
+    /// spinning rclone up just to purge a local folder.
+    pub fn confirm_empty_trash_survey(&self, dirs: Vec<PathBuf>, body: String, total: u64) {
+        if dirs.is_empty() {
             return;
         }
-
-        let mut body = String::from(
-            "Permanently delete .trash on the following drives?\n\
-             This cannot be undone.\n\n",
-        );
-        for (_, label, size) in &entries {
-            body.push_str(&format!(
-                "• {} — {}\n",
-                label,
-                crate::listview::format_size(*size),
-            ));
-        }
-        body.push_str(&format!(
-            "\nTotal to free: {}",
-            crate::listview::format_size(total),
-        ));
-
         if !confirm_empty_trash(self.main_hwnd(), &body) {
             return;
         }
 
         let speech = self.speech.handle();
         let state_weak = self.self_weak.get().cloned().unwrap_or_else(Weak::new);
-        let dirs: Vec<PathBuf> = entries.into_iter().map(|(p, _, _)| p).collect();
         let total_freed = total;
         std::thread::Builder::new()
             .name("navigator-empty-trash".into())
@@ -1800,10 +1877,13 @@ impl AppState {
     /// whole point is to hand large batches to the shell so antivirus
     /// heuristics don't flag rclone streaming thousands of files.
     ///
-    /// Runs on the UI thread on purpose: `SHFileOperationW` puts up its
-    /// own accessible, modal progress + conflict dialog owned by the main
-    /// window, which needs to live on the thread that owns that window.
-    /// Refreshes the listing once the shell returns.
+    /// The transfer runs in a **detached child process** (see
+    /// [`crate::shell_op`]), not here. `SHFileOperationW` is synchronous,
+    /// so calling it from the window procedure froze the whole app for the
+    /// length of the copy *and* tied the copy's life to navigator's:
+    /// closing the window killed it outright. Now this function only reads
+    /// the clipboard and launches the helper, and a small reaper thread
+    /// announces the outcome if we are still around to hear it.
     pub fn op_paste_from_clipboard(&self) {
         let Some(dest) = self.model.cwd() else {
             return;
@@ -1828,22 +1908,64 @@ impl AppState {
 
         let n = sources.len();
         let dest_path = dest.as_path().to_path_buf();
-        match shell_copy_move(self.main_hwnd(), &sources, &dest_path, is_move) {
-            Ok(aborted) => {
-                let verb = if is_move { "moved" } else { "copied" };
-                if aborted {
-                    self.say("paste cancelled", false);
-                } else if n == 1 {
-                    self.say(&format!("1 item {}", verb), false);
-                } else {
-                    self.say(&format!("{} items {}", n, verb), false);
-                }
-                self.refresh();
-            }
+        let child = match crate::shell_op::spawn_detached(&sources, &dest_path, is_move) {
+            Ok(c) => c,
             Err(e) => {
-                self.say(&format!("paste failed: {}", e), true);
+                self.say(&format!("paste failed to start: {}", e), true);
+                return;
             }
-        }
+        };
+
+        self.play(SoundEvent::PasteStart);
+        self.say(
+            &format!(
+                "{} {} {} in a separate process",
+                if is_move { "moving" } else { "copying" },
+                n,
+                if n == 1 { "item" } else { "items" },
+            ),
+            false,
+        );
+
+        // Reaper: purely for the spoken summary and the closing refresh.
+        // It is not what keeps the transfer alive — the child owns itself —
+        // so if navigator exits first the copy simply finishes unannounced.
+        let speech = self.speech.handle();
+        let sound = self.sound.clone();
+        let state_weak = self.self_weak.get().cloned().unwrap_or_else(Weak::new);
+        std::thread::Builder::new()
+            .name("navigator-shell-op-reaper".into())
+            .spawn(move || {
+                let mut child = child;
+                let code = match child.wait() {
+                    Ok(s) => s.code().unwrap_or(crate::shell_op::EXIT_FAILED),
+                    Err(e) => {
+                        tracing::error!("shell-op wait: {}", e);
+                        crate::shell_op::EXIT_FAILED
+                    }
+                };
+                let verb = if is_move { "moved" } else { "copied" };
+                let (text, bad) = match code {
+                    crate::shell_op::EXIT_OK if n == 1 => (format!("1 item {}", verb), false),
+                    crate::shell_op::EXIT_OK => (format!("{} items {}", n, verb), false),
+                    crate::shell_op::EXIT_ABORTED => ("paste cancelled".to_string(), false),
+                    _ => ("paste failed".to_string(), true),
+                };
+                sound.play(match code {
+                    crate::shell_op::EXIT_OK if is_move => SoundEvent::MoveDone,
+                    crate::shell_op::EXIT_OK => SoundEvent::CopyDone,
+                    crate::shell_op::EXIT_ABORTED => SoundEvent::Cancelled,
+                    _ => SoundEvent::Error,
+                });
+                let _ = speech.send(crate::speech::Utterance {
+                    text,
+                    interrupt: bad,
+                });
+                if let Some(state) = state_weak.upgrade() {
+                    state.refresh();
+                }
+            })
+            .expect("spawn shell-op reaper");
     }
 
     /// Extract every selected archive 7-Zip can open, using `7z.exe` on
@@ -2348,6 +2470,21 @@ fn shell_open(path: &std::path::Path) {
 
 /// Post a `(title, body)` payload to the main window so the viewer opens
 /// on the UI thread. Heap-leaks a `Box` that the window proc reclaims.
+/// Hand a finished empty-trash survey to the UI thread. Takes `HwndSend`
+/// by value on purpose: reaching into `hwnd.0` from inside a worker
+/// closure makes Rust capture the bare `HWND`, which is not `Send`.
+fn post_empty_trash_survey(hwnd: HwndSend, dirs: Vec<PathBuf>, body: String, total: u64) {
+    let payload = Box::into_raw(Box::new((dirs, body, total)));
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(hwnd.0),
+            crate::window::WMAPP_EMPTY_TRASH_SURVEYED,
+            WPARAM(0),
+            LPARAM(payload as isize),
+        );
+    }
+}
+
 fn post_viewer(hwnd: HwndSend, title: String, body: String) {
     let payload = Box::into_raw(Box::new((title, body)));
     unsafe {
@@ -2594,7 +2731,15 @@ impl WorkerCtx {
 
     fn refresh(&self) {
         if let (Some(path), Some(hwnd)) = (self.refresh_target.clone(), self.hwnd) {
-            let _ = self.scan_tx.send(ScanCmd::List(path, hwnd));
+            // Sort preference comes from the live model when the app is
+            // still up. If it has gone away the tag is irrelevant — nobody
+            // is left to install the listing.
+            let sort = self
+                .state
+                .upgrade()
+                .map(|s| s.model.sort())
+                .unwrap_or_default();
+            let _ = self.scan_tx.send(ScanCmd::List(path, hwnd, sort));
         }
     }
 
@@ -2910,9 +3055,24 @@ impl WorkerCtx {
         cut: bool,
         default_mode: ConflictMode,
         preset: Option<crate::preflight::PasteChoice>,
+        plan: Arc<PastePlan>,
     ) {
         let _guard = self.state.upgrade().map(|s| s.op_guard());
         use crate::preflight::{PasteChoice, top_level_conflicts, unique_numbered_path};
+
+        // Resolve the undo targets first, before anything is written and
+        // before the conflict dialog can block on the user. Everything
+        // that already exists is excluded: undo is only ever allowed to
+        // remove a destination this paste brought into being. Pairs are
+        // filtered together so `created[i]` / `originals[i]` stay aligned —
+        // `run_revert_paste` indexes them in lockstep for cut-mode
+        // restores.
+        let (undo_created, undo_originals): (Vec<NavPath>, Vec<NavPath>) = sources
+            .iter()
+            .map(|s| (dest_dir.join(s.file_name()), s.clone()))
+            .filter(|(d, _)| !d.as_path().exists())
+            .unzip();
+        plan.publish(undo_created, undo_originals);
 
         let total = sources.len();
         let mut failed = 0u32;
@@ -3183,6 +3343,18 @@ impl WorkerCtx {
         for (trash, original) in pairs.into_iter() {
             if prog.cancelled() {
                 break;
+            }
+            // `op_delete` only *named* the staging directory; create it
+            // here so the syscall lands on this thread rather than in the
+            // message pump. rclone's `moveto` will not create a missing
+            // parent for us.
+            if let Some(parent) = trash.parent()
+                && let Err(e) = std::fs::create_dir_all(parent.as_path())
+            {
+                tracing::error!("create trash dir {:?}: {}", parent.to_string(), e);
+                failed += 1;
+                prog.skip(1);
+                continue;
             }
             let op = Operation::Rename {
                 src: original,
@@ -3490,13 +3662,14 @@ fn probe_write_access(dir: &std::path::Path) -> std::io::Result<()> {
 
 /// Stat a single child by name and return its [`Entry`]. Used by the file
 /// watcher when a newly created file needs to join the virtual listing.
+///
+/// **One stat, not a directory scan.** This used to `read_dir` the parent
+/// and search it for `name`, which made the watcher cost O(entries in the
+/// folder) *per changed file* — on the UI thread. Extracting or pasting N
+/// files into a folder of M entries was N×M work in the message pump, and
+/// a few thousand of each froze the window for the whole operation.
 fn single_entry(root: &NavPath, name: &str) -> Option<navigator_core::Entry> {
-    // Re-use `read_dir` and find the matching name. One directory scan is
-    // cheap and gives us full attributes without an extra Win32 path.
-    match navigator_fs::read_dir(root) {
-        Ok(entries) => entries.into_iter().find(|e| e.name == name),
-        Err(_) => None,
-    }
+    navigator_fs::stat_entry(root.join(name).as_path())
 }
 
 /// Place UTF-16 text on the Windows clipboard.
@@ -3752,63 +3925,6 @@ fn get_clipboard_hdrop(
     }
 }
 
-/// Copy or move `sources` into the `dest` directory via the Windows
-/// shell copy engine (`SHFileOperationW`). This is the deliberate
-/// exception to the "all mutations go through rclone" invariant: the
-/// shell engine is what antivirus recognises as a legitimate file
-/// operation, so pasting thousands of files this way avoids the
-/// heuristics that flag rclone. The shell owns the (accessible) progress
-/// and overwrite-conflict UI, parented to `hwnd`.
-///
-/// Returns `Ok(true)` if the user aborted mid-operation, `Ok(false)` on
-/// a clean run, `Err` on a shell error code.
-fn shell_copy_move(
-    hwnd: Option<windows::Win32::Foundation::HWND>,
-    sources: &[std::path::PathBuf],
-    dest: &std::path::Path,
-    move_op: bool,
-) -> std::io::Result<bool> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::Shell::{
-        FO_COPY, FO_MOVE, FOF_NOCONFIRMMKDIR, SHFILEOPSTRUCTW, SHFileOperationW,
-    };
-    use windows::core::PCWSTR;
-
-    // pFrom: each source NUL-terminated, list ends in a double-NUL.
-    let mut from: Vec<u16> = Vec::new();
-    for s in sources {
-        from.extend(s.as_os_str().encode_wide());
-        from.push(0);
-    }
-    from.push(0);
-
-    // pTo: the single destination directory, also double-NUL-terminated.
-    let mut to: Vec<u16> = dest.as_os_str().encode_wide().collect();
-    to.push(0);
-    to.push(0);
-
-    let mut op = SHFILEOPSTRUCTW {
-        hwnd: hwnd.unwrap_or(HWND(std::ptr::null_mut())),
-        wFunc: if move_op { FO_MOVE } else { FO_COPY },
-        pFrom: PCWSTR(from.as_ptr()),
-        pTo: PCWSTR(to.as_ptr()),
-        // Don't prompt to create the destination — it already exists.
-        // Overwrite/skip conflicts still surface the shell's own dialog.
-        fFlags: FOF_NOCONFIRMMKDIR.0 as u16,
-        ..Default::default()
-    };
-
-    let rc = unsafe { SHFileOperationW(&mut op) };
-    if rc != 0 {
-        return Err(std::io::Error::other(format!(
-            "SHFileOperation returned 0x{:x}",
-            rc
-        )));
-    }
-    Ok(op.fAnyOperationsAborted.as_bool())
-}
-
 fn io_err(e: windows::core::Error) -> std::io::Error {
     std::io::Error::other(format!("{}", e))
 }
@@ -3817,11 +3933,11 @@ fn scan_worker(rx: crossbeam_channel::Receiver<ScanCmd>, rclone: RcloneDriver) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
             ScanCmd::Shutdown => break,
-            ScanCmd::List(path, hwnd) => {
+            ScanCmd::List(path, hwnd, sort) => {
                 // ThisPC sentinel → enumerate drives rather than reading a
                 // real directory. Same flow on the UI side: entries end up
                 // in the virtual listview just like regular files.
-                let entries = if path.is_this_pc() {
+                let mut entries = if path.is_this_pc() {
                     navigator_fs::list_drives()
                 } else if path.is_remotes_root() {
                     match rclone.listremotes() {
@@ -3901,7 +4017,14 @@ fn scan_worker(rx: crossbeam_channel::Receiver<ScanCmd>, rclone: RcloneDriver) {
                         }
                     }
                 };
-                let payload = Box::into_raw(Box::new((path, entries))) as isize;
+                // Sort here, not in the WMAPP_DIR_LISTED handler. The
+                // handler runs in the message pump, so a big folder's
+                // n log n was time the window spent unresponsive right
+                // when the user had just asked to go somewhere. The tag
+                // travels with the payload so the model can tell whether
+                // this order still matches the current preference.
+                crate::model::sort_entries(&mut entries, sort);
+                let payload = Box::into_raw(Box::new((path, entries, sort))) as isize;
                 unsafe {
                     let _ =
                         PostMessageW(Some(hwnd.0), WMAPP_DIR_LISTED, WPARAM(0), LPARAM(payload));
@@ -3971,6 +4094,10 @@ pub fn run(cfg: AppConfig) -> windows::core::Result<i32> {
     state.bootstrap_plugins();
     let window = create_window(state.clone())?;
     let rc = run_message_loop(window.hwnd);
+    // Operation history is written on its own thread so a big copy doesn't
+    // stall Ctrl+C; `main` exits the process immediately after this
+    // returns, so drain the queue before that kills the writer.
+    crate::clipboard::flush_history(std::time::Duration::from_secs(2));
     Ok(rc)
 }
 

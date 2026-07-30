@@ -16,6 +16,15 @@ fn main() -> anyhow_lite::Result<()> {
     init_tracing();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // `--shell-op` re-executions are not file explorers: navigator spawns
+    // itself this way so a Windows shell copy/move outlives the window
+    // that started it. Checked before anything else so no config is read
+    // and no HWND is ever created for the helper.
+    if let Some(code) = navigator_gui::try_run_shell_op(&args) {
+        std::process::exit(code);
+    }
+
     let initial_path = match parse_args(&args) {
         ParsedArgs::Path(p) => p,
         ParsedArgs::Help => {

@@ -62,9 +62,19 @@ pub fn is_extractable(path: &Path) -> bool {
 /// lookup fails even though a fresh shell finds 7z fine. Checking the
 /// standard install dirs makes Extract work anyway.
 pub fn find_7z() -> Option<PathBuf> {
-    which_in_path("7z.exe")
-        .or_else(|| which_in_path("7z"))
-        .or_else(find_7z_in_install_dirs)
+    // Cached: the lookup stats every directory on PATH, and both callers
+    // (`op_extract`, `op_zip`) run it on the UI thread purely to decide
+    // whether to report "7z not found" before spawning their worker.
+    // 7-Zip does not move mid-session; a user who installs it while
+    // navigator is running restarts, same as for any other PATH change.
+    static CACHED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            which_in_path("7z.exe")
+                .or_else(|| which_in_path("7z"))
+                .or_else(find_7z_in_install_dirs)
+        })
+        .clone()
 }
 
 fn which_in_path(name: &str) -> Option<PathBuf> {
