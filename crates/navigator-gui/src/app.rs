@@ -2148,6 +2148,11 @@ impl AppState {
     /// Recursively enumerate the focused folder (or the current folder
     /// if a file is focused) and show the TOML tree dump in the viewer.
     /// Runs on a worker thread for the same reason as properties.
+    ///
+    /// Remote targets take a separate route: `props::dump_tree_toml` walks
+    /// with `FindFirstFileExW`, which cannot see a `\\?\NavigatorRemote\…`
+    /// path and reported an empty tree for every remote. One
+    /// `rclone lsjson --recursive` replaces the whole walk.
     pub fn op_dump_tree(&self) {
         let Some(cwd) = self.model.cwd() else {
             return;
@@ -2165,6 +2170,12 @@ impl AppState {
             self.say("can't dump This PC", true);
             return;
         }
+        // The remotes sentinel is a list of configured remotes, not a
+        // directory — there is nothing below it to walk.
+        if target.is_remotes_root() {
+            self.say("can't dump the remotes list", true);
+            return;
+        }
         let Some(hwnd) = self.hwnd() else {
             return;
         };
@@ -2178,6 +2189,23 @@ impl AppState {
             }
         );
         self.say("dumping tree…", false);
+
+        if target.is_remote() {
+            let rclone = self.rclone.clone();
+            std::thread::Builder::new()
+                .name("navigator-dump-tree-remote".into())
+                .spawn(move || {
+                    let arg = target.rclone_arg().unwrap_or_default();
+                    let body = match rclone.lsjson_recursive(&arg) {
+                        Ok(items) => crate::props::dump_tree_toml_remote(&target, &items),
+                        Err(e) => crate::props::dump_tree_toml_error(&target, &e.to_string()),
+                    };
+                    post_viewer(hwnd, title, body);
+                })
+                .expect("spawn remote dump-tree worker");
+            return;
+        }
+
         std::thread::Builder::new()
             .name("navigator-dump-tree".into())
             .spawn(move || {

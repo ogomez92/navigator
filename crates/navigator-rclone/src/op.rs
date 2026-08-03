@@ -665,6 +665,36 @@ impl RcloneDriver {
             .collect())
     }
 
+    /// Walk an entire remote sub-tree in **one** `rclone lsjson --recursive`
+    /// invocation. Returns both directories and files; each item's `path` is
+    /// relative to `target` with forward slashes.
+    ///
+    /// `--no-modtime` is deliberate: the only consumer is the tree dump,
+    /// which prints paths and sizes, and on backends that keep the mtime in
+    /// object metadata (S3 and friends) reading it costs an extra request
+    /// per object.
+    ///
+    /// One invocation rather than one per directory — a recursive fan-out of
+    /// `lsjson` calls would pay full process startup plus a round-trip at
+    /// every level, which is the same trap `batch.rs` exists to avoid.
+    pub fn lsjson_recursive(&self, target: &str) -> std::io::Result<Vec<RemoteTreeItem>> {
+        let out = self
+            .plain_command()
+            .arg("lsjson")
+            .arg("--recursive")
+            .arg("--no-modtime")
+            .arg(target)
+            .output()?;
+        if !out.status.success() {
+            return Err(std::io::Error::other(format!(
+                "rclone lsjson --recursive {} failed: {}",
+                target,
+                String::from_utf8_lossy(&out.stderr).trim(),
+            )));
+        }
+        parse_lsjson_tree(&out.stdout)
+    }
+
     /// Stat a single remote path via `rclone lsjson --stat -M --no-modtime=false <target>`.
     /// Returns `None` if the target doesn't exist. Metadata is whatever the
     /// backend exposes (sftp/local return mode/uid/gid; cloud backends often
@@ -788,6 +818,58 @@ impl RemoteStat {
         }
         raw.parse::<u32>().ok()
     }
+}
+
+/// One object from a recursive [`RcloneDriver::lsjson_recursive`] walk.
+/// `path` is relative to the walk root and always forward-slashed, so it
+/// can go straight into the tree dump without any path arithmetic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteTreeItem {
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+/// Parse `rclone lsjson --recursive` stdout. Split out from the spawn so the
+/// mapping is testable against verbatim rclone output.
+///
+/// Items whose `Path` is empty are dropped: that is the walk root itself,
+/// which is not part of its own listing and would otherwise land in `dirs`
+/// as `""`.
+fn parse_lsjson_tree(stdout: &[u8]) -> std::io::Result<Vec<RemoteTreeItem>> {
+    let items: Vec<LsTreeItem> = serde_json::from_slice(stdout)
+        .map_err(|e| std::io::Error::other(format!("lsjson --recursive parse: {}", e)))?;
+    Ok(items
+        .into_iter()
+        .filter_map(|i| {
+            // `Path` is what we want; fall back to `Name` in case a backend
+            // omits it for a flat listing.
+            let raw = if i.path.is_empty() { i.name } else { i.path };
+            let path = raw.replace('\\', "/");
+            if path.is_empty() {
+                return None;
+            }
+            Some(RemoteTreeItem {
+                path,
+                is_dir: i.is_dir,
+                // Directories and sizeless objects report -1.
+                size: if i.size < 0 { 0 } else { i.size as u64 },
+            })
+        })
+        .collect())
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(non_snake_case)]
+struct LsTreeItem {
+    #[serde(rename = "Path", default)]
+    path: String,
+    #[serde(rename = "Name", default)]
+    name: String,
+    #[serde(rename = "Size", default)]
+    size: i64,
+    #[serde(rename = "IsDir", default)]
+    is_dir: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1120,6 +1202,65 @@ fn path_arg(p: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verbatim `rclone lsjson --recursive --no-modtime` output (1.73.5).
+    /// Pins the facts the tree dump depends on: `Path` carries the
+    /// root-relative path (not just the leaf `Name`), directories come
+    /// through alongside files, nested paths are already forward-slashed,
+    /// and `--no-modtime` empties `ModTime` without breaking the parse.
+    ///
+    /// The last entry is not from that capture — the local backend sizes
+    /// directories 0 while several remote backends report `-1`, so it pins
+    /// the clamp that keeps a negative out of the `u64` total.
+    #[test]
+    fn recursive_lsjson_yields_root_relative_paths_for_dirs_and_files() {
+        let raw = br#"[
+{"Path":"a.txt","Name":"a.txt","Size":5,"MimeType":"text/plain; charset=utf-8","ModTime":"","IsDir":false},
+{"Path":"emptydir","Name":"emptydir","Size":0,"MimeType":"inode/directory","ModTime":"","IsDir":true},
+{"Path":"sub","Name":"sub","Size":0,"MimeType":"inode/directory","ModTime":"","IsDir":true},
+{"Path":"sub/b.bin","Name":"b.bin","Size":2,"MimeType":"application/octet-stream","ModTime":"","IsDir":false},
+{"Path":"sub/nested","Name":"nested","Size":-1,"MimeType":"inode/directory","ModTime":"","IsDir":true}
+]"#;
+        let items = parse_lsjson_tree(raw).expect("parses");
+        assert_eq!(
+            items,
+            vec![
+                RemoteTreeItem {
+                    path: "a.txt".into(),
+                    is_dir: false,
+                    size: 5
+                },
+                RemoteTreeItem {
+                    path: "emptydir".into(),
+                    is_dir: true,
+                    size: 0
+                },
+                RemoteTreeItem {
+                    path: "sub".into(),
+                    is_dir: true,
+                    size: 0
+                },
+                RemoteTreeItem {
+                    path: "sub/b.bin".into(),
+                    is_dir: false,
+                    size: 2
+                },
+                RemoteTreeItem {
+                    path: "sub/nested".into(),
+                    is_dir: true,
+                    size: 0
+                },
+            ]
+        );
+    }
+
+    /// An empty remote directory is an empty JSON array, not an error —
+    /// and must stay distinguishable from a failed walk, which is an `Err`.
+    #[test]
+    fn recursive_lsjson_accepts_an_empty_listing() {
+        assert_eq!(parse_lsjson_tree(b"[]").expect("parses").len(), 0);
+        assert!(parse_lsjson_tree(b"not json").is_err());
+    }
 
     /// A remote `Delete` of a directory must emit `purge`; a file must
     /// emit `deletefile`. The verbs are not interchangeable — `purge`

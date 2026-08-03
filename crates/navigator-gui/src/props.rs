@@ -10,7 +10,7 @@ use std::path::Path;
 
 use navigator_core::{Entry, EntryKind, NavPath};
 use navigator_fs::read_dir;
-use navigator_rclone::{RemoteSize, RemoteStat};
+use navigator_rclone::{RemoteSize, RemoteStat, RemoteTreeItem};
 
 /// Recursive tally across every file below `root`. Unreadable sub-trees
 /// are counted in `errors` and skipped; we never bail on a partial scan
@@ -339,9 +339,16 @@ pub fn format_unix_mode(mode: u32) -> String {
     out
 }
 
-/// Recursive enumeration → TOML. Dirs and files come out as two separate
-/// sorted arrays of relative paths with forward slashes, plus a header
-/// block with totals. Parsable by any TOML library; friendly to diff.
+/// Recursive enumeration of a **local** tree → TOML. Dirs and files come
+/// out as two separate sorted arrays of relative paths with forward
+/// slashes, plus a header block with totals. Parsable by any TOML library;
+/// friendly to diff.
+///
+/// Remote paths must not come here: this walks with
+/// `navigator_fs::read_dir`, i.e. `FindFirstFileExW` on the synthetic
+/// `\\?\NavigatorRemote\…` string, which fails at the root and yields a
+/// tree of zeroes. `AppState::op_dump_tree` routes them to
+/// [`dump_tree_toml_remote`] instead.
 pub fn dump_tree_toml(root: &NavPath) -> String {
     let mut dirs: Vec<String> = Vec::new();
     let mut files: Vec<String> = Vec::new();
@@ -373,16 +380,64 @@ pub fn dump_tree_toml(root: &NavPath) -> String {
             }
         }
     }
+    render_tree_toml(root, dirs, files, total_size, errors, None)
+}
+
+/// Same output as [`dump_tree_toml`], built from one
+/// `rclone lsjson --recursive` walk instead of a filesystem enumeration.
+/// `items` already carry root-relative forward-slashed paths, so there is
+/// no path arithmetic to redo here — which is also why this half is pure
+/// and unit-testable without an rclone binary.
+pub fn dump_tree_toml_remote(root: &NavPath, items: &[RemoteTreeItem]) -> String {
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    let mut total_size: u64 = 0;
+    for i in items {
+        if i.is_dir {
+            dirs.push(i.path.clone());
+        } else {
+            files.push(i.path.clone());
+            total_size = total_size.saturating_add(i.size);
+        }
+    }
+    render_tree_toml(root, dirs, files, total_size, 0, None)
+}
+
+/// Render a *failed* walk. An rclone error must never be formatted as an
+/// empty tree — zero counts with no explanation is exactly the symptom
+/// that made a remote dump look like an empty folder.
+pub fn dump_tree_toml_error(root: &NavPath, err: &str) -> String {
+    render_tree_toml(root, Vec::new(), Vec::new(), 0, 1, Some(err))
+}
+
+/// Shared formatter for both walks so their output can't drift apart.
+/// Sorting happens here — every caller wants the same stable order.
+fn render_tree_toml(
+    root: &NavPath,
+    mut dirs: Vec<String>,
+    mut files: Vec<String>,
+    total_size: u64,
+    errors: u64,
+    error_msg: Option<&str>,
+) -> String {
     dirs.sort();
     files.sort();
 
+    // Remote roots display in rclone form (`mac:Downloads`) rather than as
+    // the internal `\\?\NavigatorRemote\…` sentinel — same rule the title
+    // bar and address bar follow.
+    let label = root.rclone_arg().unwrap_or_else(|| root.to_string());
+
     let mut s = String::new();
-    s.push_str(&format!("root = {}\n", toml_string(&root.to_string())));
+    s.push_str(&format!("root = {}\n", toml_string(&label)));
     s.push_str(&format!("dir_count = {}\n", dirs.len()));
     s.push_str(&format!("file_count = {}\n", files.len()));
     s.push_str(&format!("total_size = {}\n", total_size));
     if errors > 0 {
         s.push_str(&format!("errors = {}\n", errors));
+    }
+    if let Some(msg) = error_msg {
+        s.push_str(&format!("error = {}\n", toml_string(msg)));
     }
     s.push_str("\ndirs = [\n");
     for d in &dirs {
@@ -607,6 +662,57 @@ mod tests {
                 "relative path has backslashes: {line}"
             );
         }
+    }
+
+    fn tree_item(path: &str, is_dir: bool, size: u64) -> RemoteTreeItem {
+        RemoteTreeItem {
+            path: path.into(),
+            is_dir,
+            size,
+        }
+    }
+
+    /// The remote dump is fed by `lsjson --recursive`, so it must split
+    /// dirs from files, total only file bytes, and label the root in rclone
+    /// form — never the `\\?\NavigatorRemote\…` sentinel the user never
+    /// typed.
+    #[test]
+    fn dump_tree_toml_remote_splits_dirs_from_files_and_labels_root() {
+        let root = NavPath::remote("mac", "Downloads");
+        let items = vec![
+            tree_item("a.txt", false, 1),
+            tree_item("sub", true, 0),
+            tree_item("sub/b.txt", false, 2),
+            tree_item("emptydir", true, 0),
+        ];
+        let out = dump_tree_toml_remote(&root, &items);
+        assert!(out.contains("root = \"mac:Downloads\""), "root in:\n{out}");
+        assert!(!out.contains("NavigatorRemote"), "sentinel leaked:\n{out}");
+        assert!(out.contains("file_count = 2"), "file_count in:\n{out}");
+        assert!(out.contains("dir_count = 2"), "dir_count in:\n{out}");
+        assert!(out.contains("total_size = 3"), "total_size in:\n{out}");
+        assert!(out.contains("\"sub/b.txt\""), "nested file in:\n{out}");
+        assert!(out.contains("\"emptydir\""), "empty dir in:\n{out}");
+        // A successful walk carries no error keys, however empty it is.
+        assert!(!out.contains("errors ="), "spurious errors in:\n{out}");
+    }
+
+    /// A failed rclone walk must not render as a well-formed empty tree —
+    /// that indistinguishability is the original bug. The error text has to
+    /// appear in the dump itself, since the viewer is all the user sees.
+    #[test]
+    fn dump_tree_toml_error_is_distinguishable_from_an_empty_tree() {
+        let root = NavPath::remote("mac", "Downloads");
+        let empty = dump_tree_toml_remote(&root, &[]);
+        let failed = dump_tree_toml_error(&root, "rclone lsjson --recursive mac:Downloads failed");
+        assert!(empty.contains("file_count = 0"));
+        assert!(failed.contains("file_count = 0"));
+        assert_ne!(empty, failed);
+        assert!(failed.contains("errors = 1"), "errors in:\n{failed}");
+        assert!(
+            failed.contains("error = \"rclone lsjson --recursive mac:Downloads failed\""),
+            "message in:\n{failed}"
+        );
     }
 
     #[test]
