@@ -72,6 +72,12 @@ pub struct Stats {
     pub elapsedTime: f64,
     #[serde(default)]
     pub errors: u64,
+    /// rclone's own summary of what went wrong, attached to every stats
+    /// tick once `errors > 0`. It is the fallback error message when a
+    /// run leaves no `Failed to …` verdict behind — see
+    /// [`crate::error::ErrorCollector`].
+    #[serde(default)]
+    pub lastError: Option<String>,
     /// Files moving right now. A stats record carries no top-level
     /// `object` — that only appears on the per-file INFO records, which
     /// fire when a transfer *ends* — so this is the only source for "what

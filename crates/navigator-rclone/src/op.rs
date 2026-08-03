@@ -8,13 +8,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::Value;
 
 use navigator_core::{ConflictMode, Entry, EntryKind, FileTime, NavPath};
 
+use crate::error::{ErrorCollector, RcloneError};
 use crate::log::{LogEvent, LogLevel};
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -286,7 +287,20 @@ impl Progress {
 pub enum OpEvent {
     Log(LogEvent),
     Progress(Progress),
-    Done { success: bool, stderr_tail: String },
+    Done {
+        success: bool,
+        /// rclone's exit code, `None` if the child was killed or never
+        /// reaped. rclone documents these (3 = directory not found,
+        /// 4 = file not found, …) and [`RcloneError`] uses it to classify
+        /// failures whose text it doesn't recognise.
+        exit_code: Option<i32>,
+        /// Distilled failure, `None` on success. This replaced a raw
+        /// `stderr_tail: String` — every consumer was showing or speaking
+        /// JSON log records at the user, timestamps and Go source
+        /// locations included, because the real sentence was at the end
+        /// of the last line and nothing was pulling it out.
+        error: Option<RcloneError>,
+    },
 }
 
 /// Handle returned by [`RcloneDriver::spawn`]. Dropping it does *not* kill
@@ -495,22 +509,27 @@ impl RcloneDriver {
         let cancelled = Arc::new(AtomicBool::new(false));
         let child_slot = Arc::new(Mutex::new(Some(child)));
 
+        // Both readers distil into one collector. Errors can arrive on
+        // either pipe: rclone logs to stderr, but a bad flag is rejected
+        // on stdout before the logger exists.
+        let errors = Arc::new(Mutex::new(ErrorCollector::default()));
+
         let tx_out = tx.clone();
-        thread::spawn(move || {
+        let err_out = Arc::clone(&errors);
+        let reader_out = thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
-                forward_line(&tx_out, &line);
+                forward_line(&tx_out, &line, &err_out);
             }
         });
-        let (err_sink_tx, err_sink_rx) = bounded::<String>(1024);
         let tx_err = tx.clone();
-        thread::spawn(move || {
+        let err_err = Arc::clone(&errors);
+        let reader_err = thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(|l| l.ok()) {
-                let _ = err_sink_tx.try_send(line.clone());
-                forward_line(&tx_err, &line);
+                forward_line(&tx_err, &line, &err_err);
             }
         });
 
-        // Waiter thread: wait for exit, fold tail of stderr into Done.
+        // Waiter thread: wait for exit, then distil the failure into Done.
         let child_for_wait = Arc::clone(&child_slot);
         thread::spawn(move || {
             let status = {
@@ -520,15 +539,21 @@ impl RcloneDriver {
                     None => None,
                 }
             };
+            // Join before reporting. `wait` returns when the process
+            // exits, but the readers may still be draining buffered pipe
+            // data — and the error we want is the *last* thing rclone
+            // wrote. Sampling the collector at exit raced that write and
+            // could report the run's first complaint, or nothing at all.
+            let _ = reader_out.join();
+            let _ = reader_err.join();
+
             let success = status.map(|s| s.success()).unwrap_or(false);
-            let mut tail = String::new();
-            while let Ok(line) = err_sink_rx.try_recv() {
-                tail.push_str(&line);
-                tail.push('\n');
-            }
+            let exit_code = status.and_then(|s| s.code());
+            let error = (!success).then(|| errors.lock().finish(exit_code));
             let _ = tx.send(OpEvent::Done {
                 success,
-                stderr_tail: tail,
+                exit_code,
+                error,
             });
         });
 
@@ -970,9 +995,10 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-fn forward_line(tx: &Sender<OpEvent>, line: &str) {
+fn forward_line(tx: &Sender<OpEvent>, line: &str, errors: &Mutex<ErrorCollector>) {
     let Ok(ev) = serde_json::from_str::<LogEvent>(line) else {
         // Non-JSON lines happen for banners/warnings; wrap them.
+        errors.lock().observe_raw(line);
         let _ = tx.send(OpEvent::Log(LogEvent {
             level: None,
             msg: line.to_string(),
@@ -984,6 +1010,7 @@ fn forward_line(tx: &Sender<OpEvent>, line: &str) {
         }));
         return;
     };
+    errors.lock().observe(&ev);
 
     if let Some(s) = ev.stats.as_ref() {
         let _ = tx.send(OpEvent::Progress(Progress {
@@ -1202,6 +1229,12 @@ fn path_arg(p: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `forward_line` with a throwaway error collector, for the tests
+    /// that only care about the progress/log side of the split.
+    fn forward(tx: &Sender<OpEvent>, line: &str) {
+        forward_line(tx, line, &Mutex::new(ErrorCollector::default()));
+    }
 
     /// Verbatim `rclone lsjson --recursive --no-modtime` output (1.73.5).
     /// Pins the facts the tree dump depends on: `Path` carries the
@@ -1567,7 +1600,7 @@ mod tests {
     #[test]
     fn stats_records_become_a_full_progress_event() {
         let (tx, rx) = unbounded::<OpEvent>();
-        forward_line(
+        forward(
             &tx,
             r#"{"level":"notice","msg":"Transferred: 45 MiB","stats":{"bytes":47185920,"totalBytes":104857600,"transfers":9,"totalTransfers":20,"speed":5242880.0,"eta":11,"errors":0}}"#,
         );
@@ -1592,7 +1625,7 @@ mod tests {
     #[test]
     fn a_real_rclone_stats_line_parses_end_to_end() {
         let (tx, rx) = unbounded::<OpEvent>();
-        forward_line(
+        forward(
             &tx,
             r#"{"time":"2026-07-27T10:47:53.3371482+02:00","level":"notice","msg":"      444 KiB / 17.166 MiB, 3%, 0 B/s, ETA - (xfr#0/6)\n","stats":{"bytes":454656,"checks":0,"deletedDirs":0,"deletes":0,"elapsedTime":0.1988474,"errors":0,"eta":null,"fatalError":false,"listed":6,"renames":0,"retryError":false,"serverSideCopies":0,"speed":0,"totalBytes":18000000,"totalChecks":0,"totalTransfers":6,"transferTime":0.1988474,"transferring":[{"bytes":454656,"eta":null,"group":"global_stats","name":"f1.bin","percentage":15,"size":3000000,"speed":2292396.29}],"transfers":0},"source":"slog/logger.go:256"}"#,
         );
@@ -1616,7 +1649,7 @@ mod tests {
     #[test]
     fn useless_eta_values_are_dropped() {
         let (tx, rx) = unbounded::<OpEvent>();
-        forward_line(
+        forward(
             &tx,
             r#"{"level":"notice","msg":"x","stats":{"bytes":1,"totalBytes":2,"eta":0}}"#,
         );

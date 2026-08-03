@@ -540,6 +540,110 @@ fn preflight_on_missing_source_reports_error() {
     );
 }
 
+// --- Failure reporting ----------------------------------------------------
+
+/// Drive an op that is expected to fail and return what `Done` carried.
+fn run_for_error(
+    driver: &RcloneDriver,
+    op: Operation,
+) -> (bool, Option<i32>, Option<navigator_rclone::RcloneError>) {
+    let h = driver.spawn(op).expect("spawn");
+    for ev in h.events.iter() {
+        if let OpEvent::Done {
+            success,
+            exit_code,
+            error,
+        } = ev
+        {
+            return (success, exit_code, error);
+        }
+    }
+    panic!("stream ended without Done");
+}
+
+/// The failure the user hits most: acting on something that isn't there
+/// any more (stale listing, a peer instance already moved it). rclone
+/// reports it across five JSON records; what reaches the app has to be
+/// the sentence, not the records.
+#[test]
+fn deleting_a_missing_file_reports_a_typed_error() {
+    if !rclone_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let driver = RcloneDriver::from_path();
+    let (ok, code, err) = run_for_error(
+        &driver,
+        Operation::Delete {
+            targets: vec![nav(&dir.path().join("never-existed.txt"))],
+            is_dir: false,
+        },
+    );
+    assert!(!ok, "deleting a missing file must fail");
+    assert_eq!(code, Some(4), "rclone documents 4 as file-not-found");
+
+    let err = err.expect("a failed op must carry an error");
+    assert_eq!(err.kind, navigator_rclone::ErrorKind::NotFound);
+    assert_eq!(err.summary(), "not found");
+    // The whole point: no JSON, no timestamp, no Go source location.
+    assert!(
+        !err.message.contains("{\"") && !err.message.contains("slog/logger.go"),
+        "message still carries log-record scaffolding: {}",
+        err.message
+    );
+    assert!(
+        !err.message.starts_with("Attempt "),
+        "retry wrapper not stripped: {}",
+        err.message
+    );
+    // Three identical retries, one line of detail.
+    assert_eq!(err.detail.len(), 1, "retries must dedupe: {:?}", err.detail);
+}
+
+/// Same for a copy whose source vanished, which fails in a different
+/// place (rclone can't even build the source filesystem) and exits 3
+/// rather than 4.
+#[test]
+fn copying_a_missing_source_reports_a_typed_error() {
+    if !rclone_available() {
+        return;
+    }
+    let dst = tempfile::tempdir().unwrap();
+    let driver = RcloneDriver::from_path();
+    let (ok, code, err) = run_for_error(
+        &driver,
+        Operation::CopyTo {
+            src: nav(Path::new(r"C:\does_not_exist_8b3a7c\nope.bin")),
+            dst: nav(&dst.path().join("nope.bin")),
+        },
+    );
+    assert!(!ok);
+    assert_eq!(code, Some(3), "rclone documents 3 as directory-not-found");
+    let err = err.expect("a failed op must carry an error");
+    assert_eq!(err.kind, navigator_rclone::ErrorKind::NotFound);
+    assert_eq!(err.summary(), "not found");
+}
+
+/// A successful op must not manufacture an error — `Done.error` is the
+/// signal callers branch on.
+#[test]
+fn a_successful_op_carries_no_error() {
+    if !rclone_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let driver = RcloneDriver::from_path();
+    let (ok, code, err) = run_for_error(
+        &driver,
+        Operation::Touch {
+            file: nav(&dir.path().join("fine.txt")),
+        },
+    );
+    assert!(ok);
+    assert_eq!(code, Some(0));
+    assert!(err.is_none(), "success must not report an error");
+}
+
 #[test]
 fn default_transfers_value_matches_constant() {
     // Fresh drivers carry the library default. Tied to the constant so

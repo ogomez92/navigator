@@ -190,6 +190,201 @@ impl Cadence {
     }
 }
 
+/// One thing that went wrong inside a job.
+///
+/// Built from a [`navigator_rclone::RcloneError`], or by hand for a
+/// failure rclone never saw (a `--files-from` list we couldn't stage, a
+/// batch that exited 0 with destinations missing).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Failure {
+    /// Short phrase naming the problem: "not found", "permission denied".
+    pub reason: String,
+    /// What it happened to, when the job knows. The job usually does and
+    /// rclone usually doesn't — rclone names a `\\?\`-prefixed absolute
+    /// path or a Go `Fs` description, where the caller has the filename
+    /// the user selected.
+    pub subject: Option<String>,
+    /// Supporting rclone lines for the details block.
+    pub detail: Vec<String>,
+}
+
+impl Failure {
+    /// A failure the app itself detected, with no rclone error behind it.
+    pub fn app(reason: impl Into<String>, subject: Option<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            subject,
+            detail: Vec::new(),
+        }
+    }
+
+    /// Adopt a distilled rclone error. `subject` is the caller's name for
+    /// the item, which beats anything in the log — rclone's own `object`
+    /// is used only as the fallback.
+    ///
+    /// Takes `reason()` rather than `summary()`: the subject lives in its
+    /// own field here, and `summary()` folds it into the sentence, so
+    /// using it would name the item twice ("not found: C:\x\notes.txt,
+    /// notes.txt") and defeat the grouping — two files failing the same
+    /// way would look like two different reasons.
+    pub fn from_rclone(e: &navigator_rclone::RcloneError, subject: Option<String>) -> Self {
+        Self {
+            reason: e.reason(),
+            subject: subject.or_else(|| e.object.clone()),
+            detail: e.detail.clone(),
+        }
+    }
+}
+
+/// What to tell the user about a job that failed: one dialog, one spoken
+/// line, however many invocations went wrong.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FailureReport {
+    /// Dialog caption.
+    pub title: String,
+    /// One line, spoken and repeated at the top of the body.
+    pub headline: String,
+    pub body: String,
+}
+
+/// Subjects listed per distinct reason before the line trails off. Enough
+/// to recognise which files are affected without turning the dialog into
+/// a file listing.
+const MAX_SUBJECTS: usize = 8;
+/// rclone detail lines carried into the dialog.
+const MAX_DETAIL: usize = 8;
+
+/// Collapse a job's failures into one report, or `None` when nothing
+/// failed.
+///
+/// **Errors belong to the job, not the invocation** — the same rule
+/// [`Meter`] enforces for progress. Reporting per invocation meant a
+/// five-item delete of files that were already gone put up five identical
+/// modal dialogs, each blocking the worker until dismissed. Identical
+/// reasons collapse to one line with a count, so the common case (one
+/// cause, many items) reads as one sentence.
+pub fn failure_report(verb: &str, total: u64, failures: &[Failure]) -> Option<FailureReport> {
+    if failures.is_empty() {
+        return None;
+    }
+    let noun = past_tense(verb);
+
+    // Group by reason, first-seen order. Not a HashMap: the order the
+    // failures happened in is the order they make sense in.
+    let mut groups: Vec<(&str, Vec<&str>, usize)> = Vec::new();
+    for f in failures {
+        let subject = f.subject.as_deref();
+        match groups.iter_mut().find(|(r, _, _)| *r == f.reason) {
+            Some((_, subjects, count)) => {
+                *count += 1;
+                if let Some(s) = subject {
+                    subjects.push(s);
+                }
+            }
+            None => groups.push((f.reason.as_str(), subject.into_iter().collect(), 1)),
+        }
+    }
+
+    let n = failures.len();
+    let headline = match (n, groups.len()) {
+        // One failure: name it and what it happened to.
+        (1, _) => {
+            let (reason, subjects, _) = &groups[0];
+            match subjects.first() {
+                Some(s) => format!("{} failed: {}, {}", noun, reason, s),
+                None => format!("{} failed: {}", noun, reason),
+            }
+        }
+        // Many failures, one cause: say the cause once.
+        (n, 1) => format!(
+            "{} failed for {}: {}",
+            noun,
+            count_of(n, total),
+            groups[0].0
+        ),
+        // Many causes: the body enumerates them.
+        (n, g) => format!(
+            "{} failed for {}, {} different errors",
+            noun,
+            count_of(n, total),
+            g
+        ),
+    };
+
+    let mut body = headline.clone();
+    if groups.len() > 1 || groups[0].1.len() > 1 {
+        body.push('\n');
+        for (reason, subjects, count) in &groups {
+            body.push('\n');
+            if *count > 1 {
+                body.push_str(&format!("{} ({}):", reason, count));
+            } else {
+                body.push_str(&format!("{}:", reason));
+            }
+            if subjects.is_empty() {
+                body.pop(); // no list to introduce — drop the colon
+                continue;
+            }
+            body.push(' ');
+            body.push_str(&subjects[..subjects.len().min(MAX_SUBJECTS)].join(", "));
+            if subjects.len() > MAX_SUBJECTS {
+                body.push_str(&format!(", … and {} more", subjects.len() - MAX_SUBJECTS));
+            }
+        }
+    }
+
+    // rclone's own words, last, for anyone who wants them. Deduped across
+    // failures: a batch that failed for one reason repeats one detail line
+    // per invocation.
+    let mut details: Vec<&str> = Vec::new();
+    for f in failures {
+        for d in &f.detail {
+            if d != &headline && !details.contains(&d.as_str()) {
+                details.push(d);
+            }
+        }
+    }
+    if !details.is_empty() {
+        body.push_str("\n\nrclone said:\n");
+        for d in details.iter().take(MAX_DETAIL) {
+            body.push_str(d);
+            body.push('\n');
+        }
+        if details.len() > MAX_DETAIL {
+            body.push_str(&format!("… and {} more\n", details.len() - MAX_DETAIL));
+        }
+    }
+
+    Some(FailureReport {
+        title: format!("{} failed", noun),
+        headline,
+        body,
+    })
+}
+
+/// "3 of 5 items", or just "3 items" when the total says nothing extra.
+fn count_of(n: usize, total: u64) -> String {
+    if total as usize > n {
+        format!("{} of {} items", n, total)
+    } else {
+        format!("{} items", n)
+    }
+}
+
+/// Turn the progress window's gerund into the noun a failure headline
+/// wants: "Copying" → "Copy". Unknown verbs pass through — a wrong-but-
+/// readable headline beats a panic or an empty title.
+fn past_tense(verb: &str) -> &str {
+    match verb {
+        "Copying" => "Copy",
+        "Moving" => "Move",
+        "Deleting" => "Delete",
+        "Creating" => "Create",
+        "Extracting" => "Extract",
+        other => other,
+    }
+}
+
 /// Detail line for the progress window. Unlike [`phrase`] this is read at
 /// leisure, so it carries everything: counts, bytes, rate and ETA.
 pub fn window_status(m: &Meter, p: &navigator_rclone::Progress) -> String {
@@ -478,5 +673,132 @@ mod tests {
         m.set_fraction(0.5);
         assert_eq!(window_title("Copying", &m), "50% — Copying");
         assert_eq!(window_title("Copying", &Meter::new(0)), "Copying");
+    }
+
+    fn fail(reason: &str, subject: &str) -> Failure {
+        Failure::app(reason, Some(subject.into()))
+    }
+
+    /// A job that succeeded has nothing to report, and the caller uses
+    /// `None` to decide whether to open a dialog at all.
+    #[test]
+    fn no_failures_means_no_report() {
+        assert!(failure_report("Copying", 5, &[]).is_none());
+    }
+
+    /// The single-item case is the one the user hits most, and it should
+    /// read as one plain sentence — cause and item, no counts.
+    #[test]
+    fn one_failure_names_the_cause_and_the_item() {
+        let r = failure_report("Deleting", 1, &[fail("not found", "notes.txt")]).unwrap();
+        assert_eq!(r.title, "Delete failed");
+        assert_eq!(r.headline, "Delete failed: not found, notes.txt");
+        // Nothing to enumerate, so the body is just the sentence.
+        assert_eq!(r.body, r.headline);
+    }
+
+    /// Many items failing for one reason is the second-most common case
+    /// (a stale listing, a disconnected drive). The cause is stated once,
+    /// not once per item — this is what replaced a dialog per invocation.
+    #[test]
+    fn identical_reasons_collapse_to_one_line_with_a_count() {
+        let r = failure_report(
+            "Deleting",
+            5,
+            &[
+                fail("not found", "a.txt"),
+                fail("not found", "b.txt"),
+                fail("not found", "c.txt"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(r.headline, "Delete failed for 3 of 5 items: not found");
+        assert!(
+            r.body.contains("not found (3): a.txt, b.txt, c.txt"),
+            "the body still names which items: {}",
+            r.body
+        );
+    }
+
+    /// Mixed causes can't be summarised in the headline, so it counts
+    /// them and the body breaks them down.
+    #[test]
+    fn distinct_reasons_are_enumerated_in_the_body() {
+        let r = failure_report(
+            "Copying",
+            4,
+            &[
+                fail("not found", "gone.txt"),
+                fail("permission denied", "locked.txt"),
+                fail("permission denied", "system.dll"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            r.headline,
+            "Copy failed for 3 of 4 items, 2 different errors"
+        );
+        assert!(r.body.contains("not found: gone.txt"), "{}", r.body);
+        assert!(
+            r.body
+                .contains("permission denied (2): locked.txt, system.dll"),
+            "{}",
+            r.body
+        );
+    }
+
+    /// A 200-file paste that fails wholesale must not paste 200 filenames
+    /// into a message box — but it must say that it is holding some back,
+    /// or the list reads as complete.
+    #[test]
+    fn long_subject_lists_are_truncated_audibly() {
+        let items: Vec<Failure> = (0..30)
+            .map(|i| fail("not found", &format!("f{i}.txt")))
+            .collect();
+        let r = failure_report("Copying", 30, &items).unwrap();
+        assert_eq!(r.headline, "Copy failed for 30 items: not found");
+        assert!(r.body.contains("… and 22 more"), "{}", r.body);
+    }
+
+    /// rclone's own sentence is kept, once, after ours — deduped, because
+    /// every invocation in a batch reports the same one.
+    #[test]
+    fn rclone_detail_is_appended_once() {
+        let mut a = fail("not found", "a.txt");
+        a.detail = vec!["a.txt is a directory or doesn't exist: object not found".into()];
+        let mut b = fail("not found", "b.txt");
+        b.detail = a.detail.clone();
+        let r = failure_report("Deleting", 2, &[a, b]).unwrap();
+        assert_eq!(
+            r.body.matches("is a directory or doesn't exist").count(),
+            1,
+            "the same rclone line must not repeat: {}",
+            r.body
+        );
+        assert!(r.body.contains("rclone said:"), "{}", r.body);
+    }
+
+    /// The caller's name for an item beats rclone's: the job knows the
+    /// filename the user selected, rclone knows a `\\?\` absolute path.
+    /// The reason must stay free of the item either way, or grouping
+    /// breaks — two files failing identically would read as two reasons.
+    #[test]
+    fn the_callers_subject_wins_over_rclones_object() {
+        let e = navigator_rclone::RcloneError {
+            kind: navigator_rclone::ErrorKind::NotFound,
+            message: "object not found".into(),
+            object: Some("C:/very/long/path/notes.txt".into()),
+            exit_code: Some(4),
+            detail: vec!["object not found".into()],
+        };
+        let with = Failure::from_rclone(&e, Some("notes.txt".into()));
+        assert_eq!(with.subject.as_deref(), Some("notes.txt"));
+        assert_eq!(with.reason, "not found");
+        // With no caller subject, rclone's object is better than nothing.
+        let without = Failure::from_rclone(&e, None);
+        assert_eq!(
+            without.subject.as_deref(),
+            Some("C:/very/long/path/notes.txt")
+        );
     }
 }

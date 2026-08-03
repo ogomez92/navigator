@@ -31,10 +31,14 @@ use navigator_rclone::op::{Operation, RcloneDriver, op_args};
 /// Outcome of a UAC-elevated rclone retry.
 pub struct Outcome {
     pub success: bool,
-    /// Tail of the elevated child's combined log output (whatever
-    /// `--log-file` captured). Empty when the file was missing or
-    /// unreadable.
+    /// The elevated child's combined log output (whatever `--log-file`
+    /// captured). Empty when the file was missing or unreadable. Same
+    /// JSON records the piped path streams, so it distils through
+    /// [`navigator_rclone::RcloneError::from_log_text`].
     pub log_tail: String,
+    /// Exit code of the elevated child, for the same classification the
+    /// piped path gets from `Done`.
+    pub exit_code: Option<i32>,
 }
 
 /// Re-issue `op` under UAC elevation. Blocks until the elevated child
@@ -100,6 +104,7 @@ pub fn run(driver: &RcloneDriver, op: &Operation) -> std::io::Result<Outcome> {
     Ok(Outcome {
         success: exit_code == 0,
         log_tail: tail,
+        exit_code: Some(exit_code as i32),
     })
 }
 

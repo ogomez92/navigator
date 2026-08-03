@@ -989,22 +989,20 @@ impl AppState {
                 let mut success = false;
                 for ev in handle.events.iter() {
                     if let OpEvent::Done {
-                        success: ok,
-                        stderr_tail,
+                        success: ok, error, ..
                     } = ev
                     {
                         success = ok;
                         if !ok {
-                            let tail = stderr_tail.lines().next_back().unwrap_or("").to_string();
+                            let why = error
+                                .as_ref()
+                                .map(|e| e.summary())
+                                .unwrap_or_else(|| "see log".into());
+                            if let Some(e) = error.as_ref() {
+                                error!("remote download: {}", e.log_line());
+                            }
                             let _ = speech.send(crate::speech::Utterance {
-                                text: format!(
-                                    "download failed: {}",
-                                    if tail.is_empty() {
-                                        "see log".into()
-                                    } else {
-                                        tail
-                                    }
-                                ),
+                                text: format!("download failed: {}", why),
                                 interrupt: true,
                             });
                         }
@@ -1574,6 +1572,7 @@ impl AppState {
             .spawn(move || {
                 let mut ok_count = 0usize;
                 let mut fail_count = 0usize;
+                let mut why = String::new();
                 for (t, is_dir) in &targets {
                     let op = Operation::Delete {
                         targets: vec![t.clone()],
@@ -1591,11 +1590,22 @@ impl AppState {
                         }
                     };
                     for ev in handle.events.iter() {
-                        if let OpEvent::Done { success, .. } = ev {
+                        if let OpEvent::Done { success, error, .. } = ev {
                             if success {
                                 ok_count += 1;
                             } else {
                                 fail_count += 1;
+                                // Keep the first reason: a remote delete
+                                // that fails wholesale (expired token, no
+                                // network) fails identically for every
+                                // item, and "3 failed" alone gives the
+                                // user nothing to act on.
+                                if why.is_empty()
+                                    && let Some(e) = error.as_ref()
+                                {
+                                    error!("remote delete: {}", e.log_line());
+                                    why = e.summary();
+                                }
                             }
                             break;
                         }
@@ -1607,10 +1617,10 @@ impl AppState {
                     SoundEvent::Error
                 });
                 let _ = speech.send(crate::speech::Utterance {
-                    text: if fail_count == 0 {
-                        format!("deleted {} remote item(s)", ok_count)
-                    } else {
-                        format!("deleted {}, {} failed", ok_count, fail_count)
+                    text: match (fail_count, why.is_empty()) {
+                        (0, _) => format!("deleted {} remote item(s)", ok_count),
+                        (n, false) => format!("deleted {}, {} failed: {}", ok_count, n, why),
+                        (n, true) => format!("deleted {}, {} failed", ok_count, n),
                     },
                     interrupt: fail_count > 0,
                 });
@@ -2362,15 +2372,17 @@ impl AppState {
                     }
                 };
                 let mut success = false;
-                let mut tail = String::new();
+                let mut why = String::new();
                 for ev in handle.events.iter() {
                     if let OpEvent::Done {
-                        success: ok,
-                        stderr_tail,
+                        success: ok, error, ..
                     } = ev
                     {
                         success = ok;
-                        tail = stderr_tail;
+                        if let Some(e) = error.as_ref() {
+                            error!("remote upload: {}", e.log_line());
+                            why = e.summary();
+                        }
                         break;
                     }
                 }
@@ -2397,15 +2409,10 @@ impl AppState {
                     }
                 } else {
                     cache.finish_prompt(&staged, None);
-                    let last = tail.lines().next_back().unwrap_or("").to_string();
                     let _ = speech.send(crate::speech::Utterance {
                         text: format!(
                             "upload failed: {}",
-                            if last.is_empty() {
-                                "see log".into()
-                            } else {
-                                last
-                            }
+                            if why.is_empty() { "see log" } else { &why }
                         ),
                         interrupt: true,
                     });
@@ -2611,6 +2618,18 @@ struct OpProgress {
     /// exist — is what left this line permanently blank.
     current_file: String,
     stats: navigator_rclone::Progress,
+    /// Parent for the failure dialog. The job reports from the worker
+    /// thread it ran on, like every other dialog `WorkerCtx` opens.
+    hwnd: Option<HwndSend>,
+    /// Everything that went wrong, reported once by [`Self::finish`].
+    ///
+    /// **A user action is not an rclone invocation** — the same rule the
+    /// meter enforces for progress. Each invocation used to open its own
+    /// modal error dialog, so deleting five files that were already gone
+    /// meant five identical dialogs, each blocking the worker until
+    /// dismissed, and a batch that failed per-group put one up mid-job
+    /// while later groups were still running.
+    failures: Vec<crate::narrate::Failure>,
 }
 
 impl OpProgress {
@@ -2631,6 +2650,8 @@ impl OpProgress {
             cancelled: Arc::new(AtomicBool::new(false)),
             current_file: String::new(),
             stats: navigator_rclone::Progress::default(),
+            hwnd: ctx.hwnd,
+            failures: Vec::new(),
         };
         if let Some(w) = me.window.as_ref() {
             w.post_begin(&crate::narrate::window_title(verb, &me.meter));
@@ -2748,18 +2769,72 @@ impl OpProgress {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    /// Close the job out in the window. Called once, by whoever owns the
-    /// job — never by `run_op`, which would flip the window to "Done."
-    /// after the first of several invocations.
+    /// Record an rclone failure against the job. `subject` is the job's
+    /// own name for the item — better than anything in the log, which
+    /// carries `\\?\` absolute paths and Go filesystem descriptions.
+    fn record_failure(&mut self, err: &navigator_rclone::RcloneError, subject: Option<String>) {
+        error!("rclone: {}", err.log_line());
+        self.failures
+            .push(crate::narrate::Failure::from_rclone(err, subject));
+    }
+
+    /// As [`Self::record_failure`], but for a failure that survived a UAC
+    /// retry. The user approved elevation and it *still* failed, which is
+    /// a different problem from a plain denial and needs to say so —
+    /// otherwise the report reads as "permission denied" to someone who
+    /// just granted permission.
+    fn record_elevated_failure(
+        &mut self,
+        err: &navigator_rclone::RcloneError,
+        subject: Option<String>,
+    ) {
+        error!("rclone (elevated): {}", err.log_line());
+        let mut f = crate::narrate::Failure::from_rclone(err, subject);
+        f.reason = format!("{} even as administrator", f.reason);
+        self.failures.push(f);
+    }
+
+    /// Record a failure the app detected itself, with no rclone error
+    /// behind it — a `--files-from` list we couldn't stage, or a batch
+    /// that exited 0 with destinations missing. Without this those
+    /// failures reach `finish` invisibly and the job closes clean.
+    fn record_problem(&mut self, reason: impl Into<String>, subject: Option<String>) {
+        let f = crate::narrate::Failure::app(reason, subject);
+        error!("operation failed: {} {:?}", f.reason, f.subject);
+        self.failures.push(f);
+    }
+
+    /// Close the job out in the window and report whatever went wrong.
+    /// Called once, by whoever owns the job — never by `run_op`, which
+    /// would flip the window to "Done." after the first of several
+    /// invocations.
     ///
     /// A cancelled job is never "Done." no matter what the last invocation
     /// returned, so the flag overrides the caller's verdict here rather
-    /// than at each of the four call sites.
-    fn finish(&self, success: bool) {
+    /// than at each of the four call sites. A cancelled job also reports
+    /// nothing: the failures it collected are the user's own doing.
+    fn finish(&mut self, success: bool) {
         if let Some(w) = self.window.as_ref() {
             w.clear_cancel();
             w.post_done(success && !self.cancelled());
         }
+        if self.cancelled() {
+            self.failures.clear();
+            return;
+        }
+        let Some(report) =
+            crate::narrate::failure_report(self.verb, self.meter.total(), &self.failures)
+        else {
+            return;
+        };
+        self.failures.clear();
+        // Speak before the dialog: the headline is short and the dialog
+        // steals focus the moment it opens.
+        let _ = self.speech.try_send(crate::speech::Utterance {
+            text: report.headline.clone(),
+            interrupt: true,
+        });
+        crate::dialogs::show_error(self.hwnd, &report.title, &report.body);
     }
 }
 
@@ -3040,7 +3115,12 @@ impl WorkerCtx {
                 // percentage stalls short of 100 forever.
                 tracing::error!("could not write --files-from list: {e}");
                 prog.skip(group.names.len() as u64);
-                self.say("could not stage batch list", true);
+                prog.record_problem(
+                    format!("could not stage the batch list: {e}"),
+                    op_subject(&Operation::Mkdir {
+                        dir: dest_dir.clone(),
+                    }),
+                );
                 return (false, None);
             }
         };
@@ -3089,9 +3169,13 @@ impl WorkerCtx {
                 missing.len(),
                 missing.iter().take(3).collect::<Vec<_>>()
             );
-            self.say(
+            // Exit code 0 with nothing at the destination: rclone reads a
+            // directory in a `--files-from` list, transfers nothing and
+            // reports success. There is no rclone error to distil, so the
+            // job hears about it from us or not at all.
+            prog.record_problem(
                 format!("{} of {} items did not arrive", missing.len(), total),
-                true,
+                missing.first().map(|n| n.to_string()),
             );
             return (false, first);
         }
@@ -3576,7 +3660,8 @@ impl WorkerCtx {
                 }
                 navigator_rclone::op::OpEvent::Done {
                     success,
-                    stderr_tail,
+                    exit_code,
+                    error: rclone_error,
                 } => {
                     if success {
                         prune_empty_src_dirs(&op_for_retry);
@@ -3588,15 +3673,12 @@ impl WorkerCtx {
                     if prog.cancelled() {
                         return false;
                     }
-                    // Failed. If the tail looks like a Windows ACL
-                    // denial (writes to C:\, Program Files, etc.), retry
-                    // under UAC. The UAC prompt itself is the user
-                    // confirmation — no extra dialog. Don't loop more
-                    // than once: if the elevated retry also fails, the
-                    // problem isn't permission.
-                    let tail_lines: Vec<&str> = stderr_tail.lines().rev().take(10).collect();
-                    let tail = tail_lines.into_iter().rev().collect::<Vec<_>>().join("\n");
-                    error!("rclone: {tail}");
+                    // Failed. If this was a Windows ACL denial (writes to
+                    // C:\, Program Files, etc.), retry under UAC. The UAC
+                    // prompt itself is the user confirmation — no extra
+                    // dialog. Don't loop more than once: if the elevated
+                    // retry also fails, the problem isn't permission.
+                    let subject = op_subject(&op_for_retry);
 
                     // Probe the op's local destination for write
                     // permission rather than grepping rclone's tail —
@@ -3626,51 +3708,47 @@ impl WorkerCtx {
                                 return true;
                             }
                             Ok(out) => {
-                                let elev_tail = out
-                                    .log_tail
-                                    .lines()
-                                    .rev()
-                                    .take(10)
-                                    .collect::<Vec<_>>()
-                                    .into_iter()
-                                    .rev()
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                let body = if elev_tail.is_empty() {
-                                    tail.clone()
-                                } else {
-                                    elev_tail
-                                };
-                                crate::dialogs::show_error(
-                                    self.hwnd,
-                                    "File operation failed (even as administrator)",
-                                    if body.is_empty() {
-                                        "rclone reported an error"
-                                    } else {
-                                        &body
-                                    },
+                                // The elevated child couldn't be piped, so
+                                // it logged to a file — but it is the same
+                                // rclone log, and it goes through the same
+                                // distiller so an elevated failure reads
+                                // like any other.
+                                let elevated = navigator_rclone::RcloneError::from_log_text(
+                                    &out.log_tail,
+                                    out.exit_code,
                                 );
+                                let err = if elevated.message.is_empty() {
+                                    rclone_error.unwrap_or(elevated)
+                                } else {
+                                    elevated
+                                };
+                                prog.record_elevated_failure(&err, subject);
                                 return false;
                             }
                             Err(e) => {
                                 // ShellExecuteEx itself failed (UAC
-                                // declined, exe missing). Fall through
-                                // to the normal failure dialog with the
-                                // original tail.
+                                // declined, exe missing). Fall through to
+                                // the ordinary failure report with the
+                                // unelevated error.
                                 error!("elevated retry: {e}");
                             }
                         }
                     }
 
-                    crate::dialogs::show_error(
-                        self.hwnd,
-                        "File operation failed",
-                        if tail.is_empty() {
-                            "rclone reported an error"
-                        } else {
-                            &tail
-                        },
-                    );
+                    match rclone_error {
+                        Some(e) => prog.record_failure(&e, subject),
+                        // `Done` only omits the error when the op
+                        // succeeded, so this is unreachable in practice —
+                        // but a failure that reports nothing at all is the
+                        // one outcome the user can't act on.
+                        None => prog.record_problem(
+                            match exit_code {
+                                Some(c) => format!("rclone exited with code {c}"),
+                                None => "rclone failed".into(),
+                            },
+                            subject,
+                        ),
+                    }
                     return false;
                 }
             }
@@ -3693,6 +3771,32 @@ fn op_verb(op: &Operation) -> &'static str {
         Operation::Rename { .. } => "Moving",
         Operation::Delete { .. } => "Deleting",
         Operation::Mkdir { .. } | Operation::Touch { .. } => "Creating",
+    }
+}
+
+/// The item a failed operation should name, in the user's terms.
+///
+/// rclone names things too, but badly for this purpose: a `\\?\`-prefixed
+/// absolute path, or a Go filesystem description ("Local file system at
+/// //?/C:/…"). The op knows the filename the user actually selected.
+///
+/// A batch has no single subject — its whole point is that many files
+/// share one invocation — so it reports the destination folder instead of
+/// picking one of its members arbitrarily.
+fn op_subject(op: &Operation) -> Option<String> {
+    let name = |p: &NavPath| Some(p.file_name().to_string()).filter(|s| !s.is_empty());
+    match op {
+        Operation::Copy { sources, .. } | Operation::Move { sources, .. } => {
+            sources.first().and_then(name)
+        }
+        Operation::CopyBatch { dest_dir, .. } | Operation::MoveBatch { dest_dir, .. } => {
+            name(dest_dir)
+        }
+        Operation::Rename { src, .. } => name(src),
+        Operation::CopyTo { src, .. } => name(src),
+        Operation::Delete { targets, .. } => targets.first().and_then(name),
+        Operation::Mkdir { dir } => name(dir),
+        Operation::Touch { file } => name(file),
     }
 }
 

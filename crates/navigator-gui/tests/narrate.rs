@@ -18,7 +18,7 @@ use std::fs;
 use std::time::{Duration, Instant};
 
 use navigator_core::{ConflictMode, NavPath};
-use navigator_gui::narrate::{Cadence, Meter, phrase};
+use navigator_gui::narrate::{Cadence, Failure, Meter, failure_report, phrase};
 use navigator_rclone::op::OpEvent;
 use navigator_rclone::{Operation, RcloneDriver};
 
@@ -136,4 +136,62 @@ fn a_real_batch_copy_narrates_monotonic_progress() {
     for s in &spoken {
         assert!(s.len() < 40, "utterance too long to speak: {s:?}");
     }
+}
+
+/// The failure counterpart, closing the same loop: a real rclone error,
+/// through the distiller, into the exact sentence the user is told.
+///
+/// This is the case that motivated the rewrite. rclone reports a delete
+/// of a missing file as five JSON records — timestamps, Go source
+/// locations, three identical retries — and the dialog used to show the
+/// last ten of them verbatim. Asserting on the finished string is the
+/// only way to catch a regression back to that: every layer in between
+/// can look correct while the text stays unreadable.
+#[test]
+fn a_real_rclone_failure_becomes_one_readable_sentence() {
+    if !rclone_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("never-existed.txt");
+    let driver = RcloneDriver::from_path();
+    let handle = driver
+        .spawn(Operation::Delete {
+            targets: vec![NavPath::new(missing.clone()).unwrap()],
+            is_dir: false,
+        })
+        .expect("spawn");
+
+    let mut failures = Vec::new();
+    for ev in handle.events.iter() {
+        if let OpEvent::Done { success, error, .. } = ev {
+            assert!(!success);
+            let err = error.expect("a failed op must carry an error");
+            failures.push(Failure::from_rclone(&err, Some("never-existed.txt".into())));
+            break;
+        }
+    }
+
+    let report = failure_report("Deleting", 1, &failures).expect("a failure must report");
+    assert_eq!(report.title, "Delete failed");
+    assert_eq!(
+        report.headline,
+        "Delete failed: not found, never-existed.txt"
+    );
+
+    // The body may quote rclone, but nothing in it may be a log record.
+    for marker in ["{\"", "slog/logger.go", "\"level\"", "Attempt 1/3", "\\?\\"] {
+        assert!(
+            !report.body.contains(marker),
+            "log-record scaffolding leaked into the dialog ({marker}): {}",
+            report.body
+        );
+    }
+    // And it stays short enough to read, rather than being a log dump.
+    assert!(
+        report.body.lines().count() <= 6,
+        "failure body is a wall of text: {}",
+        report.body
+    );
+    eprintln!("--- dialog ---\n{}\n--------------", report.body);
 }

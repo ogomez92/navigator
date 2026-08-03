@@ -15,9 +15,11 @@
 //! the chosen mode would actually destroy, so the UI can confirm only when
 //! data is genuinely at risk.
 
+pub mod error;
 pub mod log;
 pub mod op;
 
+pub use error::{ErrorCollector, ErrorKind, RcloneError};
 pub use log::{LogEvent, LogLevel, Stats, Transferring};
 pub use op::{
     Canceller, ConflictReport, OpHandle, Operation, PreflightReport, Progress, RcloneDriver,
