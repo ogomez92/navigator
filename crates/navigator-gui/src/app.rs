@@ -739,6 +739,36 @@ impl AppState {
         );
     }
 
+    /// Jump straight to the virtual "This PC" drive list from wherever we
+    /// are — the file-manager sense of "home", not the user profile
+    /// folder. Unlike `navigate_up` this doesn't walk the tree one level
+    /// at a time.
+    ///
+    /// Focus lands on the drive we came from rather than row 0: the same
+    /// `pending_focus` slot `navigate_up` uses, matched by
+    /// `refocus_after_up`'s `drive_path_from_display` inverse. A remote or
+    /// the Remotes listing has no drive to match, so those fall through to
+    /// the default first-row focus.
+    pub fn go_this_pc(&self) {
+        let target = NavPath::this_pc();
+        let Some(cwd) = self.model.cwd() else {
+            self.navigate(target);
+            return;
+        };
+        if cwd.is_this_pc() {
+            self.say("already at this pc", false);
+            return;
+        }
+        if !cwd.is_remote()
+            && !cwd.is_remotes_root()
+            && let Some(root) = volume_root_of(cwd.as_path()).and_then(|p| NavPath::new(p).ok())
+        {
+            self.set_pending_focus(root);
+        }
+        self.set_next_nav_sound(SoundEvent::NavigateUp);
+        self.navigate(target);
+    }
+
     pub fn navigate_up(&self) {
         if let Some(cwd) = self.model.cwd() {
             if cwd.is_this_pc() {

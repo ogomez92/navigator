@@ -218,6 +218,14 @@ const PRESETS: &[Preset] = &[
         single: false,
     },
     Preset {
+        label: "Built-in: This PC (drive list)",
+        name: "This PC",
+        internal: Some(InternalCommand::ThisPc),
+        command: "",
+        args: &[],
+        single: false,
+    },
+    Preset {
         label: "Built-in: History back",
         name: "History back",
         internal: Some(InternalCommand::HistBack),

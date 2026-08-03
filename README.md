@@ -192,6 +192,7 @@ value is rejected.
 | Ctrl + A                     | Select all                                          |
 | Enter                        | Open folder / launch file                           |
 | Backspace / Alt + Up         | Parent folder                                       |
+| Ctrl + Home / Ctrl + Alt + H | This PC (the drive list), focus on the drive you left |
 | Alt + Left / Right           | History back / forward                              |
 | F5                           | Refresh                                             |
 | Ctrl + C / X / V             | Copy / cut / paste (via rclone)                     |

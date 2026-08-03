@@ -2004,6 +2004,7 @@ fn dispatch_internal(hwnd: HWND, data: &WindowData, ic: navigator_config::Intern
             crate::search::open(hwnd, state.clone());
         }
         IC::NavigateUp => state.navigate_up(),
+        IC::ThisPc => state.go_this_pc(),
         IC::HistBack => state.go_back(),
         IC::HistForward => state.go_forward(),
         IC::Undo => state.op_undo(),

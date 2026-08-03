@@ -63,6 +63,11 @@ pub enum InternalCommand {
     ToggleSystem,
     Search,
     NavigateUp,
+    /// Jump straight to the virtual "This PC" drive list from anywhere,
+    /// however deep the current folder is. Distinct from `NavigateUp`,
+    /// which only pops one level. Default chords: Ctrl+Alt+H and
+    /// Ctrl+Home.
+    ThisPc,
     HistBack,
     HistForward,
     /// Reverse the most recent undoable action (clipboard change, paste).
@@ -243,6 +248,14 @@ pub fn default_actions() -> Vec<ShortcutAction> {
         internal("Toggle system", ToggleSystem, chord(true, true, false, "H")),
         internal("Find in folder", Search, chord(true, false, false, "F")),
         internal("Navigate up", NavigateUp, chord(false, false, true, "Up")),
+        // "Home" in the file-manager sense: the drive list, not the user
+        // profile folder. Bound twice on purpose — Ctrl+Home is the
+        // discoverable chord, Ctrl+Alt+H the one that survives being
+        // typed into a control that wants Ctrl+Home for itself. Two
+        // actions can share an internal command; only chords must be
+        // unique.
+        internal("This PC", ThisPc, chord(true, false, true, "H")),
+        internal("This PC (Home)", ThisPc, chord(true, false, false, "Home")),
         internal("History back", HistBack, chord(false, false, true, "Left")),
         internal(
             "History forward",
@@ -402,6 +415,30 @@ mod tests {
             c.key.eq_ignore_ascii_case("n"),
             "unexpected key: {:?}",
             c.key
+        );
+    }
+
+    #[test]
+    fn this_pc_is_bound_to_both_ctrl_alt_h_and_ctrl_home() {
+        // Two chords, one command. `default_chord` only finds the first,
+        // so collect every seeded binding for it.
+        let chords: Vec<ShortcutChord> = default_actions()
+            .into_iter()
+            .filter(|a| a.internal == Some(InternalCommand::ThisPc))
+            .map(|a| a.chord)
+            .collect();
+        assert_eq!(chords.len(), 2, "expected two ThisPc bindings: {chords:?}");
+        assert!(
+            chords
+                .iter()
+                .any(|c| c.ctrl && c.alt && !c.shift && c.key.eq_ignore_ascii_case("h")),
+            "missing Ctrl+Alt+H: {chords:?}",
+        );
+        assert!(
+            chords
+                .iter()
+                .any(|c| c.ctrl && !c.alt && !c.shift && c.key.eq_ignore_ascii_case("home")),
+            "missing Ctrl+Home: {chords:?}",
         );
     }
 
