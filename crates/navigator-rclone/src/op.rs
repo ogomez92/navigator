@@ -404,10 +404,40 @@ impl RcloneDriver {
 
     /// Run the operation under `--dry-run` and collect destinations that
     /// would be overwritten. Blocks until rclone finishes.
+    ///
+    /// **Both pipes are drained concurrently, and that is load-bearing.**
+    /// This used to read stdout to EOF and only then start on stderr. But
+    /// rclone's JSON log goes to *stderr* and stdout stays empty until the
+    /// process exits, so the reader parked on an empty stdout while the
+    /// child filled the 64 KiB stderr pipe buffer — then the child blocked
+    /// on a write nobody was reading, stdout never reached EOF, and the
+    /// worker thread hung forever with the UI having just announced
+    /// "checking destination".
+    ///
+    /// It took ~64 KiB of log to trigger, which is why it looked random: a
+    /// dry-run emits one ~235-byte record per file (≈280 files is enough)
+    /// *plus* a ~510-byte `--stats 1s` line every second, so an op that
+    /// merely runs for a couple of minutes — a slow remote listing, an
+    /// empty destination, no files at all — reaches the same ceiling on
+    /// timing alone. `spawn` always did this correctly with two reader
+    /// threads; this is the same shape.
     pub fn preflight(&self, op: &Operation) -> std::io::Result<PreflightReport> {
         let mut cmd = self.base_command();
         push_op_args(&mut cmd, op, /*dry_run=*/ true);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        // Echo the argv for the same reason `spawn` does: when a preflight
+        // misbehaves, the flags and paths it was actually handed are the
+        // only thing that explains it, and rclone's own log never says.
+        tracing::debug!(
+            target: "rclone.spawn",
+            "rclone preflight: {} {}",
+            self.exe.to_string_lossy(),
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
 
         let mut child = cmd.spawn()?;
         #[cfg(windows)]
@@ -442,10 +472,20 @@ impl RcloneDriver {
             }
         };
 
-        for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
+        // stdout goes to its own thread so neither pipe can back up while
+        // we are busy with the other. It carries almost nothing (a bad
+        // flag, rejected before the logger exists), so collecting its
+        // lines costs nothing; stderr is the firehose and stays streamed.
+        let reader_out = thread::spawn(move || {
+            BufReader::new(stdout)
+                .lines()
+                .map_while(|l| l.ok())
+                .collect::<Vec<String>>()
+        });
+        for line in BufReader::new(stderr).lines().map_while(|l| l.ok()) {
             parse(&line);
         }
-        for line in BufReader::new(stderr).lines().map_while(|l| l.ok()) {
+        for line in reader_out.join().unwrap_or_default() {
             parse(&line);
         }
         let _ = child.wait()?;

@@ -63,3 +63,41 @@ fn accepts_unc_path_into_share() {
     let p = NavPath::new(r"\\server\share\folder").expect("UNC accepted");
     assert_eq!(p.file_name(), "folder");
 }
+
+/// Delete branches on `is_unc` to keep `.trash` off network shares, so
+/// every shape of UNC path has to be recognised — and none of the
+/// sentinels, which also start with two backslashes, may be mistaken for
+/// one.
+#[cfg(windows)]
+#[test]
+fn is_unc_covers_every_share_shape_and_no_sentinel() {
+    for s in [
+        r"\\100.86.173.34\uri\Downloads\sync",
+        r"\\100.86.173.34\uri",
+        r"\\server\share\",
+        r"\\server",
+        "//server/share/file",
+    ] {
+        let p = NavPath::new(s).expect("UNC accepted");
+        assert!(p.is_unc(), "{s} should be UNC");
+    }
+
+    for s in [r"C:\Users", r"D:\"] {
+        let p = NavPath::new(s).expect("local accepted");
+        assert!(!p.is_unc(), "{s} should not be UNC");
+    }
+
+    assert!(!NavPath::this_pc().is_unc());
+    assert!(!NavPath::remotes_root().is_unc());
+    assert!(!NavPath::remote("mac", "Downloads").is_unc());
+    assert!(!NavPath::remote("mac", "").is_unc());
+}
+
+/// `\\?\UNC\host\share` is the extended-length spelling of a share and is
+/// still a network path, while every other `\\?\` prefix is not.
+#[cfg(windows)]
+#[test]
+fn extended_length_unc_is_unc_but_extended_length_local_is_not() {
+    assert!(NavPath::new(r"\\?\UNC\server\share\file").unwrap().is_unc());
+    assert!(!NavPath::new(r"\\?\C:\Users\file").unwrap().is_unc());
+}

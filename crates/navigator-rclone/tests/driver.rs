@@ -943,3 +943,68 @@ fn batch_conflict_detection_finds_overwrites() {
         report.overwrites
     );
 }
+
+/// **The "checking destination" hang.** `preflight` pipes both stdout and
+/// stderr, and it used to drain them one after the other: stdout to EOF,
+/// then stderr. rclone's JSON log goes to *stderr*, and stdout stays empty
+/// until the process exits — so the reader parks on an empty stdout while
+/// the child fills the stderr pipe buffer, the child blocks on a write
+/// nobody is reading, and neither side ever moves again. Deadlock, in the
+/// worker thread, with the UI having just said "checking destination".
+///
+/// It is intermittent in the field because it only needs *enough* stderr:
+/// a dry-run emits one `Skipped copy as --dry-run is set` record per file
+/// plus a `--stats 1s` line every second, so a small fast paste squeaks
+/// under the buffer and a big one — or a slow remote — does not. Nothing
+/// about the destination has to be non-empty; every file counts.
+///
+/// Both pipes must therefore be read concurrently, exactly as `spawn`
+/// already does.
+#[test]
+fn preflight_does_not_deadlock_when_the_dry_run_floods_stderr() {
+    if !rclone_available() {
+        eprintln!("rclone not available; skipping");
+        return;
+    }
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    // One log record per file, ~200 bytes each — 600 files is ~120 KB of
+    // stderr, comfortably past any pipe buffer. The destination stays
+    // empty: this is not about conflicts, it is about volume.
+    let tree = src.path().join("payload");
+    fs::create_dir_all(tree.join("nested")).unwrap();
+    for i in 0..600 {
+        let dir = if i % 2 == 0 {
+            tree.clone()
+        } else {
+            tree.join("nested")
+        };
+        fs::write(dir.join(format!("file_{i:04}.bin")), b"x").unwrap();
+    }
+
+    let op = Operation::Copy {
+        sources: vec![nav(&tree)],
+        dest_dir: nav(dst.path()),
+        mode: ConflictMode::Update,
+    };
+
+    // Run it off-thread so a hang fails the test instead of wedging the
+    // suite forever. The child dies with the test process (job object).
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let driver = RcloneDriver::from_path();
+        let _ = tx.send(driver.preflight(&op).map(|r| r.would_transfer.len()));
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(Ok(n)) => assert_eq!(
+            n, 600,
+            "every file should be reported as a would-transfer; got {n}"
+        ),
+        Ok(Err(e)) => panic!("preflight failed: {e}"),
+        Err(_) => panic!(
+            "preflight deadlocked: stdout and stderr must be drained \
+             concurrently, or rclone blocks writing its log"
+        ),
+    }
+}

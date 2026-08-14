@@ -1,4 +1,4 @@
-//! Detached shell copy/move — `SHFileOperationW` in a child process.
+//! Detached shell copy/move/delete — `SHFileOperationW` in a child process.
 //!
 //! `op_paste_from_clipboard` deliberately hands large pastes to the
 //! Windows shell copy engine rather than rclone: the shell is what
@@ -24,6 +24,11 @@
 //! Sources travel through a temp file, not argv. A paste of a few
 //! thousand paths blows past the 32 KB command-line limit, and the
 //! failure mode of a truncated list is a silent partial copy.
+//!
+//! [`ShellVerb::Delete`] rides the same machinery for an unrelated
+//! reason: deleting on a UNC share must not stage into a `.trash`
+//! directory at the share root, so those targets go to the shell and get
+//! Explorer's behaviour and Explorer's confirmation. See [`shell_delete`].
 
 #![cfg(windows)]
 
@@ -39,16 +44,53 @@ pub const EXIT_FAILED: i32 = 1;
 pub const EXIT_ABORTED: i32 = 2;
 pub const EXIT_BAD_ARGS: i32 = 3;
 
+/// What the helper process should do with the source list.
+///
+/// `Delete` is the odd one out: it takes no destination, and it is not
+/// here for the antivirus reason the transfer verbs are. It exists
+/// because a delete on a UNC share has nowhere sane to stage — see
+/// [`NavPath::is_unc`](navigator_core::NavPath::is_unc) — so the shell's
+/// own "permanently delete?" prompt becomes the confirmation and the
+/// shell's engine does the work, exactly as Explorer would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellVerb {
+    Copy,
+    Move,
+    Delete,
+}
+
+impl ShellVerb {
+    /// The `--shell-op` token for this verb. On-disk contract in the same
+    /// sense the sound keys are: the parent and the child are the same
+    /// binary, but a helper left over from a half-finished upgrade must
+    /// not silently mean something else.
+    pub fn token(self) -> &'static str {
+        match self {
+            ShellVerb::Copy => "copy",
+            ShellVerb::Move => "move",
+            ShellVerb::Delete => "delete",
+        }
+    }
+
+    /// `--dest` is required for the transfer verbs and forbidden for
+    /// `Delete`.
+    pub fn needs_dest(self) -> bool {
+        !matches!(self, ShellVerb::Delete)
+    }
+}
+
 /// A parsed `--shell-op` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelperArgs {
-    pub move_op: bool,
-    pub dest: PathBuf,
+    pub verb: ShellVerb,
+    /// `Some` for copy/move, always `None` for delete.
+    pub dest: Option<PathBuf>,
     pub list_file: PathBuf,
 }
 
 /// Recognise the helper invocation:
-/// `--shell-op copy|move --dest <dir> --list <file>`.
+/// `--shell-op copy|move --dest <dir> --list <file>` or
+/// `--shell-op delete --list <file>`.
 ///
 /// Returns `None` for anything that is not a `--shell-op` command line so
 /// `main` can fall through to the normal GUI path. Returns
@@ -58,11 +100,12 @@ pub fn parse_helper_args(argv: &[String]) -> Option<Result<HelperArgs, String>> 
     if argv.first().map(String::as_str) != Some("--shell-op") {
         return None;
     }
-    let move_op = match argv.get(1).map(String::as_str) {
-        Some("copy") => false,
-        Some("move") => true,
+    let verb = match argv.get(1).map(String::as_str) {
+        Some("copy") => ShellVerb::Copy,
+        Some("move") => ShellVerb::Move,
+        Some("delete") => ShellVerb::Delete,
         Some(other) => return Some(Err(format!("unknown shell-op verb {other:?}"))),
-        None => return Some(Err("--shell-op needs copy or move".into())),
+        None => return Some(Err("--shell-op needs copy, move or delete".into())),
     };
 
     let mut dest: Option<PathBuf> = None;
@@ -88,15 +131,23 @@ pub fn parse_helper_args(argv: &[String]) -> Option<Result<HelperArgs, String>> 
         }
     }
 
-    match (dest, list_file) {
-        (Some(dest), Some(list_file)) => Some(Ok(HelperArgs {
-            move_op,
-            dest,
-            list_file,
-        })),
-        (None, _) => Some(Err("--shell-op needs --dest".into())),
-        (_, None) => Some(Err("--shell-op needs --list".into())),
+    let Some(list_file) = list_file else {
+        return Some(Err("--shell-op needs --list".into()));
+    };
+    // A `--dest` on a delete is a caller bug, and the interesting failure
+    // is the one where the two got crossed: silently ignoring it would
+    // let a mis-built command line delete the sources of what was meant
+    // to be a copy.
+    match (verb.needs_dest(), &dest) {
+        (true, None) => return Some(Err("--shell-op needs --dest".into())),
+        (false, Some(_)) => return Some(Err("--shell-op delete takes no --dest".into())),
+        _ => {}
     }
+    Some(Ok(HelperArgs {
+        verb,
+        dest,
+        list_file,
+    }))
 }
 
 /// Serialise `sources` into the newline-delimited body of a list file.
@@ -139,10 +190,14 @@ pub fn decode_list(body: &str) -> Vec<PathBuf> {
 /// reading. The parent cannot: it is gone long before the child starts.
 pub fn spawn_detached(
     sources: &[PathBuf],
-    dest: &Path,
-    move_op: bool,
+    verb: ShellVerb,
+    dest: Option<&Path>,
 ) -> io::Result<std::process::Child> {
     use std::os::windows::process::CommandExt;
+
+    if verb.needs_dest() && dest.is_none() {
+        return Err(io::Error::other("copy/move needs a destination"));
+    }
 
     // CREATE_NO_WINDOW: the debug build is a console subsystem binary, and
     // without this every paste would flash a console window and steal
@@ -165,13 +220,11 @@ pub fn spawn_detached(
     let exe = std::env::current_exe()?;
     let build = |flags: u32| {
         let mut c = std::process::Command::new(&exe);
-        c.arg("--shell-op")
-            .arg(if move_op { "move" } else { "copy" })
-            .arg("--dest")
-            .arg(dest)
-            .arg("--list")
-            .arg(&list_file)
-            .creation_flags(flags);
+        c.arg("--shell-op").arg(verb.token());
+        if let Some(d) = dest {
+            c.arg("--dest").arg(d);
+        }
+        c.arg("--list").arg(&list_file).creation_flags(flags);
         c
     };
 
@@ -244,7 +297,20 @@ pub fn run_helper(args: &HelperArgs) -> i32 {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     }
 
-    match shell_copy_move(&sources, &args.dest, args.move_op) {
+    let outcome = match args.verb {
+        ShellVerb::Delete => shell_delete(&sources),
+        verb => {
+            // `parse_helper_args` guarantees this, but the child must not
+            // fall back to *some* directory if that ever stops being true.
+            let Some(dest) = args.dest.as_deref() else {
+                tracing::error!("shell-op: {} without a destination", verb.token());
+                return EXIT_BAD_ARGS;
+            };
+            shell_copy_move(&sources, dest, matches!(verb, ShellVerb::Move))
+        }
+    };
+
+    match outcome {
         Ok(true) => EXIT_ABORTED,
         Ok(false) => EXIT_OK,
         Err(e) => {
@@ -252,6 +318,60 @@ pub fn run_helper(args: &HelperArgs) -> i32 {
             EXIT_FAILED
         }
     }
+}
+
+/// Delete `sources` through the Windows shell engine.
+///
+/// This is the UNC-share delete path. Navigator's own delete stages to
+/// `<volume_root>\.trash` and offers Ctrl+Z, which is wrong for a network
+/// share in two ways: the volume root belongs to somebody else's server,
+/// and a `.trash` directory created there comes back hidden from a macOS
+/// or Samba SMB server (both flag dot-prefixed names), so the file
+/// appears to have simply vanished. Handing the delete to the shell gives
+/// the user Explorer's behaviour instead — Recycle Bin where one exists,
+/// and on a share the shell's own "are you sure you want to permanently
+/// delete" prompt, which is the confirmation.
+///
+/// `FOF_ALLOWUNDO` is what asks for the Recycle Bin. Keep it even though
+/// only UNC paths reach here: it is what makes the shell prompt rather
+/// than delete silently, and it costs nothing when the share cannot
+/// honour it.
+///
+/// Returns `Ok(true)` if the user declined the prompt or cancelled
+/// mid-operation, `Ok(false)` on a clean run, `Err` on a shell error.
+fn shell_delete(sources: &[PathBuf]) -> io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::{FO_DELETE, FOF_ALLOWUNDO, SHFILEOPSTRUCTW, SHFileOperationW};
+    use windows::core::PCWSTR;
+
+    let mut from: Vec<u16> = Vec::new();
+    for s in sources {
+        from.extend(s.as_os_str().encode_wide());
+        from.push(0);
+    }
+    from.push(0);
+
+    let mut op = SHFILEOPSTRUCTW {
+        hwnd: HWND(std::ptr::null_mut()),
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(from.as_ptr()),
+        // FO_DELETE has no destination; pTo must stay null.
+        pTo: PCWSTR::null(),
+        fFlags: FOF_ALLOWUNDO.0 as u16,
+        ..Default::default()
+    };
+
+    let rc = unsafe { SHFileOperationW(&mut op) };
+    if rc != 0 {
+        return Err(io::Error::other(format!(
+            "SHFileOperation(delete) returned 0x{:x}",
+            rc
+        )));
+    }
+    // Answering "No" to the confirmation is a clean return with this flag
+    // set, not an error code.
+    Ok(op.fAnyOperationsAborted.as_bool())
 }
 
 /// Copy or move `sources` into the `dest` directory via the Windows
@@ -339,8 +459,8 @@ mod tests {
         assert_eq!(
             got,
             HelperArgs {
-                move_op: false,
-                dest: PathBuf::from(r"D:\dst"),
+                verb: ShellVerb::Copy,
+                dest: Some(PathBuf::from(r"D:\dst")),
                 list_file: PathBuf::from(r"C:\tmp\l.txt"),
             }
         );
@@ -355,7 +475,56 @@ mod tests {
         ]))
         .unwrap()
         .unwrap();
-        assert!(moved.move_op);
+        assert_eq!(moved.verb, ShellVerb::Move);
+    }
+
+    /// Delete carries no destination — the whole point is that there is
+    /// nowhere to stage to.
+    #[test]
+    fn parses_delete_without_a_dest() {
+        let got = parse_helper_args(&args(&["--shell-op", "delete", "--list", r"C:\tmp\l.txt"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            got,
+            HelperArgs {
+                verb: ShellVerb::Delete,
+                dest: None,
+                list_file: PathBuf::from(r"C:\tmp\l.txt"),
+            }
+        );
+    }
+
+    /// A `--dest` on a delete means the caller crossed two commands. The
+    /// dangerous reading is "copy these somewhere" arriving as "delete
+    /// these", so it is rejected rather than ignored.
+    #[test]
+    fn delete_with_a_dest_is_rejected_not_ignored() {
+        let r = parse_helper_args(&args(&[
+            "--shell-op",
+            "delete",
+            "--dest",
+            r"D:\dst",
+            "--list",
+            r"C:\tmp\l.txt",
+        ]));
+        assert!(matches!(r, Some(Err(_))), "got {r:?}");
+    }
+
+    /// The verb tokens are what a parent process writes and a child
+    /// parses. They must round-trip.
+    #[test]
+    fn verb_tokens_round_trip() {
+        for v in [ShellVerb::Copy, ShellVerb::Move, ShellVerb::Delete] {
+            let mut argv = vec!["--shell-op".to_string(), v.token().to_string()];
+            if v.needs_dest() {
+                argv.push("--dest".into());
+                argv.push(r"D:\dst".into());
+            }
+            argv.push("--list".into());
+            argv.push(r"C:\l.txt".into());
+            assert_eq!(parse_helper_args(&argv).unwrap().unwrap().verb, v);
+        }
     }
 
     /// Flag order must not matter, and paths with spaces have to survive
@@ -372,7 +541,7 @@ mod tests {
         ]))
         .unwrap()
         .unwrap();
-        assert_eq!(got.dest, PathBuf::from(r"C:\Program Files\dst"));
+        assert_eq!(got.dest, Some(PathBuf::from(r"C:\Program Files\dst")));
         assert_eq!(got.list_file, PathBuf::from(r"C:\tmp\my list.txt"));
     }
 
@@ -389,6 +558,8 @@ mod tests {
             args(&["--shell-op", "copy", "--dest", "d"]),
             args(&["--shell-op", "copy", "--dest"]),
             args(&["--shell-op", "copy", "--dest", "d", "--list", "l", "extra"]),
+            args(&["--shell-op", "delete"]),
+            args(&["--shell-op", "delete", "--list"]),
         ] {
             let r = parse_helper_args(&bad);
             assert!(

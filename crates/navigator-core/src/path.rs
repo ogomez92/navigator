@@ -121,6 +121,40 @@ impl NavPath {
         Err(crate::Error::NotAbsolute(p))
     }
 
+    /// `true` for a UNC network path — `\\host\share\...`, the host-only
+    /// `\\host` form, or the extended-length `\\?\UNC\host\share`.
+    ///
+    /// Delete branches on this: a network share must never get a
+    /// `<volume_root>\.trash` staging directory. `volume_root_of` happily
+    /// resolves `\\host\share\` as a volume, so the trash rename used to
+    /// "work" — it dropped a `.trash` folder at the root of somebody
+    /// else's file server, and on a macOS SMB share the dot-prefix comes
+    /// back flagged hidden so the user could not even see where their
+    /// file went.
+    ///
+    /// The sentinels this type uses for This PC and for rclone remotes
+    /// also start with two backslashes, so they are excluded explicitly:
+    /// a sentinel is not a network location. `\\.\` (the device
+    /// namespace) is out for the same reason.
+    pub fn is_unc(&self) -> bool {
+        let s: String = self
+            .0
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c == '/' { '\\' } else { c })
+            .collect();
+        if !s.starts_with(r"\\") {
+            return false;
+        }
+        // `\\?\UNC\host\share` is the extended-length spelling of a share
+        // and *is* a network path; every other `\\?\` (our sentinels,
+        // extended-length local paths) and all of `\\.\` is not.
+        if s.starts_with(r"\\?\UNC\") {
+            return true;
+        }
+        !(s.starts_with(r"\\?\") || s.starts_with(r"\\.\"))
+    }
+
     /// `true` for a host-only UNC path (`\\host` or `\\1.2.3.4`) with no
     /// share component. The scanner routes these to share enumeration
     /// instead of `read_dir`, because `FindFirstFileW` on a bare host

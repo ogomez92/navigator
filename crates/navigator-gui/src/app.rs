@@ -225,8 +225,20 @@ pub fn volume_root_of(path: &std::path::Path) -> Option<std::path::PathBuf> {
 /// hung the window before the delete had even started. The directory is
 /// created by the worker in `run_trash_batch`, immediately before the
 /// rename that needs it.
-fn trash_dir_on_volume_of(path: &NavPath) -> Option<NavPath> {
+///
+/// **Never names a trash dir on a UNC share.** `volume_root_of` resolves
+/// `\\host\share\dir\file` to `\\host\share\`, so this used to happily
+/// return a path that littered a `.trash` folder at the root of a file
+/// server we don't own — and an SMB server that flags dot-prefixed names
+/// hidden (macOS, Samba) then hid it from the user looking for their
+/// file. `op_delete` routes UNC targets to the shell before reaching
+/// here; the guard is so a future caller can't reintroduce the litter by
+/// forgetting to.
+pub fn trash_dir_on_volume_of(path: &NavPath) -> Option<NavPath> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if path.is_unc() {
+        return None;
+    }
     let ts = crate::clipboard::now_ts();
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -1357,18 +1369,34 @@ impl AppState {
             *self.pending_focus.lock() = Some(target);
         }
 
-        // Split by endpoint. Remote paths can't go to a local `.trash`
-        // dir — rclone would have to cross the boundary — and rclone's
-        // own purge is irreversible, so we confirm + skip the undo
-        // stack. Local paths still route through the trash flow. We carry
-        // the per-entry directory flag through so the remote worker can
-        // pick `purge` (dirs) vs `deletefile` (files). Local targets drop
-        // the flag — they route through the trash rename, not rclone.
+        // Split by endpoint, three ways.
+        //
+        // Remote paths can't go to a local `.trash` dir — rclone would
+        // have to cross the boundary — and rclone's own purge is
+        // irreversible, so we confirm + skip the undo stack. We carry the
+        // per-entry directory flag through so the remote worker can pick
+        // `purge` (dirs) vs `deletefile` (files).
+        //
+        // UNC paths go to the Windows shell. `volume_root_of` resolves
+        // `\\host\share\` as a volume, so the trash rename *worked* — it
+        // just worked by creating a `.trash` directory at the root of
+        // somebody else's file server, which is not ours to litter, and
+        // which a macOS or Samba SMB server hands back flagged hidden so
+        // the user cannot even find where the file went. The shell gives
+        // Explorer's behaviour and Explorer's "permanently delete?"
+        // prompt instead. No undo entry: the file is gone, or it is in
+        // the Recycle Bin, and either way our trash never held it.
+        //
+        // Local targets keep the trash flow, and drop the directory flag
+        // — they route through a rename, not rclone.
         let mut remote_targets: Vec<(NavPath, bool)> = Vec::new();
+        let mut unc: Vec<NavPath> = Vec::new();
         let mut local: Vec<NavPath> = Vec::new();
         for (p, is_dir) in selected {
             if p.is_remote() {
                 remote_targets.push((p, is_dir));
+            } else if p.is_unc() {
+                unc.push(p);
             } else {
                 local.push(p);
             }
@@ -1385,6 +1413,10 @@ impl AppState {
                 return;
             }
             self.spawn_remote_purge(remote_targets);
+        }
+
+        if !unc.is_empty() {
+            self.spawn_shell_delete(unc);
         }
 
         if local.is_empty() {
@@ -1549,6 +1581,88 @@ impl AppState {
                 }
             })
             .expect("spawn empty-trash worker");
+    }
+
+    /// Hand UNC targets to the Windows shell's delete engine in a
+    /// detached child process (see [`crate::shell_op`]).
+    ///
+    /// This is the network-share half of [`Self::op_delete`]. The trash
+    /// flow is deliberately not reachable from here: staging to
+    /// `<volume_root>\.trash` on a share means creating a directory at
+    /// the root of a server we don't own, and an SMB server that flags
+    /// dot-prefixed names hidden (macOS and Samba both do) then hides it
+    /// from the very user who needs to find their file.
+    ///
+    /// The shell prompts before it deletes — a share has no Recycle Bin,
+    /// so `FOF_ALLOWUNDO` degrades to "are you sure you want to
+    /// permanently delete". That prompt *is* the confirmation, which is
+    /// why there is no `MessageBoxW` here the way there is for a remote
+    /// purge; asking twice for the same delete is how a user learns to
+    /// hit Enter on dialogs without reading them.
+    ///
+    /// No undo entry is pushed. Nothing of ours holds the file.
+    fn spawn_shell_delete(&self, targets: Vec<NavPath>) {
+        let paths: Vec<PathBuf> = targets.iter().map(|p| p.as_path().to_path_buf()).collect();
+        let n = paths.len();
+
+        let child =
+            match crate::shell_op::spawn_detached(&paths, crate::shell_op::ShellVerb::Delete, None)
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    self.say(&format!("delete failed to start: {}", e), true);
+                    return;
+                }
+            };
+
+        self.say(
+            &format!(
+                "deleting {} network {} via the shell",
+                n,
+                if n == 1 { "item" } else { "items" },
+            ),
+            false,
+        );
+
+        // Same reaper shape as the detached paste: it exists for the
+        // spoken outcome and the refresh, not to keep the child alive.
+        let speech = self.speech.handle();
+        let sound = self.sound.clone();
+        let state_weak = self.self_weak.get().cloned().unwrap_or_else(Weak::new);
+        std::thread::Builder::new()
+            .name("navigator-shell-op-reaper".into())
+            .spawn(move || {
+                let mut child = child;
+                let code = match child.wait() {
+                    Ok(s) => s.code().unwrap_or(crate::shell_op::EXIT_FAILED),
+                    Err(e) => {
+                        tracing::error!("shell-op delete wait: {}", e);
+                        crate::shell_op::EXIT_FAILED
+                    }
+                };
+                let (text, bad) = match code {
+                    crate::shell_op::EXIT_OK if n == 1 => ("1 item deleted".to_string(), false),
+                    crate::shell_op::EXIT_OK => (format!("{} items deleted", n), false),
+                    // The shell reports "user said No at the prompt" and
+                    // "user hit Cancel mid-run" identically, so this
+                    // covers both. Neither is a failure.
+                    crate::shell_op::EXIT_ABORTED => ("delete cancelled".to_string(), false),
+                    _ => ("delete failed".to_string(), true),
+                };
+                sound.play(match code {
+                    crate::shell_op::EXIT_OK => SoundEvent::DeleteDone,
+                    crate::shell_op::EXIT_ABORTED => SoundEvent::Cancelled,
+                    _ => SoundEvent::Error,
+                });
+                let _ = speech.send(crate::speech::Utterance {
+                    text,
+                    interrupt: bad,
+                });
+                if let Some(state) = state_weak.upgrade() {
+                    state.refresh();
+                }
+            })
+            .expect("spawn shell-op delete reaper");
     }
 
     /// Fire `rclone purge` once per remote target on a background
@@ -1948,7 +2062,12 @@ impl AppState {
 
         let n = sources.len();
         let dest_path = dest.as_path().to_path_buf();
-        let child = match crate::shell_op::spawn_detached(&sources, &dest_path, is_move) {
+        let verb = if is_move {
+            crate::shell_op::ShellVerb::Move
+        } else {
+            crate::shell_op::ShellVerb::Copy
+        };
+        let child = match crate::shell_op::spawn_detached(&sources, verb, Some(&dest_path)) {
             Ok(c) => c,
             Err(e) => {
                 self.say(&format!("paste failed to start: {}", e), true);

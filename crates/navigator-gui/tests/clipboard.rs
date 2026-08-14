@@ -148,3 +148,38 @@ fn volume_root_of_unc_share() {
     let got = navigator_gui::app::volume_root_of(Path::new(r"\\host\share\dir\file"));
     assert_eq!(got.as_deref(), Some(Path::new(r"\\host\share\")));
 }
+
+/// A UNC target must never resolve to a trash directory. `volume_root_of`
+/// is happy to call `\\host\share\` a volume, which is exactly how the
+/// trash rename used to succeed at creating a `.trash` folder at the root
+/// of somebody else's file server — invisible afterwards on any SMB
+/// server that flags dot-prefixed names hidden. `op_delete` routes UNC to
+/// the Windows shell instead; this pins the guard behind it.
+#[test]
+fn trash_dir_is_never_named_on_a_unc_share() {
+    use navigator_core::NavPath;
+    for s in [
+        r"\\100.86.173.34\uri\Downloads\sync",
+        r"\\server\share\file.txt",
+        r"\\server\share\",
+    ] {
+        let p = NavPath::new(s).expect("UNC accepted");
+        assert!(
+            navigator_gui::app::trash_dir_on_volume_of(&p).is_none(),
+            "{s} must not get a trash dir"
+        );
+    }
+}
+
+/// …but a local path still does, or delete stops working entirely.
+#[test]
+fn trash_dir_is_still_named_on_a_local_volume() {
+    use navigator_core::NavPath;
+    let p = NavPath::new(r"C:\foo\bar.txt").unwrap();
+    let got = navigator_gui::app::trash_dir_on_volume_of(&p).expect("local gets a trash dir");
+    assert!(
+        got.to_string().starts_with(r"C:\.trash\"),
+        "unexpected trash dir {}",
+        got
+    );
+}
