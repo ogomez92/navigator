@@ -1368,10 +1368,10 @@ fn activate_index(state: &Arc<AppState>, idx: usize) {
         return;
     };
     if cwd.is_this_pc() {
-        // ThisPC view: entries carry a display string like
-        // "Local Disk (C:)". Parse out the drive letter and navigate to
-        // its root. If parsing fails (e.g. an unrecognised entry), we
-        // quietly bail rather than silently opening the wrong path.
+        // ThisPC view: entries carry a display string like "C: (Windows)".
+        // Parse out the drive letter and navigate to its root. If parsing
+        // fails (e.g. an unrecognised entry), we quietly bail rather than
+        // silently opening the wrong path.
         if let Some(drive_root) = navigator_fs::drive_path_from_display(&entry.name)
             && let Ok(p) = navigator_core::NavPath::new(drive_root)
         {

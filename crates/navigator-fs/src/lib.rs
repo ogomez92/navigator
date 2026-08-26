@@ -16,8 +16,48 @@ use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    GetDriveTypeW, GetLogicalDriveStringsW, GetVolumeInformationW,
+    GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetDriveTypeW, GetLogicalDriveStringsW,
+    GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
 };
+
+// `SetThreadErrorMode` lives under `Win32_System_Diagnostics_Debug` in
+// windows-sys — a whole feature pulled in for one call, so it is declared
+// by hand for the same reason the `DRIVE_*` constants below are inlined.
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn SetThreadErrorMode(new_mode: u32, old_mode: *mut u32) -> i32;
+}
+
+/// `SEM_FAILCRITICALERRORS` — suppress the "There is no disk in drive E:"
+/// modal the OS otherwise puts up when a volume query hits an empty
+/// removable bay. See [`ErrorModeGuard`].
+const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+
+/// Suppresses the hard-error dialog for the current thread and restores
+/// the previous mode on drop.
+///
+/// Every volume query here (`GetVolumeInformationW`, `GetDiskFreeSpaceExW`,
+/// …) against an empty card reader or CD bay pops a *system modal* asking
+/// the user to insert a disk, and the calling thread blocks until it is
+/// dismissed. Enumerating This PC would therefore stall the scan worker on
+/// a machine that merely has an empty slot. The thread-scoped variant is
+/// deliberate — `SetErrorMode` is process-wide and would change behaviour
+/// for the UI thread and every plugin along with it.
+struct ErrorModeGuard(u32);
+
+impl ErrorModeGuard {
+    fn new() -> Self {
+        let mut old: u32 = 0;
+        unsafe { SetThreadErrorMode(SEM_FAILCRITICALERRORS, &mut old) };
+        Self(old)
+    }
+}
+
+impl Drop for ErrorModeGuard {
+    fn drop(&mut self) {
+        unsafe { SetThreadErrorMode(self.0, std::ptr::null_mut()) };
+    }
+}
 
 // `GetDriveType` return values. Hard-coded here because the named
 // constants live under `System_WindowsProgramming` — a feature we'd
@@ -158,15 +198,24 @@ unsafe fn pwstr_to_string(p: *const u16) -> String {
 /// Enumerate all drive letters currently mounted, returned as virtual
 /// [`Entry`] items suitable for populating the "This PC" view.
 ///
-/// Each drive becomes a `Directory`-kind entry whose `name` is the root
-/// path (e.g. `"C:\"`). The UI opens them via `NavPath::new(name)`, so the
-/// existing open-directory path handles them without special casing.
+/// Each drive becomes a `Directory`-kind entry whose `name` is
+/// `"<letter>: (<label>)"` — **letter first**, unlike Explorer. A screen
+/// reader reads the row left to right, and the letter is the part the user
+/// is navigating by; putting the label first meant listening past a
+/// variable-length name to reach it, and it made the alphabetical sort key
+/// the label rather than the drive letter.
+///
+/// Drives with no volume label fall back to the drive kind — `E: (CD
+/// Drive)` — so the parenthesised half is never empty.
 ///
 /// Empty drives (e.g. CD drives with no disc) still show up — `GetDriveType`
 /// reports them — which matches Explorer's behaviour and lets the user see
 /// that the bay exists.
 pub fn list_drives() -> Vec<Entry> {
     let mut out: Vec<Entry> = Vec::new();
+    // Reading the label of an empty removable bay is a hard error; without
+    // this the enumeration blocks on a system modal. See `ErrorModeGuard`.
+    let _quiet = ErrorModeGuard::new();
     // 104 bytes (26 drives × 4 chars "A:\0") is plenty. Over-allocate a
     // touch to tolerate weird configurations.
     let mut buf = [0u16; 512];
@@ -216,18 +265,12 @@ pub fn list_drives() -> Vec<Entry> {
         };
 
         let drive_type = unsafe { GetDriveTypeW(drive_c.as_ptr()) };
-        let kind_word = match drive_type {
-            DRIVE_FIXED => "Local Disk",
-            DRIVE_REMOVABLE => "Removable Disk",
-            DRIVE_CDROM => "CD Drive",
-            DRIVE_REMOTE => "Network Drive",
-            DRIVE_RAMDISK => "RAM Disk",
-            _ => "Drive",
-        };
+        let kind_word = drive_kind_word(drive_type);
+        let spec = path_str.trim_end_matches('\\');
         let display = if label.is_empty() {
-            format!("{} ({})", kind_word, path_str.trim_end_matches('\\'))
+            format!("{} ({})", spec, kind_word)
         } else {
-            format!("{} ({})", label, path_str.trim_end_matches('\\'))
+            format!("{} ({})", spec, label)
         };
 
         out.push(Entry {
@@ -244,22 +287,232 @@ pub fn list_drives() -> Vec<Entry> {
     out
 }
 
+/// Human word for a `GetDriveTypeW` result. Shared by [`list_drives`] and
+/// [`drive_info`] so the This PC row and the properties screen can't drift
+/// into calling the same volume two different things.
+pub fn drive_kind_word(drive_type: u32) -> &'static str {
+    match drive_type {
+        DRIVE_FIXED => "Local Disk",
+        DRIVE_REMOVABLE => "Removable Disk",
+        DRIVE_CDROM => "CD Drive",
+        DRIVE_REMOTE => "Network Drive",
+        DRIVE_RAMDISK => "RAM Disk",
+        _ => "Drive",
+    }
+}
+
 /// Parse a drive-entry display name back to its root path. The virtual
-/// [`Entry`] produced by [`list_drives`] packs the path in parentheses at
-/// the end (`"Local Disk (C:)"`); opening it needs the `C:\` form.
+/// [`Entry`] produced by [`list_drives`] leads with the drive spec
+/// (`"C: (Windows)"`); opening it needs the `C:\` form.
+///
+/// Only the leading token is considered, so a *real* folder that happens to
+/// be named `Foo (C:)` can never be mistaken for a volume.
 pub fn drive_path_from_display(display: &str) -> Option<String> {
-    let open = display.rfind('(')?;
-    let close = display.rfind(')')?;
-    if close <= open {
+    let spec = display.split_whitespace().next()?;
+    let mut chars = spec.chars();
+    let letter = chars.next()?;
+    if !letter.is_ascii_alphabetic() || chars.next() != Some(':') || chars.next().is_some() {
         return None;
     }
-    let inside = &display[open + 1..close];
     // Restore trailing separator so the path is an absolute drive root.
-    if inside.ends_with(':') {
-        Some(format!("{}\\", inside))
-    } else {
-        None
+    Some(format!("{}:\\", letter))
+}
+
+/// Capacity figures for a volume, in bytes.
+///
+/// `free` is what the volume has left; `available` is what the *calling
+/// user* may still write, which is smaller when a disk quota applies. They
+/// are equal on an unquota'd volume, which is the common case.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DriveSpace {
+    pub total: u64,
+    pub free: u64,
+    pub available: u64,
+}
+
+impl DriveSpace {
+    /// Bytes in use — `total - free`, saturating, since the two figures
+    /// come from one call and can't legitimately invert.
+    pub fn used(&self) -> u64 {
+        self.total.saturating_sub(self.free)
     }
+
+    /// Percentage of the volume in use, 0 when the total is unknown.
+    pub fn used_percent(&self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        (self.used() as f64) * 100.0 / (self.total as f64)
+    }
+}
+
+/// Cluster geometry from `GetDiskFreeSpaceW`.
+///
+/// Deliberately carries only the two figures that stay honest on a large
+/// volume: that call also reports cluster *counts*, but they are 32-bit and
+/// documented to saturate past ~2 TB, so reporting them would be a lie on
+/// exactly the disks people ask about.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ClusterInfo {
+    pub bytes_per_sector: u32,
+    pub sectors_per_cluster: u32,
+}
+
+impl ClusterInfo {
+    /// Allocation unit size in bytes — the granularity every file on the
+    /// volume rounds up to.
+    pub fn allocation_unit(&self) -> u64 {
+        (self.bytes_per_sector as u64) * (self.sectors_per_cluster as u64)
+    }
+}
+
+/// Everything the OS will tell us about a volume **without enumerating
+/// it**: identity, filesystem features and capacity.
+///
+/// This is the answer to "properties on a drive", where a recursive walk is
+/// both the wrong number (it would count only what the user can read) and
+/// unbounded work. Every field here comes from a constant-time call.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DriveInfo {
+    /// Root path as queried, e.g. `C:\`.
+    pub root: String,
+    /// Volume label, empty when the volume has none or is unreadable.
+    pub label: String,
+    /// `GetDriveTypeW` result and its human word.
+    pub drive_type: u32,
+    pub kind: &'static str,
+    /// `NTFS`, `exFAT`, … — empty when the volume info call failed.
+    pub file_system: String,
+    /// Volume serial, rendered `XXXX-XXXX` by the UI.
+    pub serial: u32,
+    /// Longest filename component the filesystem accepts (255 on NTFS).
+    pub max_component_len: u32,
+    /// `FILE_*` filesystem capability flags; decoded by the UI.
+    pub flags: u32,
+    /// `\\?\Volume{GUID}\` mount-point name, empty when unavailable.
+    pub volume_guid: String,
+    /// False when `GetVolumeInformationW` failed — no media, or a
+    /// disconnected network drive. Label / filesystem / flags are then
+    /// meaningless rather than merely empty.
+    pub volume_info_ok: bool,
+    /// `None` when the drive has no media or the query was denied.
+    pub space: Option<DriveSpace>,
+    /// `None` under the same conditions as `space`.
+    pub cluster: Option<ClusterInfo>,
+}
+
+impl DriveInfo {
+    /// True when nothing could be read at all — an empty bay or an offline
+    /// share. Lets the UI say so instead of rendering a screen of zeroes.
+    pub fn is_unavailable(&self) -> bool {
+        !self.volume_info_ok && self.space.is_none()
+    }
+}
+
+/// Query one volume by root path (`"D:\"`, with or without the trailing
+/// separator).
+///
+/// Four constant-time syscalls, no directory enumeration — safe to call for
+/// a drive holding millions of files. Individual calls are allowed to fail
+/// independently: an unformatted volume answers `GetDiskFreeSpaceExW` and
+/// not `GetVolumeInformationW`, an offline share answers neither, and both
+/// cases must still produce a screen the user can read.
+pub fn drive_info(root: &str) -> DriveInfo {
+    let root = format!("{}\\", root.trim_end_matches(['\\', '/']));
+    let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+
+    // Same hazard as `list_drives`: an empty removable bay turns every one
+    // of these queries into a system modal without this guard.
+    let _quiet = ErrorModeGuard::new();
+
+    let drive_type = unsafe { GetDriveTypeW(wide.as_ptr()) };
+    let mut info = DriveInfo {
+        root: root.clone(),
+        drive_type,
+        kind: drive_kind_word(drive_type),
+        ..Default::default()
+    };
+
+    let mut label_buf = [0u16; 256];
+    let mut fs_buf = [0u16; 64];
+    let mut serial: u32 = 0;
+    let mut max_component: u32 = 0;
+    let mut flags: u32 = 0;
+    let ok = unsafe {
+        GetVolumeInformationW(
+            wide.as_ptr(),
+            label_buf.as_mut_ptr(),
+            label_buf.len() as u32,
+            &mut serial,
+            &mut max_component,
+            &mut flags,
+            fs_buf.as_mut_ptr(),
+            fs_buf.len() as u32,
+        )
+    };
+    if ok != 0 {
+        info.volume_info_ok = true;
+        info.label = wide_to_string(&label_buf);
+        info.file_system = wide_to_string(&fs_buf);
+        info.serial = serial;
+        info.max_component_len = max_component;
+        info.flags = flags;
+    }
+
+    let mut avail: u64 = 0;
+    let mut total: u64 = 0;
+    let mut free: u64 = 0;
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
+    if ok != 0 {
+        info.space = Some(DriveSpace {
+            total,
+            free,
+            available: avail,
+        });
+    }
+
+    let mut sectors_per_cluster: u32 = 0;
+    let mut bytes_per_sector: u32 = 0;
+    let mut free_clusters: u32 = 0;
+    let mut total_clusters: u32 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceW(
+            wide.as_ptr(),
+            &mut sectors_per_cluster,
+            &mut bytes_per_sector,
+            &mut free_clusters,
+            &mut total_clusters,
+        )
+    };
+    if ok != 0 && bytes_per_sector != 0 {
+        info.cluster = Some(ClusterInfo {
+            bytes_per_sector,
+            sectors_per_cluster,
+        });
+    }
+
+    // `\\?\Volume{…}\` — the identity that survives a drive-letter change,
+    // and the only way to tell two removable disks apart in a log.
+    let mut guid_buf = [0u16; 64];
+    let ok = unsafe {
+        GetVolumeNameForVolumeMountPointW(
+            wide.as_ptr(),
+            guid_buf.as_mut_ptr(),
+            guid_buf.len() as u32,
+        )
+    };
+    if ok != 0 {
+        info.volume_guid = wide_to_string(&guid_buf);
+    }
+
+    info
+}
+
+/// Decode a null-terminated wide buffer we own (as opposed to a pointer
+/// handed back by the OS — that is [`pwstr_to_string`]'s job).
+fn wide_to_string(buf: &[u16]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
 }
 
 /// Stat a single path and return its [`Entry`]. One `FindFirstFileExW`

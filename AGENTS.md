@@ -123,6 +123,8 @@ Multi-file pastes collapse into one `rclone copy --files-from` invocation per so
 
 `viewer.rs` is a singleton top-level window with a readonly multiline EDIT + Close button. Used for any "here is a block of text, copy what you need" screen — currently `op_show_properties` (Alt+Enter) and `op_dump_tree` (Alt+L). Workers compute the text off the UI thread and post `WMAPP_VIEWER_SHOW` with a `Box<(title, body)>` payload; the window proc reclaims the box and calls `viewer::show`. On open the edit takes focus and gets `EM_SETSEL(0, -1)` so Ctrl+C copies immediately.
 
+**Alt+Enter on a This PC row must not take the folder path.** The row is a display string (`"D: (Data)"`), not a path, so `cwd.join` builds an unstattable sentinel and the walk rendered a page of zeroes. `op_show_properties` routes `is_this_pc()` to `navigator_fs::drive_info` → `props::format_drive_properties`: constant-time volume queries, plus one non-recursive `top_level_counts` of the root. A drive is never walked — the tally would be unbounded *and* would disagree with the OS capacity figures, since it can only count what the user may read. An empty bay says "Drive not ready" instead of zeroes.
+
 Pure computation (folder stats, extension histogram, TOML tree dump) lives in `props.rs`, kept free of HWND / speech so the logic is unit-testable without a live window. Recursion is iterative — explicit stack, no risk of blowing the process stack on deep trees. Symlinks are counted but not followed.
 
 ### Real Win32 dialogs
@@ -137,6 +139,8 @@ Pure computation (folder stats, extension histogram, TOML tree dump) lives in `p
 
 - `History` (`navigator-gui/src/history.rs`) is a back/forward stack. `navigate` pushes unless `suppress_history` is set (back/forward set it before calling `navigate`).
 - "This PC" is a sentinel `NavPath` (`NavPath::this_pc`, check with `is_this_pc()`). The scan worker routes it to `list_drives()` instead of `read_dir`. Navigating "up" from a drive root lands here.
+- **Drive rows lead with the letter — `D: (Data)`, not Explorer's `Data (D:)`.** The row reads left to right and the letter is what the user navigates by; a variable-length label first meant listening past it, and it made the sort key the label rather than the letter. Unlabelled volumes fall back to their kind (`E: (CD Drive)`). `drive_path_from_display` parses only the leading token, so a folder named `Backup (C:)` is no longer mistaken for a volume.
+- **Volume queries are wrapped in `ErrorModeGuard`** (`SetThreadErrorMode(SEM_FAILCRITICALERRORS)`): reading the label or capacity of an empty card reader pops a system modal and blocks the calling thread, so an empty slot would stall the scan worker on every This PC listing.
 
 ### Remote browsing (rclone)
 

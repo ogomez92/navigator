@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use navigator_core::{Entry, EntryKind, NavPath};
-use navigator_fs::read_dir;
+use navigator_fs::{DriveInfo, read_dir};
 use navigator_rclone::{RemoteSize, RemoteStat, RemoteTreeItem};
 
 /// Recursive tally across every file below `root`. Unreadable sub-trees
@@ -185,6 +185,200 @@ pub fn format_properties(entry: &Entry, path: &NavPath, stats: Option<&FolderSta
         }
     }
     s
+}
+
+/// One non-recursive listing of a directory: how many entries sit directly
+/// inside it, and how many bytes the loose files there account for.
+///
+/// This is what a drive gets instead of [`compute_folder_stats`]. Walking a
+/// whole volume to answer Alt+Enter is unbounded work for a number the OS
+/// already knows better than we do (the recursive tally would only count
+/// what the user has permission to read, so it would disagree with the
+/// capacity figures on every system drive).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TopLevel {
+    pub files: u64,
+    pub dirs: u64,
+    /// Bytes of the files sitting directly in the folder — explicitly not
+    /// a recursive total, and labelled as such in the output.
+    pub file_bytes: u64,
+    /// How many of the above are hidden or system entries, so the count
+    /// can be reconciled with what the listing actually shows.
+    pub hidden: u64,
+}
+
+/// Tally the immediate children of `dir`. `None` when the directory can't
+/// be read at all (an empty CD bay, a disconnected share).
+pub fn top_level_counts(dir: &NavPath) -> Option<TopLevel> {
+    let entries = read_dir(dir).ok()?;
+    let mut t = TopLevel::default();
+    for e in entries {
+        if e.hidden || e.system {
+            t.hidden += 1;
+        }
+        match e.kind {
+            EntryKind::Directory => t.dirs += 1,
+            _ => {
+                t.files += 1;
+                t.file_bytes = t.file_bytes.saturating_add(e.size);
+            }
+        }
+    }
+    Some(t)
+}
+
+/// Build the properties text for a whole volume. `display` is the This PC
+/// row the user pressed Alt+Enter on (`"D: (Data)"`), kept verbatim so the
+/// screen names the same thing the listing did.
+///
+/// Everything here is a constant-time query — no tree walk — which is why
+/// the folder section reports the root's *immediate* children only.
+pub fn format_drive_properties(display: &str, info: &DriveInfo, top: Option<&TopLevel>) -> String {
+    let mut s = String::new();
+    s.push_str(&format!("Name:      {}\n", display));
+    s.push_str(&format!("Path:      {}\n", info.root));
+    s.push_str(&format!("Type:      {}\n", info.kind));
+    if info.volume_info_ok {
+        s.push_str(&format!(
+            "Label:     {}\n",
+            if info.label.is_empty() {
+                "(none)"
+            } else {
+                &info.label
+            }
+        ));
+        s.push_str(&format!("File system: {}\n", info.file_system));
+    }
+
+    // An empty bay or an offline share answers nothing. Say so — a screen
+    // of zeroes reads as "this drive is empty", which is a different fact.
+    if info.is_unavailable() {
+        s.push('\n');
+        s.push_str("Drive not ready — no media, or the volume is offline.\n");
+        return s;
+    }
+
+    if let Some(sp) = info.space {
+        let pct = sp.used_percent();
+        s.push('\n');
+        s.push_str("--- Capacity ---\n");
+        s.push_str(&format!(
+            "Total:     {}\n",
+            format_size_with_bytes(sp.total)
+        ));
+        s.push_str(&format!(
+            "Used:      {}  ({:.1}%)\n",
+            format_size_with_bytes(sp.used()),
+            pct
+        ));
+        s.push_str(&format!(
+            "Free:      {}  ({:.1}%)\n",
+            format_size_with_bytes(sp.free),
+            100.0 - pct
+        ));
+        // Only worth a line when a quota actually bites; otherwise it is
+        // the same number twice.
+        if sp.available != sp.free {
+            s.push_str(&format!(
+                "Free to you: {}  (disk quota in effect)\n",
+                format_size_with_bytes(sp.available)
+            ));
+        }
+        if let Some(c) = info.cluster {
+            s.push_str(&format!(
+                "Cluster:   {} bytes ({} bytes/sector × {} sectors)\n",
+                c.allocation_unit(),
+                c.bytes_per_sector,
+                c.sectors_per_cluster
+            ));
+        }
+    }
+
+    s.push('\n');
+    s.push_str("--- Root folder (top level only) ---\n");
+    match top {
+        Some(t) => {
+            s.push_str(&format!("Folders:   {}\n", t.dirs));
+            s.push_str(&format!("Files:     {}\n", t.files));
+            s.push_str(&format!(
+                "Loose files: {}  (not recursive)\n",
+                format_size_with_bytes(t.file_bytes)
+            ));
+            if t.hidden > 0 {
+                s.push_str(&format!("Hidden / system entries: {}\n", t.hidden));
+            }
+        }
+        None => s.push_str("(root folder could not be read)\n"),
+    }
+
+    // Identity and filesystem trivia come last: the viewer is read line by
+    // line, and capacity is what the user opened this screen for. Features
+    // are one joined line rather than sixteen for the same reason — that is
+    // sixteen rows to arrow past for a detail nobody came here to find.
+    if info.volume_info_ok {
+        s.push('\n');
+        s.push_str("--- Volume ---\n");
+        s.push_str(&format!(
+            "Serial:    {}\n",
+            format_volume_serial(info.serial)
+        ));
+        if info.max_component_len > 0 {
+            s.push_str(&format!("Max name:  {} chars\n", info.max_component_len));
+        }
+        if !info.volume_guid.is_empty() {
+            s.push_str(&format!("Volume ID: {}\n", info.volume_guid));
+        }
+        s.push_str(&format!("Flags:     0x{:08X}\n", info.flags));
+        let features = format_volume_flags(info.flags);
+        if !features.is_empty() {
+            s.push_str(&format!("Features:  {}\n", features.join(", ")));
+        }
+    }
+    s
+}
+
+/// Windows renders a volume serial as two hex groups, `A1B2-C3D4`, and
+/// that is the form users see in `dir` / disk tools — matching it means a
+/// serial read out here can be compared with one read out anywhere else.
+pub fn format_volume_serial(serial: u32) -> String {
+    format!("{:04X}-{:04X}", (serial >> 16) & 0xFFFF, serial & 0xFFFF)
+}
+
+/// Decode the `FILE_*` filesystem capability flags `GetVolumeInformationW`
+/// returns. Only the bits a user can act on are named; the raw value is
+/// printed alongside for anything not covered.
+pub fn format_volume_flags(flags: u32) -> Vec<&'static str> {
+    const NAMED: &[(u32, &str)] = &[
+        (0x0000_0001, "case-sensitive search"),
+        (0x0000_0002, "case-preserved names"),
+        (0x0000_0004, "unicode filenames"),
+        (0x0000_0008, "persistent ACLs"),
+        (0x0000_0010, "per-file compression"),
+        (0x0000_0020, "disk quotas"),
+        (0x0000_0040, "sparse files"),
+        (0x0000_0080, "reparse points"),
+        (0x0000_0100, "remote storage"),
+        (0x0000_8000, "volume is compressed"),
+        (0x0001_0000, "object IDs"),
+        (0x0002_0000, "encryption (EFS)"),
+        (0x0004_0000, "named streams"),
+        (0x0008_0000, "READ-ONLY volume"),
+        (0x0010_0000, "write-once (sequential)"),
+        (0x0020_0000, "transactions"),
+        (0x0040_0000, "hard links"),
+        (0x0080_0000, "extended attributes"),
+        (0x0100_0000, "open by file ID"),
+        (0x0200_0000, "USN journal"),
+        (0x0400_0000, "integrity streams"),
+        (0x0800_0000, "block cloning"),
+        (0x2000_0000, "DAX (direct access) volume"),
+        (0x4000_0000, "cloud file ghosting"),
+    ];
+    NAMED
+        .iter()
+        .filter(|(bit, _)| flags & bit != 0)
+        .map(|(_, name)| *name)
+        .collect()
 }
 
 /// Build the properties text for a remote `entry` at `path`. `stat` is the
@@ -735,6 +929,144 @@ mod tests {
         assert!(s.contains("42 bytes"));
         // No folder summary for a file.
         assert!(!s.contains("Folder contents"));
+    }
+
+    fn drive(space: Option<navigator_fs::DriveSpace>) -> DriveInfo {
+        DriveInfo {
+            root: r"D:\".into(),
+            label: "Data".into(),
+            drive_type: 3,
+            kind: "Local Disk",
+            file_system: "NTFS".into(),
+            serial: 0xA1B2_C3D4,
+            max_component_len: 255,
+            flags: 0x0000_0002 | 0x0004_0000,
+            volume_guid: r"\\?\Volume{deadbeef-0000-0000-0000-000000000000}\".into(),
+            volume_info_ok: true,
+            space,
+            cluster: Some(navigator_fs::ClusterInfo {
+                bytes_per_sector: 512,
+                sectors_per_cluster: 8,
+            }),
+        }
+    }
+
+    #[test]
+    fn volume_serial_uses_the_windows_two_group_form() {
+        assert_eq!(format_volume_serial(0xA1B2_C3D4), "A1B2-C3D4");
+        assert_eq!(format_volume_serial(0), "0000-0000");
+        assert_eq!(format_volume_serial(0x0000_00FF), "0000-00FF");
+    }
+
+    #[test]
+    fn volume_flags_decode_only_the_bits_that_are_set() {
+        let f = format_volume_flags(0x0000_0002 | 0x0008_0000);
+        assert!(f.contains(&"case-preserved names"), "{f:?}");
+        assert!(f.contains(&"READ-ONLY volume"), "{f:?}");
+        assert!(!f.contains(&"hard links"), "{f:?}");
+        assert!(format_volume_flags(0).is_empty());
+    }
+
+    /// The headline numbers for a drive are capacity, and they must be
+    /// derived from the volume query rather than a walk — used is
+    /// total − free, and the percentages are consistent with them.
+    #[test]
+    fn drive_properties_report_capacity_and_free_space() {
+        let space = navigator_fs::DriveSpace {
+            total: 1000,
+            free: 250,
+            available: 250,
+        };
+        let s = format_drive_properties("D: (Data)", &drive(Some(space)), None);
+        assert!(s.contains("Name:      D: (Data)"), "{s}");
+        assert!(s.contains("Path:      D:\\"), "{s}");
+        assert!(s.contains("Type:      Local Disk"), "{s}");
+        assert!(s.contains("File system: NTFS"), "{s}");
+        assert!(s.contains("Total:     1000 bytes"), "{s}");
+        assert!(s.contains("Used:      750 bytes  (75.0%)"), "{s}");
+        assert!(s.contains("Free:      250 bytes  (25.0%)"), "{s}");
+        assert!(s.contains("Serial:    A1B2-C3D4"), "{s}");
+        assert!(s.contains("Cluster:   4096 bytes"), "{s}");
+        assert!(s.contains("named streams"), "{s}");
+        // No quota → the "free to you" line would just repeat Free.
+        assert!(!s.contains("Free to you"), "{s}");
+        // Never a recursive tally — that is the whole point of this path.
+        assert!(!s.contains("Folder contents (recursive)"), "{s}");
+    }
+
+    /// A quota'd volume is the only case where "free" and "free to you"
+    /// differ, and hiding the difference would misreport how much the user
+    /// can actually write.
+    #[test]
+    fn drive_properties_call_out_a_quota() {
+        let space = navigator_fs::DriveSpace {
+            total: 1000,
+            free: 400,
+            available: 100,
+        };
+        let s = format_drive_properties("D: (Data)", &drive(Some(space)), None);
+        assert!(s.contains("Free to you: 100 bytes"), "{s}");
+        assert!(s.contains("disk quota in effect"), "{s}");
+    }
+
+    /// An empty bay must say so. Rendering zeroes would be indistinguishable
+    /// from a genuinely empty disk — the same trap `dump_tree_toml_error`
+    /// exists to avoid.
+    #[test]
+    fn an_unreadable_drive_says_so_instead_of_showing_zeroes() {
+        let info = DriveInfo {
+            root: r"E:\".into(),
+            kind: "CD Drive",
+            drive_type: 5,
+            ..Default::default()
+        };
+        let s = format_drive_properties("E: (CD Drive)", &info, None);
+        assert!(s.contains("Drive not ready"), "{s}");
+        assert!(!s.contains("Total:"), "no capacity section:\n{s}");
+        assert!(!s.contains("0 bytes"), "no zero figures:\n{s}");
+    }
+
+    /// The root listing is explicitly one level deep, and the output has to
+    /// say that so the numbers aren't read as a whole-disk tally.
+    #[test]
+    fn drive_properties_report_the_root_listing_as_non_recursive() {
+        let space = navigator_fs::DriveSpace {
+            total: 1000,
+            free: 250,
+            available: 250,
+        };
+        let top = TopLevel {
+            files: 3,
+            dirs: 12,
+            file_bytes: 4096,
+            hidden: 2,
+        };
+        let s = format_drive_properties("D: (Data)", &drive(Some(space)), Some(&top));
+        assert!(s.contains("Root folder (top level only)"), "{s}");
+        assert!(s.contains("Folders:   12"), "{s}");
+        assert!(s.contains("Files:     3"), "{s}");
+        assert!(s.contains("not recursive"), "{s}");
+        assert!(s.contains("Hidden / system entries: 2"), "{s}");
+        // Order is deliberate: the viewer is read top-down, so capacity
+        // comes before the listing and volume trivia comes last.
+        let capacity = s.find("--- Capacity ---").expect("capacity section");
+        let root = s.find("--- Root folder").expect("root section");
+        let volume = s.find("--- Volume ---").expect("volume section");
+        assert!(capacity < root && root < volume, "section order:\n{s}");
+    }
+
+    #[test]
+    fn top_level_counts_do_not_recurse() {
+        let td = TempDir::new();
+        write(&td.path().join("a.txt"), b"hello"); // 5 bytes
+        write(&td.path().join("b.bin"), b"xy"); // 2 bytes
+        write(&td.path().join("sub/deep.txt"), b"ignored"); // must not count
+        fs::create_dir_all(td.path().join("empty")).unwrap();
+
+        let t = top_level_counts(&td.nav()).expect("readable dir");
+        assert_eq!(t.files, 2, "only the two root files: {t:?}");
+        assert_eq!(t.dirs, 2, "sub + empty: {t:?}");
+        assert_eq!(t.file_bytes, 7, "root files only, no descent: {t:?}");
     }
 
     #[test]

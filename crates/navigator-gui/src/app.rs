@@ -2217,6 +2217,13 @@ impl AppState {
     /// directories the recursive size / counts / extension histogram
     /// come from a worker thread so a giant tree doesn't freeze the UI;
     /// the viewer only opens once the scan finishes.
+    ///
+    /// Three routes, and picking the wrong one fails *quietly*: a This PC
+    /// row is a display string (`"D: (Data)"`), not a path — `cwd.join` on
+    /// it builds `\\?\NavigatorThisPC\D: (Data)`, which no filesystem can
+    /// stat, so the folder walk found nothing and rendered a page of
+    /// zeroes. Drives answer from `navigator_fs::drive_info` instead, and
+    /// remotes from rclone (same class of bug — see `op_dump_tree`).
     pub fn op_show_properties(&self) {
         let Some(cwd) = self.model.cwd() else {
             return;
@@ -2236,6 +2243,30 @@ impl AppState {
 
         let is_dir = entry.is_dir();
         let title = format!("Properties — {}", entry.name);
+
+        // This PC: the row names a volume, so report the volume. No walk —
+        // capacity comes from the OS in constant time, and the only
+        // enumeration is one non-recursive listing of the root.
+        if cwd.is_this_pc() {
+            let display = entry.name.clone();
+            let Some(root) = navigator_fs::drive_path_from_display(&display) else {
+                self.say("not a drive", true);
+                return;
+            };
+            std::thread::Builder::new()
+                .name("navigator-properties-drive".into())
+                .spawn(move || {
+                    let info = navigator_fs::drive_info(&root);
+                    let top = NavPath::new(&root)
+                        .ok()
+                        .and_then(|p| crate::props::top_level_counts(&p));
+                    let body = crate::props::format_drive_properties(&display, &info, top.as_ref());
+                    post_viewer(hwnd, title, body);
+                })
+                .expect("spawn drive properties worker");
+            return;
+        }
+
         if is_dir {
             self.say(&format!("scanning {}…", entry.name), false);
         }
