@@ -16,6 +16,13 @@
 //! log lines, cancel, done) doesn't match a one-shot "set the text" flow,
 //! and conflating them would reopen the progress window every time the
 //! user hit Alt+Enter.
+//!
+//! **Copy is a button, not just Ctrl+C.** The text arrives selected so
+//! Ctrl+C works the moment the window opens, but that only holds until
+//! the user moves the caret to read — and the whole point of these
+//! screens is to be read before they're copied. The button copies the
+//! entire body regardless of what is selected, and says so, so a
+//! screen-reader user gets confirmation the clipboard actually changed.
 
 use std::ffi::c_void;
 
@@ -37,12 +44,28 @@ use windows::core::{PCWSTR, w};
 
 const IDC_EDIT: u16 = 401;
 const IDC_BTN_CLOSE: u16 = 402;
+const IDC_BTN_COPY: u16 = 403;
 
 const CLASS: PCWSTR = w!("NavigatorTextViewer");
 
 struct Data {
     edit: HWND,
+    btn_copy: HWND,
     btn_close: HWND,
+    /// The **main** window — our owner, not this window. Kept so the Copy
+    /// button can reach `AppState` for the spoken confirmation.
+    ///
+    /// It has to be captured at creation: `build_children` is handed the
+    /// viewer's own hwnd, and both windows keep a pointer in
+    /// `GWLP_USERDATA`, so passing the wrong one to
+    /// `crate::window::window_data` reads this very `Data` back as a
+    /// `WindowData`.
+    owner: HWND,
+    /// Exactly what the edit is showing, CR-LF normalised. Copying from
+    /// here rather than re-reading the control keeps the button
+    /// independent of the selection and skips a second allocation of a
+    /// body that can run to megabytes.
+    body: String,
 }
 
 /// Show `text` in the viewer, replacing whatever was there. `parent` is
@@ -59,7 +82,7 @@ pub fn show(parent: HWND, title: &str, text: &str) {
     };
     set_title(hwnd, title);
     if let Some(d) = unsafe { data(hwnd) } {
-        set_edit_text(d.edit, text);
+        d.body = set_edit_text(d.edit, text);
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOW);
         }
@@ -98,7 +121,7 @@ fn ensure_window(parent: HWND) -> windows::core::Result<HWND> {
             None,
         )?
     };
-    let data = Box::new(build_children(hwnd));
+    let data = Box::new(build_children(hwnd, parent));
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(data) as isize);
     }
@@ -148,7 +171,9 @@ fn ensure_class() -> windows::core::Result<()> {
     Ok(())
 }
 
-fn build_children(parent: HWND) -> Data {
+/// Build the viewer's children. `hwnd` is the viewer; `owner` is the main
+/// window it belongs to (see [`Data::owner`]).
+fn build_children(hwnd: HWND, owner: HWND) -> Data {
     let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
     let apply_font = |h: HWND| unsafe {
         SendMessageW(
@@ -159,18 +184,28 @@ fn build_children(parent: HWND) -> Data {
         );
     };
 
-    let edit = mkmulti(parent, 10, 10, 700, 440, IDC_EDIT);
+    let edit = mkmulti(hwnd, 10, 10, 700, 440, IDC_EDIT);
     apply_font(edit);
-    // Release Tab to the parent so Tab cycles edit ↔ Close instead of
-    // inserting a tab character.
+    // Release Tab to the parent so Tab cycles edit → Copy → Close instead
+    // of inserting a tab character.
     crate::window::install_tab_nav(edit);
     // Multi-line EDIT swallows VK_ESCAPE — subclass turns it into
     // WM_CLOSE on the parent so Esc actually closes the window.
     crate::window::install_esc_close(edit);
-    let btn_close = mkbutton(parent, "&Close", 620, 460, 80, 28, IDC_BTN_CLOSE);
+    // Created before Close so Tab runs edit → Copy → Close.
+    let btn_copy = mkbutton(hwnd, "Cop&y all", 520, 460, 90, 28, IDC_BTN_COPY);
+    apply_font(btn_copy);
+    crate::window::install_esc_close(btn_copy);
+    let btn_close = mkbutton(hwnd, "&Close", 620, 460, 80, 28, IDC_BTN_CLOSE);
     apply_font(btn_close);
     crate::window::install_esc_close(btn_close);
-    Data { edit, btn_close }
+    Data {
+        edit,
+        btn_copy,
+        btn_close,
+        owner,
+        body: String::new(),
+    }
 }
 
 fn layout(hwnd: HWND) {
@@ -185,18 +220,52 @@ fn layout(hwnd: HWND) {
     let h = (rc.bottom - rc.top).max(0);
     let pad = 10;
     let btn_w = 80;
+    let copy_w = 90;
     let btn_h = 28;
     let edit_h = (h - btn_h - pad * 3).max(40);
+    let btn_y = pad + edit_h + pad;
+    let close_x = (w - btn_w - pad).max(pad);
     unsafe {
         let _ = MoveWindow(d.edit, pad, pad, (w - pad * 2).max(40), edit_h, true);
         let _ = MoveWindow(
-            d.btn_close,
-            (w - btn_w - pad).max(pad),
-            pad + edit_h + pad,
-            btn_w,
+            d.btn_copy,
+            (close_x - copy_w - pad).max(pad),
+            btn_y,
+            copy_w,
             btn_h,
             true,
         );
+        let _ = MoveWindow(d.btn_close, close_x, btn_y, btn_w, btn_h, true);
+    }
+}
+
+/// Put the whole body on the clipboard and say whether it landed. Routed
+/// through `AppState` for the announcement because a screen-reader user
+/// gets no other feedback from a button that changes nothing on screen.
+fn copy_all(hwnd: HWND) {
+    let Some(d) = (unsafe { data(hwnd) }) else {
+        return;
+    };
+    let state = unsafe { crate::window::window_data(d.owner) }.map(|w| w.state.clone());
+    if d.body.is_empty() {
+        if let Some(s) = state {
+            s.say("nothing to copy", true);
+        }
+        return;
+    }
+    let chars = d.body.chars().count();
+    match crate::app::set_clipboard_text(Some(hwnd), &d.body) {
+        Ok(()) => {
+            if let Some(s) = state {
+                s.say(&format!("copied, {chars} characters"), true);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("viewer copy failed: {e}");
+            if let Some(s) = state {
+                s.say("copy failed", true);
+            }
+        }
     }
 }
 
@@ -209,6 +278,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         WM_COMMAND => unsafe {
             let cmd = (wp.0 & 0xFFFF) as u16;
             match cmd {
+                IDC_BTN_COPY => copy_all(hwnd),
                 IDC_BTN_CLOSE => {
                     let _ = DestroyWindow(hwnd);
                 }
@@ -259,7 +329,9 @@ fn set_title(hwnd: HWND, s: &str) {
     }
 }
 
-fn set_edit_text(edit: HWND, s: &str) {
+/// Push `s` into the edit and hand the CR-LF normalised form back, which
+/// is what the Copy button puts on the clipboard.
+fn set_edit_text(edit: HWND, s: &str) -> String {
     // EDIT expects CR-LF line breaks; LF-only leaves everything on one
     // visible row. Normalise \n to \r\n without doubling up existing \r\n.
     let mut buf = String::with_capacity(s.len());
@@ -275,6 +347,7 @@ fn set_edit_text(edit: HWND, s: &str) {
     unsafe {
         let _ = SetWindowTextW(edit, PCWSTR(w.as_ptr()));
     }
+    buf
 }
 
 fn mkmulti(parent: HWND, x: i32, y: i32, w: i32, h: i32, id: u16) -> HWND {

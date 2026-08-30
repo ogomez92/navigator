@@ -50,8 +50,11 @@ pub fn run(driver: &RcloneDriver, op: &Operation) -> std::io::Result<Outcome> {
     // Per-op temp log path. Includes the parent PID so concurrent
     // retries from peer instances can't stomp each other; rclone
     // appends if the file exists, but we want a clean read.
-    let log_path: PathBuf =
-        std::env::temp_dir().join(format!("navigator-elevated-{}.log", std::process::id()));
+    let log_path: PathBuf = std::env::temp_dir().join(format!(
+        "{}{}.log",
+        crate::tempsweep::ELEVATED_LOG_PREFIX,
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&log_path);
 
     // Compose argv that mirrors `RcloneDriver::spawn`, plus the

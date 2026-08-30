@@ -136,7 +136,8 @@ impl TempList {
     /// including both.
     pub fn write(names: &[String], seq: u64) -> std::io::Result<Self> {
         let path = std::env::temp_dir().join(format!(
-            "navigator-files-from-{}-{}.txt",
+            "{}{}-{}.txt",
+            crate::tempsweep::FILES_FROM_PREFIX,
             std::process::id(),
             seq
         ));

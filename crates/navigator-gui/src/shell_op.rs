@@ -262,7 +262,8 @@ fn list_file_path() -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "navigator-shellop-{}-{}.txt",
+        "{}{}-{}.txt",
+        crate::tempsweep::SHELL_OP_PREFIX,
         std::process::id(),
         n
     ))

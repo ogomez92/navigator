@@ -32,7 +32,9 @@ fn main() {
     let driver = RcloneDriver::from_path();
     say(format!(
         "paste -> {} ({} sources, mode {:?})",
-        dest_dir.rclone_arg().unwrap_or_else(|| dest_dir.to_string()),
+        dest_dir
+            .rclone_arg()
+            .unwrap_or_else(|| dest_dir.to_string()),
         sources.len(),
         MODE
     ));

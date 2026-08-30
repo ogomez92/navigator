@@ -2573,6 +2573,72 @@ impl AppState {
             .expect("spawn dump-tree worker");
     }
 
+    /// File → Compare trees…: walk the folder the user is standing in,
+    /// diff it against a tree they paste in, and show the result in the
+    /// viewer.
+    ///
+    /// The prompt is modal on the UI thread (it is one paste box), but the
+    /// walk, the parse and the diff all run on a worker — the walk is
+    /// unbounded IO and the paste can be megabytes, neither of which
+    /// belongs in the message pump.
+    ///
+    /// Remote roots branch to `lsjson --recursive` for the same reason
+    /// `op_dump_tree` does: `walk_tree` uses `FindFirstFileExW`, which
+    /// cannot see a `\\?\NavigatorRemote\…` path and would report the
+    /// whole remote as missing rather than failing loudly.
+    pub fn op_compare_trees(&self) {
+        let Some(cwd) = self.model.cwd() else {
+            return;
+        };
+        if cwd.is_this_pc() {
+            self.say("can't compare This PC", true);
+            return;
+        }
+        if cwd.is_remotes_root() {
+            self.say("can't compare the remotes list", true);
+            return;
+        }
+        let Some(hwnd) = self.hwnd() else {
+            return;
+        };
+        let label = cwd.rclone_arg().unwrap_or_else(|| cwd.to_string());
+        let Some(text) = crate::compare_dialog::open(hwnd.0, &label) else {
+            return;
+        };
+        let title = format!("Compare — {label}");
+        self.say("comparing trees…", false);
+
+        if cwd.is_remote() {
+            let rclone = self.rclone.clone();
+            std::thread::Builder::new()
+                .name("navigator-compare-remote".into())
+                .spawn(move || {
+                    let arg = cwd.rclone_arg().unwrap_or_default();
+                    let body = match rclone.lsjson_recursive(&arg) {
+                        Ok(items) => crate::compare::compare_against_text(
+                            crate::compare::tree_from_remote_items(label, &items),
+                            &text,
+                        ),
+                        Err(e) => crate::compare::format_error(&label, &e.to_string()),
+                    };
+                    post_viewer(hwnd, title, body);
+                })
+                .expect("spawn remote compare worker");
+            return;
+        }
+
+        std::thread::Builder::new()
+            .name("navigator-compare".into())
+            .spawn(move || {
+                let (entries, errors) = crate::props::walk_tree(&cwd);
+                let mut here = crate::compare::Tree::new(label, entries);
+                here.errors = errors;
+                let body = crate::compare::compare_against_text(here, &text);
+                post_viewer(hwnd, title, body);
+            })
+            .expect("spawn compare worker");
+    }
+
     /// Rename `old_name` → `new_name` within the current directory. Arms
     /// `pending_focus` so the caret lands on the renamed row after the
     /// post-op refresh — without it the listing rebuild defaults to row 0.
@@ -4256,7 +4322,7 @@ fn single_entry(root: &NavPath, name: &str) -> Option<navigator_core::Entry> {
 ///   4. `SetClipboardData(CF_UNICODETEXT, hmem)` — ownership of hmem passes
 ///      to the system; *we must not* GlobalFree it on success.
 ///   5. `CloseClipboard`.
-fn set_clipboard_text(
+pub(crate) fn set_clipboard_text(
     hwnd: Option<windows::Win32::Foundation::HWND>,
     text: &str,
 ) -> std::io::Result<()> {
@@ -4665,6 +4731,10 @@ fn prune_empty_src_dirs(op: &Operation) {
 }
 
 pub fn run(cfg: AppConfig) -> windows::core::Result<i32> {
+    // Backstop for the temp files an operation could not delete itself —
+    // a killed process, an abort, a `process::exit` that skipped a
+    // destructor. Runs on its own thread and nothing waits for it.
+    crate::tempsweep::spawn();
     let state = AppState::new(&cfg);
     state.bootstrap_plugins();
     let window = create_window(state.clone())?;

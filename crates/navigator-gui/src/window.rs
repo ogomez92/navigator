@@ -393,6 +393,7 @@ pub enum Commands {
     NewFile = 150,
     /// Paste, choosing the conflict mode first. Only route to Mirror.
     PasteSpecial = 151,
+    CompareTrees = 152,
     // Help menu
     About = 160,
     // Shortcut/Action dynamic range
@@ -452,6 +453,12 @@ fn build_menu() -> HMENU {
             MF_STRING,
             Commands::ShowProperties as usize,
             w!("P&roperties\tAlt+Enter"),
+        );
+        let _ = AppendMenuW(
+            file,
+            MF_STRING,
+            Commands::CompareTrees as usize,
+            w!("&Compare trees…"),
         );
         let _ = AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(
@@ -1575,6 +1582,7 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
         x if x == Commands::NavigateUp as u16 => data.state.navigate_up(),
         x if x == Commands::ShowProperties as u16 => data.state.op_show_properties(),
         x if x == Commands::DumpTree as u16 => data.state.op_dump_tree(),
+        x if x == Commands::CompareTrees as u16 => data.state.op_compare_trees(),
         x if x == Commands::Extract as u16 => data.state.op_extract(),
         x if x == Commands::Zip as u16 => data.state.op_zip(),
         x if x == Commands::EmptyTrash as u16 => data.state.op_empty_trash(),

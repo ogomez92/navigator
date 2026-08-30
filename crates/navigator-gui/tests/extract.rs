@@ -19,13 +19,17 @@ use navigator_config::Extraction;
 use navigator_core::NavPath;
 use navigator_gui::extract;
 
-/// Unique scratch directory for one test. Removed first so a previous
-/// run's leftovers can't answer the assertions.
-fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("nav-extract-e2e-{}-{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// Scratch directory for one test, deleted when the returned guard drops.
+///
+/// A guard rather than a bare path: these tests drive a real `7z.exe`, so
+/// an assertion that fires part-way through would otherwise strand a tree
+/// of archives and extracted output in `%TEMP%` permanently. The name is
+/// unique per call, so a previous run cannot answer the assertions either.
+fn scratch(tag: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("nav-extract-e2e-{tag}-"))
+        .tempdir()
+        .expect("mkdir scratch")
 }
 
 /// Build `dest` from the files in `src_dir` using the real 7z. Returns
@@ -59,7 +63,8 @@ fn a_swept_folder_extracts_each_archive_in_place_and_purges_it() {
         eprintln!("7z not installed; skipping");
         return;
     };
-    let root = scratch("sweep");
+    let tmp = scratch("sweep");
+    let root = tmp.path();
 
     // Staging area for the archive's contents. Two entries, so the
     // wrap-folder rule applies and the output is a named subfolder.
@@ -82,7 +87,7 @@ fn a_swept_folder_extracts_each_archive_in_place_and_purges_it() {
     std::fs::write(root.join("keep.exe"), b"MZ").unwrap();
     std::fs::write(deep.join("notes.txt"), b"notes").unwrap();
 
-    let found = extract::sweep_archives(&root);
+    let found = extract::sweep_archives(root);
     assert_eq!(found, vec![archive.clone()], "sweep took the wrong set");
 
     run(
@@ -104,8 +109,6 @@ fn a_swept_folder_extracts_each_archive_in_place_and_purges_it() {
     assert!(!archive.exists(), "archive was not deleted");
     assert!(root.join("keep.exe").is_file(), "swept an executable");
     assert!(deep.join("notes.txt").is_file(), "deleted a non-archive");
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -114,7 +117,8 @@ fn a_failed_extraction_keeps_its_archive() {
         eprintln!("7z not installed; skipping");
         return;
     };
-    let root = scratch("corrupt");
+    let tmp = scratch("corrupt");
+    let root = tmp.path();
     // Named like an archive, isn't one — 7z exits non-zero, and a delete
     // here would destroy the only copy of whatever it really is.
     let bogus = root.join("broken.zip");
@@ -130,7 +134,6 @@ fn a_failed_extraction_keeps_its_archive() {
     );
 
     assert!(bogus.is_file(), "a failed extraction deleted its archive");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -143,7 +146,8 @@ fn a_split_7z_extracts_from_its_first_part_and_purges_the_whole_set() {
         eprintln!("7z not installed; skipping");
         return;
     };
-    let root = scratch("split");
+    let tmp = scratch("split");
+    let root = tmp.path();
 
     let staging = root.join("staging");
     std::fs::create_dir_all(&staging).unwrap();
@@ -186,7 +190,7 @@ fn a_split_7z_extracts_from_its_first_part_and_purges_the_whole_set() {
 
     // Selecting every part is the normal Ctrl+A gesture; only the first
     // may be queued, and the rest must not come back as failures.
-    let parts: Vec<(NavPath, bool)> = std::fs::read_dir(&root)
+    let parts: Vec<(NavPath, bool)> = std::fs::read_dir(root)
         .unwrap()
         .flatten()
         .map(|e| (NavPath::new(e.path()).unwrap(), false))
@@ -212,13 +216,11 @@ fn a_split_7z_extracts_from_its_first_part_and_purges_the_whole_set() {
     assert!(out.join("one.bin").is_file(), "missing {:?}", out);
     assert!(out.join("two.bin").is_file(), "missing {:?}", out);
     // Every part purged, not just the one 7z was pointed at.
-    let leftovers: Vec<String> = std::fs::read_dir(&root)
+    let leftovers: Vec<String> = std::fs::read_dir(root)
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.contains(".7z."))
         .collect();
     assert!(leftovers.is_empty(), "orphaned volumes: {leftovers:?}");
-
-    let _ = std::fs::remove_dir_all(&root);
 }

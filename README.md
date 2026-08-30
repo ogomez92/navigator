@@ -182,6 +182,38 @@ error     = "uhoh.wav"
 Filenames are resolved inside `navigator_sounds/` only — a path or `..` in the
 value is rejected.
 
+## Comparing two trees
+
+**File → Compare trees…** answers "what does that copy have that this one
+doesn't?". Alt+L dumps the folder you're standing in as a TOML tree; copy
+that from the viewer (**Copy all**), go to the other folder — another
+drive, another machine, an rclone remote — and paste it into the compare
+prompt. A plain list of paths, one per line, works too.
+
+The report opens in the same viewer and leads with the totals:
+
+```
+Summary
+-------
+Total files missing:    62
+Total folders missing:  4
+  (those folders hold a further 145 files and 9 sub-folders, not listed)
+Only here — files:      3
+Only here — folders:    1
+```
+
+A folder that is missing in whole is named once and its contents are
+*counted, not listed* — if `a/b` isn't here then neither is anything under
+it, and `a/b` is the one line you can act on. The scan carries straight on
+with `a/b`'s siblings. Matching is case-insensitive, and both directions
+are reported, so a paste that turns out to be the same tree says so.
+
+Paths are relative to each tree's own root, so the two folders don't have
+to live anywhere alike. Remote folders are read with one
+`rclone lsjson --recursive`; local ones are walked directly, and any
+sub-folder that couldn't be read is called out rather than quietly
+inflating the missing list.
+
 ## Key bindings
 
 | Key                          | Action                                              |

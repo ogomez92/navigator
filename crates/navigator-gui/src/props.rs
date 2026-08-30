@@ -544,9 +544,31 @@ pub fn format_unix_mode(mode: u32) -> String {
 /// tree of zeroes. `AppState::op_dump_tree` routes them to
 /// [`dump_tree_toml_remote`] instead.
 pub fn dump_tree_toml(root: &NavPath) -> String {
+    let (entries, errors) = walk_tree(root);
     let mut dirs: Vec<String> = Vec::new();
     let mut files: Vec<String> = Vec::new();
     let mut total_size: u64 = 0;
+    for e in entries {
+        if e.is_dir {
+            dirs.push(e.path);
+        } else {
+            total_size = total_size.saturating_add(e.size);
+            files.push(e.path);
+        }
+    }
+    render_tree_toml(root, dirs, files, total_size, errors, None)
+}
+
+/// The walk itself, flattened into `(entries, unreadable_subdir_count)`.
+///
+/// Shared by the Alt+L dump above and File → Compare trees so the two can
+/// never disagree about what is in a folder. Recursion is an explicit
+/// stack (a deep tree must not blow the process stack) and reparse points
+/// are recorded but not followed, matching `compute_folder_stats`.
+///
+/// Local only, for the reason spelled out on [`dump_tree_toml`].
+pub fn walk_tree(root: &NavPath) -> (Vec<crate::compare::TreeEntry>, u64) {
+    let mut out: Vec<crate::compare::TreeEntry> = Vec::new();
     let mut errors: u64 = 0;
 
     let root_path = root.as_path().to_path_buf();
@@ -564,17 +586,16 @@ pub fn dump_tree_toml(root: &NavPath) -> String {
             let rel = relativize(&root_path, full.as_path());
             match e.kind {
                 EntryKind::Directory => {
-                    dirs.push(rel);
+                    out.push(crate::compare::TreeEntry::new(&rel, true, 0));
                     stack.push(full);
                 }
                 EntryKind::Symlink | EntryKind::File | EntryKind::Other => {
-                    files.push(rel);
-                    total_size = total_size.saturating_add(e.size);
+                    out.push(crate::compare::TreeEntry::new(&rel, false, e.size));
                 }
             }
         }
     }
-    render_tree_toml(root, dirs, files, total_size, errors, None)
+    (out, errors)
 }
 
 /// Same output as [`dump_tree_toml`], built from one

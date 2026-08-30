@@ -1319,15 +1319,16 @@ Size = 0
 
     #[test]
     fn sweep_archives_walks_subfolders_and_skips_non_archives() {
-        let root = std::env::temp_dir().join(format!("nav-sweep-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        // Guarded, so a failing assertion below cannot strand the tree.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
         let deep = root.join("sub").join("deeper");
         std::fs::create_dir_all(&deep).unwrap();
         for (dir, name) in [
-            (root.as_path(), "top.zip"),
-            (root.as_path(), "notes.txt"),
+            (root, "top.zip"),
+            (root, "notes.txt"),
             // Directly selectable, never swept.
-            (root.as_path(), "setup.exe"),
+            (root, "setup.exe"),
             (deep.as_path(), "nested.7z"),
             (deep.as_path(), "movie.part1.rar"),
             (deep.as_path(), "movie.part2.rar"),
@@ -1335,7 +1336,7 @@ Size = 0
             std::fs::write(dir.join(name), b"x").unwrap();
         }
 
-        let found = sweep_archives(&root);
+        let found = sweep_archives(root);
         let names: Vec<String> = found
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
@@ -1346,15 +1347,12 @@ Size = 0
         assert!(!names.contains(&"movie.part2.rar".to_string()), "{names:?}");
         assert!(!names.contains(&"notes.txt".to_string()), "{names:?}");
         assert!(!names.contains(&"setup.exe".to_string()), "{names:?}");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn purge_targets_names_the_whole_volume_set() {
-        let root = std::env::temp_dir().join(format!("nav-purge-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
         for name in ["m.part1.rar", "m.part2.rar", "m.part3.rar", "keep.zip"] {
             std::fs::write(root.join(name), b"x").unwrap();
         }
@@ -1364,21 +1362,20 @@ Size = 0
             .collect();
         got.sort();
         assert_eq!(got, vec!["m.part1.rar", "m.part2.rar", "m.part3.rar"]);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn unique_dest_passes_through_when_free() {
-        let tmp = std::env::temp_dir().join(format!("nav-extract-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let result = unique_dest(tmp.clone());
-        assert_eq!(result, tmp);
+        let tmp = tempfile::tempdir().unwrap();
+        let free = tmp.path().join("archive");
+        let result = unique_dest(free.clone());
+        assert_eq!(result, free);
     }
 
     #[test]
     fn unique_dest_appends_counter_on_collision() {
-        let base = std::env::temp_dir().join(format!("nav-extract-collide-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("archive");
         std::fs::create_dir_all(&base).unwrap();
         let result = unique_dest(base.clone());
         assert_ne!(result, base);
@@ -1391,6 +1388,5 @@ Size = 0
             "expected suffix ` (1)`, got {:?}",
             result,
         );
-        let _ = std::fs::remove_dir_all(&base);
     }
 }

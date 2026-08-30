@@ -151,6 +151,19 @@ It now runs in a **separate process**: `spawn_detached` re-executes navigator's 
 - Exit codes are the contract: `0` ok, `1` failed, `2` user cancelled in the shell's dialog, `3` bad args. The parent's reaper thread maps them to a spoken summary and a final `refresh()`. **The reaper is not what keeps the copy alive** — the child owns itself, so if navigator exits first the copy simply finishes unannounced. A malformed `--shell-op` must exit `3`, never fall through to the GUI: opening a file explorer because a flag was missing would leave the user staring at a window they didn't ask for while the paste silently never happened.
 - Detached ops deliberately do **not** hold an `OpGuard`, so they don't count toward `ops_in_flight` and the close-confirmation ignores them. That's correct — they survive the close.
 
+### Temp artifacts and the startup sweep (`tempsweep.rs`)
+
+Three things stage a file in `%TEMP%`: the `--files-from` list of a batched paste (`batch::TempList`), the source list a detached shell copy hands its helper (`shell_op::list_file_path`), and the `--log-file` an elevated retry redirects rclone to (`elevated::run`). Each deletes its own file on the normal path — that is still the primary cleanup, and `TempList`'s `Drop` is what covers a paste that fails mid-flight.
+
+**Destructors are not enough here, so there is a startup sweep.** `main` ends the process with `std::process::exit`, so a `TempList` a worker still holds at that moment is never dropped; the release profile is `panic = "abort"`, which unwinds nothing; and a crash or a kill takes the file either way. `app::run` therefore calls `tempsweep::spawn()` before building the window — a `read_dir` of `%TEMP%` is unbounded IO, so it runs on `navigator-temp-sweep` and nothing waits for it.
+
+- **Every producer names its file from the prefix constant in `tempsweep`**, never its own literal, so the sweeper and the thing it sweeps cannot drift.
+- **A file is reaped only once its owner is gone.** The pid in the name is the whole safety story: a peer instance mid-paste is holding a list rclone is reading, and only the pid distinguishes that from a leak. `is_stale` (pure, unit-tested) keeps anything that isn't ours by prefix, anything younger than a 10-minute grace period, anything whose owning pid still exists, and anything written by this very process; `MAX_AGE` (7 days) is the backstop for a pid the OS has since reissued to some unrelated live process.
+- **The grace period is not padding.** A detached shell copy outlives its parent by design — the parent can exit within milliseconds of `CreateProcess` — so a second navigator starting in that window would otherwise see a dead owner and delete a list the helper hasn't read yet.
+- Test fixtures are deliberately *not* swept: they don't match a producer prefix, and a test's leftovers are the test suite's problem (they use `tempfile::TempDir`, which removes itself on drop — never hand back a bare `PathBuf`, which owns no destructor and leaks one directory per run, permanently).
+
+Not swept, on purpose: per-volume `.trash/` and `<exe_dir>/.remote-cache/`. Both hold user data, and neither lives in `%TEMP%`.
+
 ### Conflict handling is mode-based, not per-item
 
 There is **no per-file "this exists — replace it?" prompt**. rclone already knows how to compare two trees, so a paste carries a `ConflictMode` (in `navigator-core`, shared by config and rclone) and the question is asked once per batch, if at all:
@@ -313,9 +326,11 @@ file is how you decide whether to switch sounds on. Note `CB_SETCURSEL` /
 load-bearing here, since selecting an event in the listbox programmatically
 re-points the combo and a notification would re-assign and replay its sound.
 
-### Text viewer (Alt+Enter / Alt+L)
+### Text viewer (Alt+Enter / Alt+L / Compare trees)
 
-`viewer.rs` is a singleton top-level window with a readonly multiline EDIT + Close button. Used for any "here is a block of text, copy what you need" screen — currently `op_show_properties` (Alt+Enter) and `op_dump_tree` (Alt+L). Workers compute the text off the UI thread and post `WMAPP_VIEWER_SHOW` with a `Box<(title, body)>` payload; the window proc reclaims the box and calls `viewer::show`. On open the edit takes focus and gets `EM_SETSEL(0, -1)` so Ctrl+C copies immediately.
+`viewer.rs` is a singleton top-level window with a readonly multiline EDIT + `Copy all` and `Close` buttons. Used for any "here is a block of text, copy what you need" screen — currently `op_show_properties` (Alt+Enter), `op_dump_tree` (Alt+L) and `op_compare_trees`. Workers compute the text off the UI thread and post `WMAPP_VIEWER_SHOW` with a `Box<(title, body)>` payload; the window proc reclaims the box and calls `viewer::show`. On open the edit takes focus and gets `EM_SETSEL(0, -1)` so Ctrl+C copies immediately.
+
+**`Copy all` copies the body, not the selection, and says so.** The open-with-everything-selected trick only survives until the user moves the caret to *read* — which is the whole point of these screens — so by the time they want the text, Ctrl+C copies one line. The button reads `Data.body` (the CR-LF normalised string `set_edit_text` returned) rather than pulling the control's text back out: it is independent of the selection and skips a second multi-megabyte allocation. It announces through `AppState::say` because a button that changes nothing on screen gives a screen-reader user no other confirmation, and `Data.parent` exists solely so `crate::window::window_data` can find that `AppState`.
 
 Pure computation (folder stats, extension histogram, TOML tree dump) lives in `props.rs`, kept free of HWND / speech so the logic is unit-testable without a live window. Recursion is iterative — explicit stack, no risk of blowing the process stack on deep trees. Symlinks are counted but not followed.
 
@@ -327,6 +342,28 @@ Pure computation (folder stats, extension histogram, TOML tree dump) lives in `p
 - **`Path` is already root-relative and forward-slashed**, so the remote half needs no `relativize` and stays pure — `parse_lsjson_tree` is pinned against verbatim 1.73.5 output, including the `Size: -1` some backends report for directories.
 - **A failed walk renders as `error = "…"`, never as an empty tree.** `dump_tree_toml_error` exists precisely so zero counts with no explanation can't come back; `render_tree_toml` is shared by all three paths so their output can't drift.
 - The `root` line shows `rclone_arg()` (`mac:Downloads`), not the sentinel — same rule the title and address bar follow. `is_remotes_root()` is rejected outright, like This PC: it's a list of remotes, not a directory.
+
+### Compare trees (File menu)
+
+Walk the current folder, diff it against a tree the user pastes in, render the result into the viewer. `compare.rs` is the pure half (parse / diff / report, unit-tested with no HWND and no filesystem); `compare_dialog.rs` is the paste prompt; `AppState::op_compare_trees` is the impure driver.
+
+**The walk is `props::walk_tree`, shared with Alt+L.** `dump_tree_toml` was the only walker and it inlined its own stack; two walkers of the same folder that can disagree about what's in it is exactly the drift the rest of this file warns about. `walk_tree` returns `(Vec<TreeEntry>, unreadable_count)` and the dump reduces that to its two sorted arrays.
+
+Four rules, each with a test in `compare.rs`:
+
+- **A missing folder is reported once and its contents are not.** If `a/b` is absent then everything under it is absent too, and listing `a/b/c/hi.mp3` tells the user nothing they can act on. The subtree is *counted* (`[ 12 files, 2 folders inside ]`) and skipped, and the scan carries on with `a/b`'s siblings.
+- **Sorting is component-wise (`a.split('/').cmp(b.split('/'))`), not string-wise.** That is the only reason the prune above can be a single running prefix instead of a set: plain string order puts `a.txt` *between* `a` and `a/b` (`.` is 0x2E, `/` is 0x2F), which breaks a folder's descendants into non-contiguous runs and leaks half a missing subtree into the report.
+- **Matching is case-insensitive**, on the lower-cased `TreeEntry::key` — Windows is, and the usual comparison is a folder against a copy of itself.
+- **Both sides are completed with their implied parent folders.** A pasted list of file paths carries no `dirs` array; without synthesising `a` and `a/b` out of `a/b/c.txt`, every intermediate folder of the *walked* tree comes back as "only here".
+
+Two failure modes are called out rather than swallowed, for the same reason `dump_tree_toml_error` exists — with a diff, silence reads as "no differences", which is the one answer a user would act on:
+
+- A parse error or a failed remote listing renders through `compare::format_error`, never as an empty tree.
+- A local walk that hit an unreadable sub-directory prints a warning above the lists, because those items surface as "missing here" whether they are or not.
+
+**The pasted text is read through a multiline `EDIT` with `EM_SETLIMITTEXT` raised.** That control caps *user* input at 32 KB by default and enforces the cap by silently truncating the paste — an Alt+L dump of a few thousand files clears it easily, and the symptom would be a comparison confidently reporting the tail of the other tree as missing. `wParam = 0` means "no limit" for a multiline edit.
+
+Remote roots branch to `lsjson --recursive` → `compare::tree_from_remote_items`, same rule (and same bug class) as Alt+L. This PC and the remotes list are rejected outright: neither is a directory.
 
 ### Real Win32 dialogs
 
@@ -388,6 +425,8 @@ Jump reuses `AppState.pending_focus` + the existing `refocus_after_up` post-list
 See `README.md` for the user-facing table. User-bound actions live under `shortcuts` in `config.toml`; `navigator_config::shortcuts::default_actions()` returns the seeded defaults (Copy/Cut/Paste/PasteSpecial[Ctrl+Shift+V]/Append/CopyPaths/SelectAll/Rename/Refresh/ToggleHidden/ToggleSystem/Search/NavigateUp/Hist Back+Forward/Undo + Hotspot1..10 + HotspotSet1..10 + ShowProperties[Alt+Enter] + DumpTree[Alt+L] + NewFolder[Ctrl+N] + NewFile[Ctrl+Shift+N]). The accel table is rebuilt on startup and on shortcut-editor save via `window::rebuild_accels`. `default_chords_are_unique` in `navigator-config/tests/config.rs` guards against a new default silently shadowing an existing chord — the accel table matches modifiers strictly, so a collision means one action never fires.
 
 The `new_folder.rs` dialog serves both `NewFolder` (Ctrl+N) and `NewFile` (Ctrl+Shift+N) via a `Kind` enum — `open` / `open_file` are the two entry points. `op_new_file` requires a non-empty segment after the final dot so ShellExecute can resolve a handler — `name.contains('.') && !name.ends_with('.')`, which accepts `notes.txt` and dotfiles like `.gitignore` but rejects `notes` / `notes.`. It creates the file with `Operation::Touch` (`rclone touch`, works local + remote), then opens it via `open_file`. A pre-existing local file is opened rather than clobbered.
+
+`Commands::CompareTrees` is menu-only — no chord, so it needs no `InternalCommand` variant and no `default_actions()` seed (which only runs on first run anyway; see the no-migration rule).
 
 Adding a new `InternalCommand` variant touches three places: enum in `shortcuts.rs`, seed line in `default_actions()`, and a `dispatch_internal` arm in `window.rs`. Accel matches modifiers strictly, so `Alt+Enter` does **not** collide with the listview's plain-Enter handler (those are distinct ACCEL entries only when modifiers match).
 

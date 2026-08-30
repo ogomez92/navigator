@@ -18,7 +18,7 @@ fn touch(p: &std::path::Path) {
 #[test]
 fn free_path_is_returned_unchanged() {
     let tmp = tempdir();
-    let target = tmp.join("new.txt");
+    let target = tmp.path().join("new.txt");
     let got = unique_numbered_path(&target);
     assert_eq!(got, target);
 }
@@ -26,55 +26,55 @@ fn free_path_is_returned_unchanged() {
 #[test]
 fn first_collision_gets_one_suffix() {
     let tmp = tempdir();
-    let target = tmp.join("foo.txt");
+    let target = tmp.path().join("foo.txt");
     touch(&target);
     let got = unique_numbered_path(&target);
-    assert_eq!(got, tmp.join("foo (1).txt"));
+    assert_eq!(got, tmp.path().join("foo (1).txt"));
 }
 
 #[test]
 fn numbering_advances_past_existing_suffixed_siblings() {
     let tmp = tempdir();
-    let target = tmp.join("bar.txt");
+    let target = tmp.path().join("bar.txt");
     touch(&target);
-    touch(&tmp.join("bar (1).txt"));
-    touch(&tmp.join("bar (2).txt"));
+    touch(&tmp.path().join("bar (1).txt"));
+    touch(&tmp.path().join("bar (2).txt"));
     let got = unique_numbered_path(&target);
-    assert_eq!(got, tmp.join("bar (3).txt"));
+    assert_eq!(got, tmp.path().join("bar (3).txt"));
 }
 
 #[test]
 fn extensionless_file_appends_suffix_without_dot() {
     let tmp = tempdir();
-    let target = tmp.join("README");
+    let target = tmp.path().join("README");
     touch(&target);
     let got = unique_numbered_path(&target);
-    assert_eq!(got, tmp.join("README (1)"));
+    assert_eq!(got, tmp.path().join("README (1)"));
 }
 
 #[test]
 fn multi_extension_preserves_last_segment() {
     // Explorer parity: "foo.tar.gz" → "foo.tar (1).gz".
     let tmp = tempdir();
-    let target = tmp.join("foo.tar.gz");
+    let target = tmp.path().join("foo.tar.gz");
     touch(&target);
     let got = unique_numbered_path(&target);
-    assert_eq!(got, tmp.join("foo.tar (1).gz"));
+    assert_eq!(got, tmp.path().join("foo.tar (1).gz"));
 }
 
-/// Make a fresh temp directory for a test. Uses the OS temp dir and a
-/// nonce combining thread id + timestamp so parallel tests don't collide.
-fn tempdir() -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("navigator-preflight-{}-{}", t, n));
-    fs::create_dir_all(&p).expect("mkdir tempdir");
-    p
+/// Make a fresh temp directory for a test, deleted when the returned
+/// guard drops.
+///
+/// The guard is the point. An earlier version handed back a bare
+/// `PathBuf`, which owns no destructor tied to the directory, so every
+/// `cargo test --test preflight` left its eleven fixtures in `%TEMP%`
+/// permanently. Bind it for the whole test — `tempdir().path()` deletes
+/// the directory on the spot and hands back a dangling path.
+fn tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("navigator-preflight-")
+        .tempdir()
+        .expect("mkdir tempdir")
 }
 
 // --- Keep-both scope ------------------------------------------------------
@@ -87,8 +87,8 @@ fn top_level_conflicts_lists_only_colliding_selections() {
     use navigator_gui::preflight::top_level_conflicts;
 
     let tmp = tempdir();
-    let src_dir = tmp.join("src");
-    let dst_dir = tmp.join("dst");
+    let src_dir = tmp.path().join("src");
+    let dst_dir = tmp.path().join("dst");
     fs::create_dir_all(&src_dir).unwrap();
     fs::create_dir_all(&dst_dir).unwrap();
 
@@ -114,8 +114,8 @@ fn top_level_conflicts_counts_directories_as_whole_units() {
     use navigator_gui::preflight::top_level_conflicts;
 
     let tmp = tempdir();
-    let src_dir = tmp.join("src");
-    let dst_dir = tmp.join("dst");
+    let src_dir = tmp.path().join("src");
+    let dst_dir = tmp.path().join("dst");
     fs::create_dir_all(src_dir.join("photos")).unwrap();
     fs::create_dir_all(dst_dir.join("photos")).unwrap();
     // An inner file that would conflict on a merge — irrelevant here.
@@ -134,8 +134,8 @@ fn top_level_conflicts_is_empty_for_a_clean_destination() {
     use navigator_gui::preflight::top_level_conflicts;
 
     let tmp = tempdir();
-    let src_dir = tmp.join("src");
-    let dst_dir = tmp.join("dst");
+    let src_dir = tmp.path().join("src");
+    let dst_dir = tmp.path().join("dst");
     fs::create_dir_all(&src_dir).unwrap();
     fs::create_dir_all(&dst_dir).unwrap();
     touch(&src_dir.join("a.txt"));
@@ -153,9 +153,9 @@ fn top_level_conflicts_is_empty_for_a_clean_destination() {
 #[test]
 fn unique_numbered_path_renames_directories_whole() {
     let tmp = tempdir();
-    let dir = tmp.join("photos");
+    let dir = tmp.path().join("photos");
     fs::create_dir(&dir).unwrap();
-    assert_eq!(unique_numbered_path(&dir), tmp.join("photos (1)"));
+    assert_eq!(unique_numbered_path(&dir), tmp.path().join("photos (1)"));
 }
 
 // --- Spoken summary ------------------------------------------------------
@@ -225,8 +225,8 @@ fn undo_targets_exclude_preexisting_destinations() {
     use navigator_core::NavPath;
 
     let tmp = tempdir();
-    let src_dir = tmp.join("src");
-    let dst_dir = tmp.join("dst");
+    let src_dir = tmp.path().join("src");
+    let dst_dir = tmp.path().join("dst");
     fs::create_dir_all(&src_dir).unwrap();
     fs::create_dir_all(&dst_dir).unwrap();
 
@@ -302,8 +302,8 @@ fn local_destinations_keep_the_cheap_prefilter() {
     use navigator_gui::preflight::conflict_candidates;
 
     let tmp = tempdir();
-    let src_dir = tmp.join("src");
-    let dst_dir = tmp.join("dst");
+    let src_dir = tmp.path().join("src");
+    let dst_dir = tmp.path().join("dst");
     fs::create_dir_all(&src_dir).unwrap();
     fs::create_dir_all(&dst_dir).unwrap();
     touch(&src_dir.join("a.txt"));
