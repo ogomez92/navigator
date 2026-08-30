@@ -61,6 +61,38 @@ fn default_sort_puts_directories_first() {
     assert_eq!(names, vec!["alpha", "zeta_dir", "alpha.txt", "zeta.txt"]);
 }
 
+/// The caret is put back by *name* after a re-listing, so the name has to
+/// be readable before the new listing replaces the old one — an index is
+/// meaningless across a refresh that added, removed or re-sorted rows.
+#[test]
+fn focused_name_reads_the_focused_row() {
+    let m = Model::new();
+    m.set_listing(cwd(), vec![file("a.txt"), file("b.txt"), file("c.txt")]);
+    assert_eq!(m.focused_name(), None, "nothing focused yet");
+    m.with_selection(|s| s.set_focus(Some(1)));
+    assert_eq!(m.focused_name().as_deref(), Some("b.txt"));
+    // Out-of-range focus (listing shrank underneath it) answers None
+    // rather than panicking or naming the wrong row.
+    m.with_selection(|s| s.set_focus(Some(99)));
+    assert_eq!(m.focused_name(), None);
+}
+
+/// Focus is reported against the *visible* rows, so a filtered-out entry
+/// can't leak into the name used to restore the caret.
+#[test]
+fn focused_name_follows_the_filter() {
+    let m = Model::new();
+    m.set_listing(
+        cwd(),
+        vec![
+            entry(".hidden", EntryKind::File, true, false),
+            file("visible.txt"),
+        ],
+    );
+    m.with_selection(|s| s.set_focus(Some(0)));
+    assert_eq!(m.focused_name().as_deref(), Some("visible.txt"));
+}
+
 #[test]
 fn hidden_filter_excludes_by_default() {
     let m = Model::new();

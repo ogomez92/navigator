@@ -28,7 +28,7 @@ static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// flagged `KILL_ON_JOB_CLOSE`, and never closed by us: when the process
 /// exits its only handle closes and the OS terminates the children.
 #[cfg(windows)]
-mod job {
+pub mod job {
     use std::os::windows::io::AsRawHandle;
     use std::process::Child;
     use std::sync::OnceLock;
@@ -84,6 +84,23 @@ mod job {
         }
     }
 }
+
+/// Tie `child` to the process-wide kill-on-close job so it dies with the
+/// navigator process instead of orphaning itself.
+///
+/// Exported because rclone is not the only long-running child we spawn:
+/// archive extraction shells out to `7z.exe`, and an orphaned extractor
+/// keeps writing files into a folder nobody is watching any more. One
+/// job for the whole process is the point — a second one would only
+/// duplicate the plumbing.
+#[cfg(windows)]
+pub fn kill_child_with_process(child: &std::process::Child) {
+    job::assign(child);
+}
+
+/// Non-Windows stub so callers need no `cfg` of their own.
+#[cfg(not(windows))]
+pub fn kill_child_with_process(_child: &std::process::Child) {}
 
 #[derive(Debug, Clone)]
 pub enum Operation {

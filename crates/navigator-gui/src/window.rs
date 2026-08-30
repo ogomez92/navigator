@@ -70,6 +70,12 @@ pub const WMAPP_REMOTE_EDIT: u32 = WM_APP + 9;
 /// the trash means walking every staged file on every drive, which is
 /// unbounded work that must not happen in the message pump.
 pub const WMAPP_EMPTY_TRASH_SURVEYED: u32 = WM_APP + 10;
+/// Recursive-extract survey finished. Payload is
+/// `Box<(Vec<NavPath>, PathBuf, String)>` — the archives the sweep found,
+/// the resolved `7z.exe`, and the pre-rendered confirmation body. Posted
+/// from a worker because walking a folder tree for archives is unbounded
+/// IO that must not happen in the message pump.
+pub const WMAPP_EXTRACT_SURVEYED: u32 = WM_APP + 11;
 
 const IDC_LISTVIEW: u16 = 1001;
 const IDC_ADDRESS: u16 = 1002;
@@ -894,6 +900,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let Some(data) = window_data(hwnd) else { return LRESULT(0) };
             let payload: Box<(NavPath, Vec<Entry>, crate::model::Sort)> = Box::from_raw(lp.0 as *mut _);
             let (path, entries, sorted_as) = *payload;
+            data.state.settle_nav_target(&path);
+            // A re-listing of the folder already on screen — F5, a filter
+            // or sort toggle, or a background operation finishing here —
+            // must not throw the caret back to row 0. Remember the focused
+            // name before the listing is replaced; indices don't survive it.
+            let previous_focus = if data.state.model.cwd().as_ref() == Some(&path) {
+                data.state.model.focused_name()
+            } else {
+                None
+            };
             let count = data.state.model.set_listing_presorted(path.clone(), entries, Some(sorted_as));
             data.listview.set_item_count(count);
             set_address_text(data.address, &address_display(&path));
@@ -904,7 +920,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             // listview's focused item on focus change, and the count is
             // visible in the status bar + title. Prism adding "X — N
             // items" on top was duplicate noise.
-            refocus_after_up(data, &path);
+            refocus_after_up(data, &path, previous_focus);
             data.state.watch_cwd(&path);
             if let Some(reg) = data.state.plugin_registry() {
                 reg.dispatch_navigated(&path.to_string());
@@ -926,6 +942,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let Some(data) = window_data(hwnd) else { return LRESULT(0) };
             let payload: Box<(NavPath, String)> = Box::from_raw(lp.0 as *mut _);
             let (path, err) = *payload;
+            // The navigation resolved, just not successfully. Retire the
+            // claim either way, or every later worker would think the user
+            // is in a folder they never reached and skip its refresh.
+            data.state.settle_nav_target(&path);
             data.state.say(&format!("cannot open {}: {}", path.file_name(), err), true);
             crate::dialogs::show_error(
                 Some(HwndSend(hwnd)),
@@ -972,6 +992,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let payload: Box<(Vec<std::path::PathBuf>, String, u64)> = Box::from_raw(lp.0 as *mut _);
             let (dirs, body, total) = *payload;
             data.state.confirm_empty_trash_survey(dirs, body, total);
+            LRESULT(0)
+        },
+
+        WMAPP_EXTRACT_SURVEYED => unsafe {
+            let payload: Box<(
+                Vec<navigator_core::NavPath>,
+                std::path::PathBuf,
+                String,
+            )> = Box::from_raw(lp.0 as *mut _);
+            let Some(data) = window_data(hwnd) else { return LRESULT(0) };
+            let (targets, seven_zip, body) = *payload;
+            data.state.confirm_extract_survey(targets, seven_zip, body);
             LRESULT(0)
         },
 
@@ -2071,8 +2103,17 @@ fn begin_rename(data: &WindowData) {
 /// drive roots landing on the This PC virtual view, we invert
 /// `drive_path_from_display` to map a listing entry back to its root
 /// path and compare.
-fn refocus_after_up(data: &WindowData, cwd: &NavPath) {
+fn refocus_after_up(data: &WindowData, cwd: &NavPath, previous_focus: Option<String>) {
     let pending = data.state.take_pending_focus();
+
+    // A pending target only applies to the listing of the folder it lives
+    // in. `op_delete` (and the workers) arm this before the operation
+    // runs, so a slow delete could otherwise have its "focus the next
+    // surviving row" applied to whatever folder the user browsed to
+    // meanwhile — matching a same-named row there by coincidence, or
+    // dropping the caret to row 0. Drive roots have no parent and belong
+    // to the This PC listing.
+    let pending = pending.filter(|child| crate::app::focus_target_belongs(cwd, child));
 
     if let Some(child) = pending {
         let target_idx = if cwd.is_this_pc() {
@@ -2096,7 +2137,19 @@ fn refocus_after_up(data: &WindowData, cwd: &NavPath) {
             return;
         }
         // Named target not found (deleted, filtered out, etc.) — fall
-        // through to row-0 default rather than leaving focus nowhere.
+        // through to the defaults below rather than leaving focus nowhere.
+    }
+
+    // Nothing armed a target, and this listing replaced the same folder:
+    // the user is standing somewhere in it, so put them back. Row 0 is
+    // right for arriving in a folder and wrong for re-reading the one you
+    // are already in — a refresh that moves the caret is indistinguishable
+    // from the app navigating on its own.
+    if let Some(name) = previous_focus
+        && let Some(idx) = data.state.model.index_of(|e| e.name == name)
+    {
+        select_row(data.listview.hwnd, idx);
+        return;
     }
 
     if !data.state.model.is_empty() {

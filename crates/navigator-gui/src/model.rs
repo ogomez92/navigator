@@ -190,6 +190,21 @@ impl Model {
         self.0.read().selection.clone()
     }
 
+    /// Name of the currently focused entry, if any.
+    ///
+    /// Read *before* a new listing is installed so the caret can be put
+    /// back on the same row afterwards: indices don't survive a re-listing
+    /// (the folder may have gained or lost entries, or been re-sorted), but
+    /// the name does.
+    pub fn focused_name(&self) -> Option<String> {
+        let g = self.0.read();
+        let vi = g.selection.focus()?;
+        g.visible
+            .get(vi)
+            .and_then(|&ai| g.all.get(ai as usize))
+            .map(|e| e.name.clone())
+    }
+
     pub fn selected_paths(&self) -> Vec<NavPath> {
         let g = self.0.read();
         let Some(cwd) = g.cwd.as_ref() else {

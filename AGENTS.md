@@ -82,7 +82,17 @@ The Win32 input pipeline has two stages in the message pump and several interact
 
 `extract.rs` shells out to `7z.exe` on `PATH`. Pure helpers (`is_extractable`, `parse_top_level_count`, `archive_stem`, `decide_dest`, `unique_dest`) are kept separate from `run_extract` so the wrap-folder decision and extension classification are unit-testable without spawning a process. `EXTRACTABLE_EXTENSIONS` is the source of truth — extend it, don't pre-filter elsewhere.
 
-`AppState::op_extract` filters the selection to extractable + local (remote rclone paths are skipped — 7z can't read `\\?\NavigatorRemote\...`), then validates `find_7z()` before spawning the worker. Two error paths announce via prism: "no extractable archives selected" and "7z not found on PATH".
+`AppState::op_extract` drops remote rclone paths (7z can't read `\\?\NavigatorRemote\...`), then validates `find_7z()` before spawning the worker. Two error paths announce via prism: "no extractable archives selected" and "7z not found on PATH".
+
+**A selected folder is a sweep root.** `split_extract_selection` routes files to a direct extract and directories to `sweep_archives`, which walks the tree and extracts every archive it finds *in place*. Three rules, each with a test:
+
+- **The sweep sees `SWEEP_EXTENSIONS`, not `EXTRACTABLE_EXTENSIONS`.** The full list is deliberately wide — 7-Zip opens `.exe` (SFX), `.jar`, `.msi`, `.apk`, `.iso` — and that width is only safe for a file the user pointed at. Swept recursively with the default `delete_when_extracted`, it would "extract" every binary in a source tree and then delete it.
+- **The walk runs on `navigator-extract-survey`**, never the pump: unbounded IO. It posts `WMAPP_EXTRACT_SURVEYED` with `(targets, 7z path, body)`; the UI thread confirms and spawns the extractor. Same shape as the empty-trash survey.
+- **A sweep always confirms first, defaulting to No** — one keystroke on a folder row can reach a whole drive, and the purge is a plain `remove_file` with no undo. A flat selection of archives keeps the old zero-dialog path.
+
+**The purge deletes the volume set, not the file 7z was handed.** `purge_targets` does one `read_dir` and feeds the pure `volume_set`, which collects `movie.partN.rar` siblings (or old-style `movie.rNN` next to `movie.rar`); deleting part 1 alone leaves eight parts that are now unopenable. The sweep skips continuation volumes — 7-Zip pulls the set in from part 1, so queueing part 2 is one guaranteed failure per part.
+
+**A numbered split set (`movie.7z.001`) is recognised by filename, not extension** — `split_volume` parses `<base>.<3+ digits>` and `is_extractable` asks it before the extension table. The base keeps its own extension: `is_sweepable` takes the set only when that base is itself sweepable (`foo.7z.001` yes, `foo.mkv.001` no), `archive_stem` falls through to `movie`, `is_continuation_volume` skips `.002`+, `volume_set` purges every numbered sibling, and `drop_covered_volumes` removes continuations whose first part is also selected so Ctrl+A over a set extracts once instead of failing N-1 times.
 
 Wrap-folder rule (`decide_dest`): if `[extraction] create_folder = false` OR the archive already has ≤1 top-level entry → extract straight into the parent (no `name/name/...` double); otherwise wrap in `parent/<archive_stem>` deduped by `unique_dest`. `archive_stem` strips layered extensions so `foo.tar.gz` → `foo`.
 
@@ -91,6 +101,8 @@ Wrap-folder rule (`decide_dest`): if `[extraction] create_folder = false` OR the
 The Extract worker deliberately does NOT call `state.refresh()`. The notify watcher already folds new files into the listing via `Model::append_entries`, which keeps existing sort order and lands fresh entries at the bottom — provided `general.new_items_at_bottom` is true (the default; guarded by `new_items_at_bottom_default_is_on`). Don't add a refresh; it would re-sort and lose the user's anchor.
 
 `opts.delete_when_extracted` only deletes on `7z x` exit-success. Failures keep the archive.
+
+**Extract holds an `OpGuard` and its children die with us.** `spawn_extract` counts it in `ops_in_flight` — without that, Alt+F4 closed the window mid-extract with no warning. Both 7z calls go through `run_child`, which registers the child with the process-wide kill-on-close job (`navigator_rclone::kill_child_with_process`). `Command::status()` hands back no `Child` to register, and an unregistered 7z outlives us, unpacking into a folder nobody is watching and never purging. `run_zip` uses the same helper.
 
 ### File operations invariant
 
@@ -110,6 +122,13 @@ Multi-file pastes collapse into one `rclone copy --files-from` invocation per so
 
 **Progress is reported per user action, not per rclone invocation.** `navigator_gui::narrate` holds a `Meter` (weighted, monotonic across every invocation the action takes) and a `Cadence` (silent for the first interval, one utterance per interval, never repeating itself); `OpProgress` in `app.rs` drives them, the progress window and the cancel flag. `run_op` runs one invocation against a job-level `OpProgress` and must **not** post completion — that belongs to the job. `general.announce_interval_secs` defaults to 5. See CLAUDE.md's *Progress reporting* section.
 
+### Finishing an operation must not move the user
+
+**A background operation owns its files, not the user's location.** `WorkerCtx.refresh_target` is the folder captured at spawn and is only re-listed through `refresh_with_focus`, which checks `AppState::is_viewing` first — it used to post that listing unconditionally, so a long paste dragged the user out of whatever folder they had since browsed to. `AppState::refresh_dir(dir)` is the same rule for the workers without a `WorkerCtx` (shell-op reapers, remote purge, remote upload).
+
+- **"Where the user is" is `nav_target`, not `model.cwd()`.** A navigation is a queued scan, so between the keypress and the listing arriving `cwd()` still names the folder being left; a worker trusting it re-listed the old folder, and since the scan worker is FIFO that listing landed *after* the user's and pulled them back. `navigate` publishes the destination; `settle_nav_target` retires it when the listing or `WMAPP_DIR_ERROR` lands. `effective_folder` is the pure rule, unit-tested.
+- **`pending_focus` is scoped by `focus_target_belongs`** — a target belongs to the listing of its parent (drive roots to This PC). It is armed before the op runs, so an unrelated folder's listing would otherwise consume it and land the caret on a coincidentally same-named row or on row 0.
+- **A re-listing of the folder on screen keeps the caret.** `WMAPP_DIR_LISTED` reads `Model::focused_name` before installing and restores it when nothing armed a target: row 0 is right for arriving somewhere new and wrong for F5 or an op finishing under you.
 ### Clipboard + undo + trash
 
 - **Clipboard is file-backed**, not the Windows clipboard. `<exe_dir>/clipboard.json` holds `{sources, cut, ts}`; written by copy/cut/append, read by paste. Two running navigator instances share it automatically. The OS clipboard is untouched except by `op_copy_paths` (CF_UNICODETEXT on purpose).

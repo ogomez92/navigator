@@ -93,6 +93,17 @@ pub struct AppState {
     /// Set by `navigate_up` so Backspace / Alt+Up returns the caret to
     /// the folder the user just left, the way Explorer does.
     pending_focus: Mutex<Option<NavPath>>,
+    /// The folder the user last *asked* for, while its listing is still
+    /// being scanned. `None` once that listing (or its error) lands.
+    ///
+    /// A navigation is a queued scan, so for the whole gap between the
+    /// keypress and the listing arriving, `model.cwd()` still names the
+    /// folder the user is leaving. A worker that consults `cwd()` in that
+    /// window concludes the user is still where they were and re-lists it
+    /// — and because the scan queue is FIFO, that listing lands *after*
+    /// the one the user asked for and silently drags them back. See
+    /// [`AppState::is_viewing`].
+    nav_target: Mutex<Option<NavPath>>,
     /// Sound the *next* `navigate` should play, consumed and reset to
     /// [`SoundEvent::Navigate`] on every call. Every route into a folder
     /// funnels through `navigate`, so "went up" / "went back" / "went
@@ -203,6 +214,38 @@ enum UndoAction {
     Delete { pairs: Vec<(NavPath, NavPath)> },
 }
 
+/// Which folder the user is effectively in, given an in-flight
+/// navigation target and the listing currently on screen.
+///
+/// The in-flight target wins whenever there is one. Between the keypress
+/// and the listing arriving, the user has already left as far as they are
+/// concerned, and anything that consults the screen instead will act on
+/// the folder they are walking away from. Pure so the rule can be pinned
+/// by a test without a window.
+pub fn effective_folder<'a>(
+    nav_target: Option<&'a NavPath>,
+    cwd: Option<&'a NavPath>,
+) -> Option<&'a NavPath> {
+    nav_target.or(cwd)
+}
+
+/// Does `target` name a row of the listing for `cwd`?
+///
+/// `pending_focus` is armed *before* the operation that justifies it runs
+/// — `op_delete` picks the row that will survive, a paste worker names the
+/// file it created — so by the time a listing arrives to consume it, the
+/// user may be in a different folder entirely. Applying it there lands the
+/// caret on a coincidentally same-named row, or on row 0. A target belongs
+/// to exactly one listing: the one for its parent folder.
+///
+/// Drive roots (`D:\`) have no parent and belong to the This PC listing.
+pub fn focus_target_belongs(cwd: &NavPath, target: &NavPath) -> bool {
+    if cwd.is_this_pc() {
+        return target.parent().is_none();
+    }
+    target.parent().as_ref() == Some(cwd)
+}
+
 /// Find the filesystem-root of `path` — `C:\` for a drive-letter path,
 /// `\\host\share\` for UNC, `/` on non-Windows. Pure (no IO); surfaced
 /// as its own function for testability.
@@ -294,6 +337,7 @@ impl AppState {
             suppress_history: Mutex::new(false),
             watcher: Mutex::new(None),
             pending_focus: Mutex::new(None),
+            nav_target: Mutex::new(None),
             // Seeded with Startup rather than Navigate: window creation
             // navigates to the initial path, and that first listing *is*
             // the app starting. Playing both would mean the startup chime
@@ -574,9 +618,64 @@ impl AppState {
             self.history.lock().push(path.clone());
         }
         drop(suppress);
+        // Publish the destination *before* queueing the scan: from here
+        // until the listing lands, this — not `model.cwd()` — is the
+        // folder the user considers themselves to be in.
+        *self.nav_target.lock() = Some(path.clone());
         let _ = self
             .scan_tx
             .send(ScanCmd::List(path, hwnd, self.model.sort()));
+    }
+
+    /// Retire the in-flight navigation once `landed` has been listed (or
+    /// has failed to list). Only clears a target it actually matches, so
+    /// the older of two queued navigations can't cancel the newer one's
+    /// claim on the way past.
+    pub fn settle_nav_target(&self, landed: &NavPath) {
+        let mut t = self.nav_target.lock();
+        if t.as_ref() == Some(landed) {
+            *t = None;
+        }
+    }
+
+    /// Is `dir` the folder the user is looking at — or the one they are
+    /// about to be looking at, because they have already asked for it and
+    /// the scan is still running?
+    ///
+    /// This is the question a finishing worker must ask before touching
+    /// the listing. Answering it with `model.cwd()` alone is what made a
+    /// long paste yank the user back to the folder they started it in.
+    pub fn is_viewing(&self, dir: &NavPath) -> bool {
+        let target = self.nav_target.lock();
+        effective_folder(target.as_ref(), self.model.cwd().as_ref()) == Some(dir)
+    }
+
+    /// Re-list `dir` because a background operation just changed it —
+    /// **only** if the user is still there. Returns whether it ran.
+    ///
+    /// A worker must never re-list the folder it captured at spawn time
+    /// unconditionally: the user is free to walk away while a copy runs,
+    /// and a listing posted for the old folder replaces whatever they
+    /// navigated to. Nothing about a finished operation entitles it to
+    /// move the user.
+    pub fn refresh_dir(&self, dir: &NavPath) -> bool {
+        if !self.is_viewing(dir) {
+            return false;
+        }
+        self.rescan(dir.clone());
+        true
+    }
+
+    /// Queue a listing of `dir` with none of the navigation ceremony — no
+    /// history entry, no navigation cue, no type-ahead reset. Re-reading
+    /// the folder you are already standing in is a redraw, not a move.
+    fn rescan(&self, dir: NavPath) {
+        let Some(hwnd) = self.hwnd() else {
+            return;
+        };
+        let _ = self
+            .scan_tx
+            .send(ScanCmd::List(dir, hwnd, self.model.sort()));
     }
 
     /// Wipe the incremental type-ahead prefix. Called on navigation so a
@@ -1629,6 +1728,10 @@ impl AppState {
         let speech = self.speech.handle();
         let sound = self.sound.clone();
         let state_weak = self.self_weak.get().cloned().unwrap_or_else(Weak::new);
+        // The folder the deleted items came out of — the only listing this
+        // op invalidates, and only worth re-reading if the user is still
+        // looking at it when the shell finally finishes.
+        let parent_hint = targets.first().and_then(|p| p.parent());
         std::thread::Builder::new()
             .name("navigator-shell-op-reaper".into())
             .spawn(move || {
@@ -1658,8 +1761,10 @@ impl AppState {
                     text,
                     interrupt: bad,
                 });
-                if let Some(state) = state_weak.upgrade() {
-                    state.refresh();
+                if let Some(state) = state_weak.upgrade()
+                    && let Some(parent) = parent_hint
+                {
+                    state.refresh_dir(&parent);
                 }
             })
             .expect("spawn shell-op delete reaper");
@@ -1739,10 +1844,9 @@ impl AppState {
                     interrupt: fail_count > 0,
                 });
                 if let Some(state) = state_weak.upgrade()
-                    && let (Some(cwd), Some(parent)) = (state.model.cwd(), parent_hint)
-                    && cwd == parent
+                    && let Some(parent) = parent_hint
                 {
-                    state.refresh();
+                    state.refresh_dir(&parent);
                 }
             })
             .expect("spawn remote-purge worker");
@@ -1855,7 +1959,6 @@ impl AppState {
             rclone: self.rclone.clone().with_transfers(transfers),
             speech: self.speech.handle(),
             sound: self.sound.clone(),
-            scan_tx: self.scan_tx.clone(),
             refresh_target: self.model.cwd(),
             hwnd: self.hwnd(),
             progress,
@@ -2092,6 +2195,10 @@ impl AppState {
         let speech = self.speech.handle();
         let sound = self.sound.clone();
         let state_weak = self.self_weak.get().cloned().unwrap_or_else(Weak::new);
+        // Only the destination listing changed, and a detached shell copy
+        // can run for hours — long enough that the user is very likely
+        // somewhere else by the time this fires.
+        let dest_dir = dest.clone();
         std::thread::Builder::new()
             .name("navigator-shell-op-reaper".into())
             .spawn(move || {
@@ -2121,30 +2228,48 @@ impl AppState {
                     interrupt: bad,
                 });
                 if let Some(state) = state_weak.upgrade() {
-                    state.refresh();
+                    state.refresh_dir(&dest_dir);
                 }
             })
             .expect("spawn shell-op reaper");
     }
 
-    /// Extract every selected archive 7-Zip can open, using `7z.exe` on
-    /// `PATH`. The set is filtered to known-extractable extensions
-    /// before validating the binary so the user gets the more useful
-    /// "nothing extractable selected" error instead of "7z missing".
+    /// Extract the selected archives with `7z.exe`.
+    ///
+    /// Two shapes, and the selection decides which:
+    ///
+    /// * **Files** are extracted as picked, using the full
+    ///   [`EXTRACTABLE_EXTENSIONS`](crate::extract::EXTRACTABLE_EXTENSIONS)
+    ///   set — pointing at a specific `.exe` or `.iso` is an explicit act.
+    /// * **Folders** become sweep roots: the worker walks the tree and
+    ///   extracts every archive it finds, each one *in place* next to
+    ///   itself, so a folder of nested downloads unpacks in one gesture.
+    ///   A sweep sees only [`SWEEP_EXTENSIONS`](crate::extract::SWEEP_EXTENSIONS)
+    ///   and always confirms first — see [`Self::confirm_extract_survey`].
+    ///
+    /// The walk is unbounded IO, so it runs on `navigator-extract-survey`
+    /// and posts [`WMAPP_EXTRACT_SURVEYED`](crate::window::WMAPP_EXTRACT_SURVEYED)
+    /// back rather than stalling the message pump. A selection of plain
+    /// files skips the survey entirely and keeps the old zero-dialog path.
+    ///
     /// Behaviour (delete after, wrapper folder) is read from the
-    /// `[extraction]` config section. Runs on a worker; the file
-    /// watcher folds the new entries into the listing automatically so
-    /// the user doesn't need to refresh.
+    /// `[extraction]` config section. The file watcher folds new entries
+    /// into the listing, so no refresh is needed.
     pub fn op_extract(&self) {
-        let selection = self.model.selected_paths();
+        let selection = self.model.selected_paths_with_kind();
         if selection.is_empty() {
             self.say("nothing selected", false);
             return;
         }
-        let local: Vec<navigator_core::NavPath> =
-            selection.into_iter().filter(|p| !p.is_remote()).collect();
-        let extractable = crate::extract::filter_extractable(&local);
-        if extractable.is_empty() {
+        // Remote items are dropped wholesale: 7z can't read the synthetic
+        // remote path, and a remote folder can't be walked with `read_dir`
+        // either.
+        let local: Vec<(navigator_core::NavPath, bool)> = selection
+            .into_iter()
+            .filter(|(p, _)| !p.is_remote())
+            .collect();
+        let (direct, roots) = crate::extract::split_extract_selection(&local);
+        if direct.is_empty() && roots.is_empty() {
             self.say("no extractable archives selected", true);
             return;
         }
@@ -2155,14 +2280,87 @@ impl AppState {
                 return;
             }
         };
+
+        if roots.is_empty() {
+            self.spawn_extract(direct, seven_zip);
+            return;
+        }
+
+        let Some(hwnd) = self.hwnd() else { return };
+        let speech = self.speech.handle();
+        let delete_after = self.config.read().extraction.delete_when_extracted;
+        self.say("searching for archives\u{2026}", false);
+        std::thread::Builder::new()
+            .name("navigator-extract-survey".into())
+            .spawn(move || {
+                let mut swept: Vec<navigator_core::NavPath> = Vec::new();
+                for root in &roots {
+                    for found in crate::extract::sweep_archives(root.as_path()) {
+                        if let Ok(nav) = NavPath::new(found) {
+                            swept.push(nav);
+                        }
+                    }
+                }
+                let targets = crate::extract::merge_targets(direct, swept);
+                if targets.is_empty() {
+                    let _ = speech.send(crate::speech::Utterance {
+                        text: "no archives found".into(),
+                        interrupt: true,
+                    });
+                    return;
+                }
+                let body = crate::extract::sweep_confirm_body(&targets, &roots, delete_after);
+                post_extract_survey(hwnd, targets, seven_zip, body);
+            })
+            .expect("spawn extract-survey worker");
+    }
+
+    /// UI-thread half of a recursive [`Self::op_extract`]: confirm what the
+    /// sweep found, then run it.
+    ///
+    /// The confirmation is not ceremony. A sweep is one keystroke on a
+    /// folder row, `[extraction] delete_when_extracted` defaults to on,
+    /// and that delete is a plain `remove_file` — it does not stage to
+    /// `.trash`, so there is no undo. Ctrl+E on a large tree is therefore
+    /// an unrecoverable action whose scope the user cannot see from the
+    /// listing, so they get the count before it runs. Defaults to No, like
+    /// every other destructive confirm here.
+    pub fn confirm_extract_survey(
+        &self,
+        targets: Vec<navigator_core::NavPath>,
+        seven_zip: PathBuf,
+        body: String,
+    ) {
+        if targets.is_empty() {
+            return;
+        }
+        if !confirm_extract_sweep(self.main_hwnd(), &body) {
+            self.say("extract cancelled", false);
+            return;
+        }
+        self.spawn_extract(targets, seven_zip);
+    }
+
+    /// Spawn the extract worker for an already-resolved archive list.
+    ///
+    /// Holds an [`OpGuard`] for the worker's lifetime so `ops_in_flight`
+    /// counts it: extraction is a long-running file operation like any
+    /// other, and without the guard Alt+F4 closed the window mid-extract
+    /// with no warning at all — killing 7z (it shares the rclone job) and
+    /// skipping the archive purge.
+    fn spawn_extract(&self, targets: Vec<navigator_core::NavPath>, seven_zip: PathBuf) {
         let opts = self.config.read().extraction;
         let speech = self.speech.handle();
         let sound = self.sound.clone();
-        let total = extractable.len();
+        let guard = self.op_guard();
+        let total = targets.len();
         self.say(&format!("extracting {} archive(s)", total), false);
         std::thread::Builder::new()
             .name("navigator-extract".into())
-            .spawn(move || crate::extract::run_extract(extractable, opts, seven_zip, speech, sound))
+            .spawn(move || {
+                let _guard = guard;
+                crate::extract::run_extract(targets, opts, seven_zip, speech, sound)
+            })
             .expect("spawn extract worker");
     }
 
@@ -2543,19 +2741,19 @@ impl AppState {
                         text: format!("uploaded to {}", remote_display),
                         interrupt: false,
                     });
-                    // Refresh the current view so the listing picks up
-                    // the new mtime/size, and arm `pending_focus` with
-                    // the uploaded file so the caret lands on it after
-                    // the rescan instead of snapping to row 0. Only
-                    // refresh if cwd matches the remote's parent — the
-                    // user may have navigated away during upload.
+                    // Re-list the remote folder so it picks up the new
+                    // mtime/size, and arm `pending_focus` with the
+                    // uploaded file so the caret lands on it instead of
+                    // snapping to row 0 — but only while the user is
+                    // still in that folder. They are free to browse
+                    // elsewhere while an upload runs, and neither the
+                    // listing nor the caret is ours to move once they do.
                     if let Some(state) = state_weak.upgrade()
-                        && let Some(cwd) = state.model.cwd()
                         && let Some(parent) = remote.parent()
-                        && cwd == parent
+                        && state.is_viewing(&parent)
                     {
                         state.set_pending_focus(remote.clone());
-                        state.refresh();
+                        state.refresh_dir(&parent);
                     }
                 } else {
                     cache.finish_prompt(&staged, None);
@@ -2656,6 +2854,39 @@ fn confirm_empty_trash(parent: Option<HWND>, body: &str) -> bool {
     rc == IDYES.0
 }
 
+/// Confirm a recursive extract. Yes/No, defaulting to No: the sweep can
+/// reach an entire drive from one keystroke on a folder row, and with
+/// `delete_when_extracted` on (the default) the archives it finds are
+/// gone for good afterwards. Same safe-default rule the paste-conflict
+/// dialogs follow.
+fn confirm_extract_sweep(parent: Option<HWND>, body: &str) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, IDYES, MB_DEFBUTTON2, MB_ICONQUESTION, MB_SETFOREGROUND, MB_YESNO,
+        MessageBoxW,
+    };
+    use windows::core::PCWSTR;
+
+    let title_w: Vec<u16> = "Extract archives?".encode_utf16().chain([0]).collect();
+    let body_w: Vec<u16> = body.encode_utf16().chain([0]).collect();
+    let is_foreground = parent
+        .map(|h| unsafe { GetForegroundWindow() } == h)
+        .unwrap_or(false);
+    let mut flags = MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2;
+    if is_foreground {
+        flags |= MB_SETFOREGROUND;
+    }
+    let rc = unsafe {
+        MessageBoxW(
+            parent,
+            PCWSTR(body_w.as_ptr()),
+            PCWSTR(title_w.as_ptr()),
+            flags,
+        )
+        .0
+    };
+    rc == IDYES.0
+}
+
 /// Ask the Windows shell to open `path` with its default handler. Used
 /// for both local files and files downloaded out of rclone remotes.
 fn shell_open(path: &std::path::Path) {
@@ -2700,6 +2931,26 @@ fn post_empty_trash_survey(hwnd: HwndSend, dirs: Vec<PathBuf>, body: String, tot
     }
 }
 
+/// Hand a finished recursive-extract survey to the UI thread. Same
+/// leak-a-`Box` shape as [`post_empty_trash_survey`]; the window proc
+/// reclaims it.
+fn post_extract_survey(
+    hwnd: HwndSend,
+    targets: Vec<navigator_core::NavPath>,
+    seven_zip: PathBuf,
+    body: String,
+) {
+    let payload = Box::into_raw(Box::new((targets, seven_zip, body)));
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(hwnd.0),
+            crate::window::WMAPP_EXTRACT_SURVEYED,
+            WPARAM(0),
+            LPARAM(payload as isize),
+        );
+    }
+}
+
 fn post_viewer(hwnd: HwndSend, title: String, body: String) {
     let payload = Box::into_raw(Box::new((title, body)));
     unsafe {
@@ -2721,7 +2972,9 @@ struct WorkerCtx {
     /// Event sounds. Carried by value like the speech sender so a worker
     /// never has to upgrade the `Weak<AppState>` just to chime.
     sound: SoundPlayer,
-    scan_tx: Sender<ScanCmd>,
+    /// Folder this operation acts on, captured when the worker span. Only
+    /// ever re-listed through [`WorkerCtx::refresh_with_focus`], which
+    /// checks the user is still there first — see the note on that method.
     refresh_target: Option<NavPath>,
     hwnd: Option<HwndSend>,
     progress: Option<crate::progress::ProgressHandle>,
@@ -3013,17 +3266,32 @@ impl WorkerCtx {
     }
 
     fn refresh(&self) {
-        if let (Some(path), Some(hwnd)) = (self.refresh_target.clone(), self.hwnd) {
-            // Sort preference comes from the live model when the app is
-            // still up. If it has gone away the tag is irrelevant — nobody
-            // is left to install the listing.
-            let sort = self
-                .state
-                .upgrade()
-                .map(|s| s.model.sort())
-                .unwrap_or_default();
-            let _ = self.scan_tx.send(ScanCmd::List(path, hwnd, sort));
+        self.refresh_with_focus(None);
+    }
+
+    /// Bring the operation's folder up to date, optionally landing the
+    /// caret on `focus` (a path the op just created or restored).
+    ///
+    /// **Both are skipped when the user has moved on.** `refresh_target`
+    /// is the folder captured when the worker span, and this used to post
+    /// that listing unconditionally — so finishing a long copy dragged the
+    /// user out of whatever folder they had since browsed to, which is
+    /// indistinguishable from the app navigating on its own. `pending_focus`
+    /// is gated by the same check for the same reason: armed for a folder
+    /// the user is no longer in, it is consumed by the *next* listing
+    /// anywhere and either matches a same-named row by accident or throws
+    /// the caret to row 0.
+    fn refresh_with_focus(&self, focus: Option<NavPath>) {
+        let (Some(dir), Some(state)) = (self.refresh_target.as_ref(), self.state.upgrade()) else {
+            return;
+        };
+        if !state.is_viewing(dir) {
+            return;
         }
+        if let Some(target) = focus {
+            state.set_pending_focus(target);
+        }
+        state.refresh_dir(dir);
     }
 
     fn run_single(self, op: Operation) {
@@ -3526,12 +3794,10 @@ impl WorkerCtx {
                 first_created = Some(dest_dir.join(&effective_name));
             }
         }
-        // Arm pending_focus before the refresh so refocus_after_up can
-        // land the caret on the newly pasted row by filename. Matches the
-        // behaviour of undo-delete for a consistent "where did it go" UX.
-        if let (Some(state), Some(target)) = (self.state.upgrade(), first_created) {
-            state.set_pending_focus(target);
-        }
+        // `refresh_with_focus` arms pending_focus so refocus_after_up can
+        // land the caret on the newly pasted row by filename — matching
+        // undo-delete for a consistent "where did it go" UX — and skips
+        // both that and the refresh if the user has since walked away.
         let done = if cut {
             SoundEvent::MoveDone
         } else {
@@ -3550,7 +3816,7 @@ impl WorkerCtx {
             crate::preflight::paste_summary(mode, total, failed, skipped, renamed),
             failed > 0,
         );
-        self.refresh();
+        self.refresh_with_focus(first_created);
     }
 
     /// Reverse a paste. For copy-mode, delete each created entry. For
@@ -3734,14 +4000,11 @@ impl WorkerCtx {
             )
         };
         self.say(msg, failed > 0);
-        // Arm pending_focus so the post-listing hook lands the caret on
-        // the restored row. Only fires when the refresh target is the same
-        // directory the item was restored into, since refocus_after_up
-        // matches by filename within the new listing.
-        if let (Some(state), Some(target)) = (self.state.upgrade(), first_restored) {
-            state.set_pending_focus(target);
-        }
-        self.refresh();
+        // Arms pending_focus so the post-listing hook lands the caret on
+        // the restored row — refocus_after_up matches by filename within
+        // the new listing, so this is only meaningful (and only happens)
+        // when the user is still in the folder it was restored into.
+        self.refresh_with_focus(first_restored);
     }
 
     /// Classify a path as a directory so a delete can pick the right

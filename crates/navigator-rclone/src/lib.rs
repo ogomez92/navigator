@@ -23,5 +23,5 @@ pub use error::{ErrorCollector, ErrorKind, RcloneError};
 pub use log::{LogEvent, LogLevel, Stats, Transferring};
 pub use op::{
     Canceller, ConflictReport, OpHandle, Operation, PreflightReport, Progress, RcloneDriver,
-    RemoteSize, RemoteStat, RemoteTreeItem, victims,
+    RemoteSize, RemoteStat, RemoteTreeItem, kill_child_with_process, victims,
 };
