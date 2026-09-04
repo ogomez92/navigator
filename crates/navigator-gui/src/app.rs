@@ -1935,6 +1935,163 @@ impl AppState {
         }
     }
 
+    /// Back up the focused entry to
+    /// `<volume_root>\.navigator_backup\<id>\<basename>` — a copy, staged
+    /// like `.trash` stages deletes, recorded in `backups.json` for a
+    /// later Ctrl+Shift+R. See `backup.rs` for the rules.
+    ///
+    /// Local, non-UNC paths only: a backup we could not restore (or that
+    /// litters a file server's root) must never be taken, so the refusal
+    /// happens here — before any copy — rather than at restore time.
+    pub fn op_backup(&self) {
+        let Some(cwd) = self.model.cwd() else {
+            return;
+        };
+        if cwd.is_this_pc() {
+            // The row is a volume, and a whole-drive backup onto itself is
+            // nonsense (and onto another drive is a job for real tooling).
+            self.say("can't back up a drive", true);
+            return;
+        }
+        let sel = self.model.selection_snapshot();
+        let Some(idx) = sel.focus() else {
+            self.say("no item focused", false);
+            return;
+        };
+        let Some(entry) = self.model.get(idx) else {
+            return;
+        };
+        let path = cwd.join(&entry.name);
+        if path.is_remote() {
+            self.say("can't back up remote paths", true);
+            return;
+        }
+        if path.is_unc() {
+            self.say("can't back up network paths", true);
+            return;
+        }
+        let id = crate::backup::new_backup_id();
+        let Some(dir) = crate::backup::backup_dir_on_volume_of(&path, &id) else {
+            self.say(
+                &format!("failed to resolve backup dir for {}", path.file_name()),
+                true,
+            );
+            return;
+        };
+        let backup_path = dir.join(path.file_name());
+        let record = crate::backup::BackupEntry {
+            id,
+            original: path.to_string(),
+            backup: backup_path.to_string(),
+            is_dir: entry.is_dir(),
+            ts: crate::clipboard::now_ts(),
+        };
+
+        let ctx = self.clone_for_worker();
+        thread::Builder::new()
+            .name("navigator-backup".into())
+            .spawn(move || ctx.run_backup(path, backup_path, record))
+            .expect("spawn backup worker");
+    }
+
+    /// Pick a recorded backup and restore it over the original path.
+    ///
+    /// **The picker only offers backups taken from the folder the user is
+    /// standing in** (`backup::backups_in_dir`), with the focused entry's
+    /// newest backup preselected — so the usual gesture (stand on the
+    /// thing, Ctrl+Shift+R, Enter) restores what you are looking at, and
+    /// nothing reachable from the list can write outside the current
+    /// folder. Restoring is a destructive write, and an unscoped list made
+    /// every recorded backup one mis-keyed Enter away from any folder:
+    /// Ctrl+Shift+R in `D:\code\tools` could overwrite `C:\meow`, and
+    /// with a single record on file it did so with no dialog at all.
+    ///
+    /// The dialog is skipped only when the one candidate *is* the focused
+    /// row — there is then nothing to choose and the row the user is
+    /// pointing at is the row that gets restored. Everything else asks,
+    /// including a lone backup of some sibling, because the item being
+    /// restored would otherwise not be the item under the caret.
+    ///
+    /// Restore never destroys silently: the current version (if any) is
+    /// moved to `.trash` first, and only then is the backup *copied* back
+    /// — copied, so the same backup can be restored again later.
+    pub fn op_restore_backup(&self) {
+        let all = crate::backup::load_backups();
+        if all.is_empty() {
+            self.say("no backups recorded", false);
+            return;
+        }
+        let Some(cwd) = self.model.cwd() else {
+            return;
+        };
+        // Resolved before the scope check so the "nothing here" message and
+        // the preselect see the same focus.
+        let focused = {
+            let sel = self.model.selection_snapshot();
+            sel.focus()
+                .and_then(|i| self.model.get(i))
+                .map(|entry| cwd.join(&entry.name).to_string())
+        };
+
+        let entries = crate::backup::backups_in_dir(&all, cwd.as_path());
+        if entries.is_empty() {
+            // Say how many exist elsewhere: a flat "no backups" would read
+            // as "the backup you took is gone" when it is simply in
+            // another folder.
+            self.say(
+                &format!(
+                    "no backups from this folder, {} recorded elsewhere",
+                    all.len()
+                ),
+                false,
+            );
+            return;
+        }
+
+        let unambiguous = entries.len() == 1
+            && focused
+                .as_deref()
+                .is_some_and(|f| entries[0].original.eq_ignore_ascii_case(f));
+        let idx = if unambiguous {
+            0
+        } else {
+            let Some(hwnd) = self.main_hwnd() else {
+                return;
+            };
+            let labels: Vec<String> = entries.iter().map(crate::backup::entry_label).collect();
+            let pre = crate::backup::preselect_index(&entries, focused.as_deref());
+
+            let Some(idx) = crate::backup_dialog::pick(hwnd, &labels, pre, &cwd.to_string()) else {
+                return;
+            };
+            idx
+        };
+        let e = entries[idx].clone();
+
+        // One stat, bounded — same stance as `op_restore_from_history`.
+        // A record whose data is gone (the user wiped `.navigator_backup`
+        // by hand) is pruned so the list stops offering it.
+        let Ok(backup) = NavPath::new(PathBuf::from(&e.backup)) else {
+            self.say("backup record has an invalid path", true);
+            return;
+        };
+        if !backup.as_path().exists() {
+            crate::backup::remove_backup_record(&e.id);
+            self.say("backup data no longer exists; removed from the list", true);
+            return;
+        }
+        let Ok(original) = NavPath::new(PathBuf::from(&e.original)) else {
+            self.say("backup record has an invalid original path", true);
+            return;
+        };
+
+        let ctx = self.clone_for_worker();
+        thread::Builder::new()
+            .name("navigator-restore-backup".into())
+            .spawn(move || ctx.run_restore_backup(backup, original))
+            .expect("spawn restore-backup worker");
+    }
+
     /// Cheap snapshot of the bits worker threads need. Keeps `AppState` out
     /// of the closure so we don't leak `Arc<Self>` into threads that only
     /// need to speak + spawn rclone.
@@ -4071,6 +4228,153 @@ impl WorkerCtx {
         // the new listing, so this is only meaningful (and only happens)
         // when the user is still in the folder it was restored into.
         self.refresh_with_focus(first_restored);
+    }
+
+    /// Copy `src` into its freshly named backup directory, and record the
+    /// pair only once the copy has succeeded — `backups.json` must never
+    /// offer a restore whose data isn't there.
+    fn run_backup(self, src: NavPath, dst: NavPath, record: crate::backup::BackupEntry) {
+        let _guard = self.state.upgrade().map(|s| s.op_guard());
+        let name = src.file_name().to_string();
+        let mut prog = OpProgress::new(&self, "Backing up", 1);
+        prog.opening("backing up", Some(&name));
+
+        // `op_backup` only named the directory; create it here so the
+        // syscall lands on this thread — same split as the trash flow.
+        if let Some(parent) = dst.parent()
+            && let Err(e) = std::fs::create_dir_all(parent.as_path())
+        {
+            tracing::error!("create backup dir {:?}: {}", parent.to_string(), e);
+            prog.record_problem(format!("could not create backup dir: {}", e), Some(name));
+            prog.finish(false);
+            self.play(SoundEvent::Error);
+            return;
+        }
+
+        prog.begin(1);
+        let ok = self.run_op(
+            Operation::CopyTo {
+                src,
+                dst: dst.clone(),
+            },
+            &mut prog,
+        );
+        prog.end();
+        prog.finish(ok);
+        self.play_outcome(prog.cancelled(), !ok, SoundEvent::CopyDone);
+
+        if ok && !prog.cancelled() {
+            crate::backup::record_backup(record);
+            self.say(format!("backed up {}", name), false);
+        } else {
+            // Never record a failed or cancelled backup, and don't leave
+            // its half-written directory behind — unrecorded, nothing
+            // would ever point at it again. Our own staging dir, so a
+            // direct fs call is fine (same stance as emptying `.trash`).
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::remove_dir_all(parent.as_path());
+            }
+            self.say(
+                if prog.cancelled() {
+                    "backup cancelled"
+                } else {
+                    "backup failed"
+                },
+                !prog.cancelled(),
+            );
+        }
+    }
+
+    /// Replace `original` with the backed-up copy at `backup`.
+    ///
+    /// Two invocations, strictly ordered: the current version (if one
+    /// exists) is renamed into `.trash` first, and the backup is copied
+    /// back only if that rename succeeded — restoring over something we
+    /// failed to stage would be the silent data loss this feature exists
+    /// to prevent. The backup itself is never consumed: a copy, not a
+    /// move, so the same backup restores any number of times.
+    fn run_restore_backup(self, backup: NavPath, original: NavPath) {
+        let _guard = self.state.upgrade().map(|s| s.op_guard());
+        let name = original.file_name().to_string();
+        let existed = original.as_path().exists();
+        let mut prog = OpProgress::new(&self, "Restoring", if existed { 2 } else { 1 });
+        prog.opening("restoring", Some(&name));
+
+        if existed {
+            let staged = trash_dir_on_volume_of(&original)
+                .map(|dir| dir.join(&name))
+                .filter(|trash| {
+                    trash
+                        .parent()
+                        .map(|p| std::fs::create_dir_all(p.as_path()).is_ok())
+                        .unwrap_or(false)
+                });
+            let Some(trash) = staged else {
+                prog.record_problem(
+                    "could not stage the current version to trash",
+                    Some(name.clone()),
+                );
+                prog.finish(false);
+                self.play(SoundEvent::Error);
+                self.say("restore failed", true);
+                return;
+            };
+            prog.begin(1);
+            let ok = self.run_op(
+                Operation::Rename {
+                    src: original.clone(),
+                    dst: trash,
+                },
+                &mut prog,
+            );
+            prog.end();
+            if !ok || prog.cancelled() {
+                prog.finish(false);
+                self.play_outcome(prog.cancelled(), !ok, SoundEvent::UndoDone);
+                self.say(
+                    if prog.cancelled() {
+                        "restore cancelled"
+                    } else {
+                        "restore failed — current version was not replaced"
+                    },
+                    !prog.cancelled(),
+                );
+                return;
+            }
+        }
+
+        prog.begin(1);
+        let ok = self.run_op(
+            Operation::CopyTo {
+                src: backup,
+                dst: original.clone(),
+            },
+            &mut prog,
+        );
+        prog.end();
+        prog.finish(ok);
+        self.play_outcome(prog.cancelled(), !ok, SoundEvent::UndoDone);
+        // A cancel here is not a clean abort: the current version is
+        // already staged in `.trash` and the copy-back stopped partway.
+        // Saying "failed" would hide where the user's data went.
+        let msg = if prog.cancelled() && existed {
+            "restore cancelled — previous version is in trash".to_string()
+        } else if prog.cancelled() {
+            "restore cancelled".to_string()
+        } else if !ok {
+            "restore failed".to_string()
+        } else if existed {
+            format!("restored {} — previous version moved to trash", name)
+        } else {
+            format!("restored {}", name)
+        };
+        self.say(msg, !ok);
+        // Lands the caret on the restored row when the user is still in
+        // its folder; `refresh_with_focus` skips both the re-list and the
+        // focus if they have moved on, and a restore aimed at some other
+        // folder entirely leaves the current view untouched (the armed
+        // target is scoped to its own listing by `focus_target_belongs`).
+        self.refresh_with_focus(ok.then_some(original));
     }
 
     /// Classify a path as a directory so a delete can pick the right

@@ -2052,6 +2052,8 @@ fn dispatch_internal(hwnd: HWND, data: &WindowData, ic: navigator_config::Intern
         IC::DumpTree => state.op_dump_tree(),
         IC::Extract => state.op_extract(),
         IC::Zip => state.op_zip(),
+        IC::Backup => state.op_backup(),
+        IC::RestoreBackup => state.op_restore_backup(),
         IC::NewFolder => {
             crate::new_folder::open(hwnd, state.clone());
         }

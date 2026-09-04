@@ -11,6 +11,8 @@
 pub mod accel;
 pub mod actions;
 pub mod app;
+pub mod backup;
+pub mod backup_dialog;
 pub mod batch;
 pub mod clipboard;
 pub mod compare;

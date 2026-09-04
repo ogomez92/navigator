@@ -146,6 +146,15 @@ pub enum InternalCommand {
     /// using `7z` on PATH. Default chord: Ctrl+Shift+Z. The original is
     /// never deleted.
     Zip,
+    /// Back up the focused entry to `<volume_root>\.navigator_backup\<id>\`
+    /// (same-volume staging, like `.trash`) and record it for a later
+    /// restore. Local paths only — remote and UNC targets are refused.
+    /// Default chord: Ctrl+Shift+B.
+    Backup,
+    /// Pick a recorded backup and restore it: the current version is moved
+    /// to `.trash`, then the backup is copied back over the original path.
+    /// Default chord: Ctrl+Shift+R.
+    RestoreBackup,
 }
 
 impl InternalCommand {
@@ -312,6 +321,12 @@ pub fn default_actions() -> Vec<ShortcutAction> {
         ),
         internal("Extract archive", Extract, chord(true, false, false, "E")),
         internal("Zip selection", Zip, chord(true, true, false, "Z")),
+        internal("Backup", Backup, chord(true, true, false, "B")),
+        internal(
+            "Restore backup",
+            RestoreBackup,
+            chord(true, true, false, "R"),
+        ),
         // OS-clipboard cut + paste. Alt+C already copies to the OS
         // clipboard; Alt+X cuts (writes a MOVE hint) and Alt+V pastes via
         // the Windows shell copy engine (no rclone) so huge batches don't
@@ -380,6 +395,28 @@ mod tests {
         assert!(c.ctrl && c.shift && !c.alt);
         assert!(
             c.key.eq_ignore_ascii_case("z"),
+            "unexpected key: {:?}",
+            c.key
+        );
+    }
+
+    #[test]
+    fn backup_default_is_ctrl_shift_b() {
+        let c = default_chord(InternalCommand::Backup).expect("seeded");
+        assert!(c.ctrl && c.shift && !c.alt);
+        assert!(
+            c.key.eq_ignore_ascii_case("b"),
+            "unexpected key: {:?}",
+            c.key
+        );
+    }
+
+    #[test]
+    fn restore_backup_default_is_ctrl_shift_r() {
+        let c = default_chord(InternalCommand::RestoreBackup).expect("seeded");
+        assert!(c.ctrl && c.shift && !c.alt);
+        assert!(
+            c.key.eq_ignore_ascii_case("r"),
             "unexpected key: {:?}",
             c.key
         );

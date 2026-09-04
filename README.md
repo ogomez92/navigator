@@ -242,5 +242,7 @@ inflating the missing list.
 | Ctrl + H / Ctrl + Shift + H  | Toggle hidden / system files                        |
 | Ctrl + E                     | Extract archives — on a folder, sweeps it and its subfolders and unpacks each archive in place (asks first) |
 | Ctrl + Shift + Z             | Zip the selection into a sibling `.zip`             |
+| Ctrl + Shift + B             | Back up focused item to per-volume `.navigator_backup` (local paths only) |
+| Ctrl + Shift + R             | Restore a backup taken from the current folder — current version goes to `.trash`, the backup is kept |
 | Ctrl + 1..9, Ctrl + 0        | Jump to hotspot slot 1..10                          |
 | Ctrl+Shift+1..9, Ctrl+Shift+0| Save selection to hotspot slot 1..10                |

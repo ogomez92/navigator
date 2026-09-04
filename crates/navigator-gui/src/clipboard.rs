@@ -246,7 +246,9 @@ fn distinct_parents(paths: &[String]) -> Vec<String> {
     out
 }
 
-fn format_ts(ts: u64) -> String {
+/// Unix seconds → human-readable timestamp. Also used by the backup
+/// module's picker labels, hence `pub(crate)`.
+pub(crate) fn format_ts(ts: u64) -> String {
     // Convert Unix seconds → FILETIME (100-ns since 1601) so we reuse
     // the existing formatter without pulling in chrono.
     if ts == 0 {
