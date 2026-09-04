@@ -155,6 +155,32 @@ pub enum Operation {
     /// — the caller has already resolved the final filename, so rclone
     /// just runs `copyto` against that path.
     CopyTo { src: NavPath, dst: NavPath },
+    /// [`Operation::CopyTo`] that writes *into* an existing destination
+    /// object instead of replacing it, via `--inplace`.
+    ///
+    /// This exists to keep Unix permissions on a remote the user edits.
+    /// rclone's default upload for any backend with `PartialUploads`
+    /// (sftp, local) writes `<name>.<rand>.partial` and renames it over
+    /// the target, so the object the user gets back is a **new inode**
+    /// carrying umask-derived mode and the connecting account's
+    /// ownership. Measured against a real sftp remote: a file at
+    /// `600 root:root` came back `644 root:root` with a different inode
+    /// after one save-and-upload. `--inplace` opens the existing path
+    /// `O_WRONLY|O_CREATE|O_TRUNC`, which POSIX defines as leaving mode
+    /// and owner alone — the same file, with new contents.
+    ///
+    /// There is no rclone route to *read* a Unix mode over sftp to
+    /// restore it afterwards, so preserving the inode is the only
+    /// mechanism available: the backend reports `ReadMetadata: false` /
+    /// `WriteMetadata: false` / `MetadataInfo: null`, and
+    /// `lsjson --metadata` emits no `Metadata` key at all.
+    ///
+    /// The cost is atomicity. A cancelled or failed transfer leaves the
+    /// destination truncated rather than untouched, so this is only for
+    /// write-back of a file we already hold a full local copy of. Do not
+    /// reach for it in the paste path, where the source may be the only
+    /// copy.
+    CopyToInPlace { src: NavPath, dst: NavPath },
     Delete {
         targets: Vec<NavPath>,
         /// Whether the (single) target is a directory. rclone's delete
@@ -1116,7 +1142,7 @@ pub fn local_dest_dir(op: &Operation) -> Option<std::path::PathBuf> {
                 .filter(|_| !dst.is_remote())
                 .map(|p| p.to_path_buf());
         }
-        Operation::CopyTo { dst, .. } => {
+        Operation::CopyTo { dst, .. } | Operation::CopyToInPlace { dst, .. } => {
             return dst
                 .as_path()
                 .parent()
@@ -1243,6 +1269,15 @@ pub fn op_args(op: &Operation, dry_run: bool) -> Vec<String> {
             out.push(nav_arg(dst));
         }
         Operation::CopyTo { src, dst } => {
+            out.push("copyto".into());
+            out.push(nav_arg(src));
+            out.push(nav_arg(dst));
+        }
+        Operation::CopyToInPlace { src, dst } => {
+            // Flag first: rclone accepts global flags anywhere, but the
+            // rest of this function keeps them ahead of the verb and a
+            // reader comparing arg lists shouldn't have to notice.
+            out.push("--inplace".into());
             out.push("copyto".into());
             out.push(nav_arg(src));
             out.push(nav_arg(dst));
@@ -1443,6 +1478,58 @@ mod tests {
             args,
             vec!["--ignore-times", "moveto", "C:\\a\\photos", "C:\\b\\photos"]
         );
+    }
+
+    /// `CopyToInPlace` is `copyto` plus `--inplace`, and the flag is the
+    /// entire feature: without it rclone uploads `<name>.<rand>.partial`
+    /// and renames it over the destination, so a Unix remote hands back a
+    /// brand-new inode at the connecting account's umask and ownership.
+    /// Measured against a real sftp remote, `600 root:root` came back
+    /// `644 root:root` after one save-and-upload; with `--inplace` the
+    /// mode, owner and inode all survived.
+    ///
+    /// Asserts the full argv rather than "contains" because plain
+    /// `CopyTo` must stay atomic — it is the paste and download path,
+    /// where the source can be the only copy and a truncated destination
+    /// is worse than a lost permission bit.
+    #[test]
+    fn copy_to_in_place_adds_inplace_and_copy_to_does_not() {
+        let src = NavPath::new("C:\\cache\\lin\\etc\\hosts").unwrap();
+        let dst = NavPath::new("lin:etc/hosts").unwrap();
+        assert_eq!(
+            op_args(
+                &Operation::CopyToInPlace {
+                    src: src.clone(),
+                    dst: dst.clone(),
+                },
+                false,
+            ),
+            vec![
+                "--inplace",
+                "copyto",
+                "C:\\cache\\lin\\etc\\hosts",
+                "lin:etc/hosts"
+            ]
+        );
+        assert_eq!(
+            op_args(&Operation::CopyTo { src, dst }, false),
+            vec!["copyto", "C:\\cache\\lin\\etc\\hosts", "lin:etc/hosts"]
+        );
+    }
+
+    /// `--dry-run` still has to lead, even past an op that contributes its
+    /// own leading flag.
+    #[test]
+    fn dry_run_leads_an_in_place_copy() {
+        let args = op_args(
+            &Operation::CopyToInPlace {
+                src: NavPath::new("C:\\a\\f.txt").unwrap(),
+                dst: NavPath::new("lin:f.txt").unwrap(),
+            },
+            true,
+        );
+        assert_eq!(args[0], "--dry-run");
+        assert_eq!(args[1], "--inplace");
     }
 
     /// `--dry-run` must lead the argv so it applies to the whole

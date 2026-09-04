@@ -2906,6 +2906,24 @@ impl AppState {
     /// Upload a staged remote file back to its origin. Runs on a worker
     /// so the UI doesn't block, and updates the cache record on success
     /// so the next save re-prompts instead of re-uploading silently.
+    ///
+    /// Writes with [`Operation::CopyToInPlace`] so a Unix remote keeps the
+    /// file's mode and owner. rclone's default upload renames a `.partial`
+    /// over the target, which replaces the inode and hands the file back
+    /// at the connecting account's umask — a `600` config edited through
+    /// this flow came back world-readable. Overwriting in place is the
+    /// only mechanism available: no rclone command can read a Unix mode
+    /// over sftp, so there is nothing to restore afterwards.
+    ///
+    /// The trade is atomicity: a transfer that dies part-way leaves the
+    /// remote file truncated rather than untouched. That is survivable
+    /// only because the staged local file *is* the complete new contents,
+    /// so a retry always finishes the job — which is why a failure here
+    /// raises [`crate::window::WMAPP_REMOTE_UPLOAD_FAILED`] and a dialog
+    /// with Retry rather than just speaking a sentence into whatever the
+    /// user is doing. `prompting` is deliberately left set across that
+    /// dialog so the watcher cannot race a second prompt against the
+    /// retry; the dialog clears it if the user declines.
     pub fn op_remote_upload(&self, staged: PathBuf, remote: NavPath) {
         let Ok(staged_nav) = NavPath::new(staged.clone()) else {
             self.say("cache path invalid", true);
@@ -2917,6 +2935,9 @@ impl AppState {
         let remote_display = remote.rclone_arg().unwrap_or_else(|| remote.to_string());
         let state_weak = self.self_weak.get().cloned().unwrap_or_else(Weak::new);
         let guard = self.op_guard();
+        // Captured up front: the failure path needs a UI-thread target and
+        // must not go looking for one after the fact.
+        let hwnd = self.hwnd();
 
         let _ = speech.send(crate::speech::Utterance {
             text: format!("uploading to {}", remote_display),
@@ -2927,18 +2948,25 @@ impl AppState {
             .name("navigator-remote-upload".into())
             .spawn(move || {
                 let _guard = guard;
-                let op = Operation::CopyTo {
+                let op = Operation::CopyToInPlace {
                     src: staged_nav,
                     dst: remote.clone(),
                 };
                 let handle = match rclone.spawn(op) {
                     Ok(h) => h,
                     Err(e) => {
-                        let _ = speech.send(crate::speech::Utterance {
-                            text: format!("upload failed: {}", e),
-                            interrupt: true,
-                        });
-                        cache.finish_prompt(&staged, None);
+                        // rclone never ran, so the remote is untouched —
+                        // `started: false` keeps the dialog from claiming
+                        // otherwise.
+                        report_upload_failure(
+                            hwnd,
+                            &speech,
+                            &cache,
+                            &staged,
+                            &remote,
+                            e.to_string(),
+                            false,
+                        );
                         return;
                     }
                 };
@@ -2979,17 +3007,65 @@ impl AppState {
                         state.refresh_dir(&parent);
                     }
                 } else {
-                    cache.finish_prompt(&staged, None);
-                    let _ = speech.send(crate::speech::Utterance {
-                        text: format!(
-                            "upload failed: {}",
-                            if why.is_empty() { "see log" } else { &why }
-                        ),
-                        interrupt: true,
-                    });
+                    let reason = if why.is_empty() {
+                        "see log for details".to_string()
+                    } else {
+                        why
+                    };
+                    // rclone ran, so it may have opened (and therefore
+                    // truncated) the destination before failing.
+                    report_upload_failure(hwnd, &speech, &cache, &staged, &remote, reason, true);
                 }
             })
             .expect("spawn remote-upload worker");
+    }
+}
+
+/// Hand a failed write-back to the UI thread so it can offer a retry, and
+/// speak it either way.
+///
+/// The dialog is the important half — see
+/// [`AppState::op_remote_upload`] — but it needs a window. With no hwnd
+/// there is nothing to show it on, so this falls back to the spoken
+/// notice *and* clears `prompting`; leaving that flag set with no dialog
+/// coming would silently stop the file ever prompting again.
+fn report_upload_failure(
+    hwnd: Option<HwndSend>,
+    speech: &crossbeam_channel::Sender<crate::speech::Utterance>,
+    cache: &Arc<crate::remote_cache::RemoteCache>,
+    staged: &std::path::Path,
+    remote: &NavPath,
+    reason: String,
+    started: bool,
+) {
+    let _ = speech.send(crate::speech::Utterance {
+        text: format!("upload failed: {}", reason),
+        interrupt: true,
+    });
+
+    let Some(h) = hwnd else {
+        cache.finish_prompt(staged, None);
+        return;
+    };
+    let payload = Box::into_raw(Box::new((
+        staged.to_path_buf(),
+        remote.clone(),
+        reason,
+        started,
+    ))) as isize;
+    let posted = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(h.0),
+            crate::window::WMAPP_REMOTE_UPLOAD_FAILED,
+            windows::Win32::Foundation::WPARAM(0),
+            windows::Win32::Foundation::LPARAM(payload),
+        )
+    };
+    if posted.is_err() {
+        // Reclaim the box the UI thread will now never see, and unblock
+        // the record so the next save can still prompt.
+        drop(unsafe { Box::from_raw(payload as *mut (PathBuf, NavPath, String, bool)) });
+        cache.finish_prompt(staged, None);
     }
 }
 
@@ -4545,9 +4621,10 @@ impl WorkerCtx {
 /// asked for; batch jobs name their own verb up front.
 fn op_verb(op: &Operation) -> &'static str {
     match op {
-        Operation::Copy { .. } | Operation::CopyBatch { .. } | Operation::CopyTo { .. } => {
-            "Copying"
-        }
+        Operation::Copy { .. }
+        | Operation::CopyBatch { .. }
+        | Operation::CopyTo { .. }
+        | Operation::CopyToInPlace { .. } => "Copying",
         Operation::Move { .. } | Operation::MoveBatch { .. } => "Moving",
         // A rename is how we stage a trash-delete and how we undo one, so
         // "Moving" is the honest label for all of them.
@@ -4576,7 +4653,7 @@ fn op_subject(op: &Operation) -> Option<String> {
             name(dest_dir)
         }
         Operation::Rename { src, .. } => name(src),
-        Operation::CopyTo { src, .. } => name(src),
+        Operation::CopyTo { src, .. } | Operation::CopyToInPlace { src, .. } => name(src),
         Operation::Delete { targets, .. } => targets.first().and_then(name),
         Operation::Mkdir { dir } => name(dir),
         Operation::Touch { file } => name(file),

@@ -1008,3 +1008,111 @@ fn preflight_does_not_deadlock_when_the_dry_run_floods_stderr() {
         ),
     }
 }
+
+/// Pins the rclone behaviour that `Operation::CopyToInPlace` exists for.
+///
+/// By default rclone uploads to `<name>.<rand>.partial` and renames it
+/// over the destination — for any backend with `PartialUploads` (sftp,
+/// local), the object the user gets back is a **different file**. On a
+/// Unix remote that means a fresh inode carrying umask-derived mode and
+/// the connecting account's ownership, which is how editing a `600` file
+/// through the open/edit/upload flow handed it back world-readable.
+/// rclone offers no way to read a Unix mode over sftp and put it back
+/// (`ReadMetadata` / `WriteMetadata` are both false and `lsjson
+/// --metadata` emits no `Metadata` key at all), so keeping the original
+/// file *is* the mechanism — there is nothing to restore afterwards.
+///
+/// Windows has no mode bits to assert on, but "is it still the same file
+/// object?" is the same question, and a hard link answers it in plain
+/// std: a link keeps pointing at the file it was made from, so it sees an
+/// in-place write and misses a replace-by-rename. If a future rclone
+/// makes `--inplace` a no-op, or drops the temp-and-rename default, this
+/// is what notices.
+#[test]
+fn inplace_overwrites_the_same_file_and_the_default_replaces_it() {
+    if !rclone_available() {
+        eprintln!("rclone not available; skipping");
+        return;
+    }
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    let src = src_dir.path().join("hosts");
+    let dst = dst_dir.path().join("hosts");
+    let driver = RcloneDriver::from_path();
+
+    let copy = |op: Operation, what: &str| {
+        let (ok, _) = run_to_completion(&driver, op);
+        assert!(ok, "{what} must succeed");
+    };
+
+    // Seed the destination so every write below is an overwrite, which is
+    // the only case the flag changes anything for. rclone skips a transfer
+    // whose size and mtime already match, so each pass needs genuinely
+    // different contents to actually write.
+    fs::write(&src, b"first").unwrap();
+    copy(
+        Operation::CopyTo {
+            src: nav(&src),
+            dst: nav(&dst),
+        },
+        "seeding the destination",
+    );
+
+    // A second name for the file rclone is about to overwrite.
+    let witness = dst_dir.path().join("witness-default");
+    fs::hard_link(&dst, &witness).unwrap();
+
+    fs::write(&src, b"second, longer").unwrap();
+    copy(
+        Operation::CopyTo {
+            src: nav(&src),
+            dst: nav(&dst),
+        },
+        "the default overwrite",
+    );
+    assert_eq!(fs::read(&dst).unwrap(), b"second, longer");
+    assert_eq!(
+        fs::read(&witness).unwrap(),
+        b"first",
+        "default copyto is expected to replace the destination via \
+         temp-and-rename, leaving the original file behind under its other \
+         name; if this now reads as the new contents, rclone changed its \
+         upload strategy and CopyToInPlace may be redundant"
+    );
+
+    // Fresh witness: the previous one is attached to the file the default
+    // pass orphaned, not to the destination as it now stands.
+    let witness = dst_dir.path().join("witness-inplace");
+    fs::hard_link(&dst, &witness).unwrap();
+
+    fs::write(&src, b"third, longer still").unwrap();
+    copy(
+        Operation::CopyToInPlace {
+            src: nav(&src),
+            dst: nav(&dst),
+        },
+        "the in-place overwrite",
+    );
+    assert_eq!(
+        fs::read(&dst).unwrap(),
+        b"third, longer still",
+        "--inplace must still deliver the new contents in full"
+    );
+    assert_eq!(
+        fs::read(&witness).unwrap(),
+        b"third, longer still",
+        "--inplace must write into the existing file rather than replace \
+         it — keeping that file is what keeps a Unix remote's mode and owner"
+    );
+
+    let leftovers: Vec<String> = fs::read_dir(dst_dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".partial"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no partial file should survive either pass; found {leftovers:?}"
+    );
+}

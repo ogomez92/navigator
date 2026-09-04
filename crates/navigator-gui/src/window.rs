@@ -76,6 +76,18 @@ pub const WMAPP_EMPTY_TRASH_SURVEYED: u32 = WM_APP + 10;
 /// from a worker because walking a folder tree for archives is unbounded
 /// IO that must not happen in the message pump.
 pub const WMAPP_EXTRACT_SURVEYED: u32 = WM_APP + 11;
+/// A remote write-back failed. Payload is
+/// `Box<(PathBuf, NavPath, String, bool)>` — the staged local file, the
+/// remote it was going to, the distilled reason, and whether rclone got
+/// far enough to have started writing.
+///
+/// This has a dialog rather than the spoken-only failure it replaces
+/// because the write is `--inplace`: a transfer that dies part-way leaves
+/// the remote file **truncated**, and a sentence spoken into an editor
+/// the user is still typing in is not enough warning for that. The local
+/// staged copy is the complete new contents, so retrying is always the
+/// fix — see [`prompt_remote_upload_failed`].
+pub const WMAPP_REMOTE_UPLOAD_FAILED: u32 = WM_APP + 12;
 
 const IDC_LISTVIEW: u16 = 1001;
 const IDC_ADDRESS: u16 = 1002;
@@ -1052,6 +1064,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             LRESULT(0)
         },
 
+        WMAPP_REMOTE_UPLOAD_FAILED => unsafe {
+            let payload: Box<(std::path::PathBuf, navigator_core::NavPath, String, bool)> =
+                Box::from_raw(lp.0 as *mut _);
+            let (staged, remote, reason, started) = *payload;
+            let Some(data) = window_data(hwnd) else { return LRESULT(0) };
+            prompt_remote_upload_failed(hwnd, &data.state, staged, remote, reason, started);
+            LRESULT(0)
+        },
+
         WM_KEYDOWN => unsafe {
             // Enter on the listview opens the focused entry (handled globally
             // because we don't own the ListView's own key handling).
@@ -1467,9 +1488,6 @@ fn sign_extend_16(v: i32) -> i32 {
     if v & 0x8000 != 0 { v | !0xFFFF } else { v }
 }
 
-/// Ask the user whether to upload `staged` back to its origin remote.
-/// Called on the UI thread from the WMAPP_REMOTE_EDIT arm so the
-/// MessageBox gets a real parent hwnd and can be announced properly.
 /// Modal "an operation is still running — close anyway?" confirmation.
 /// Returns `true` if the user chose to close (kill the transfers), `false`
 /// to keep the window open. Defaults to the safe choice (No) so a stray
@@ -1502,11 +1520,68 @@ fn confirm_close_with_ops(hwnd: HWND, n: usize) -> bool {
     rc == IDYES.0
 }
 
+/// What [`task_dialog_focus_callback`] should do, passed by pointer
+/// through `lpCallbackData`. Lives on the caller's stack, which outlives
+/// the blocking `TaskDialogIndirect` call.
+struct DialogFocus {
+    /// Button id to put keyboard focus on at creation.
+    button: i32,
+    /// Re-assert foreground. Only ever set when navigator already held
+    /// it — see [`prompt_remote_upload`].
+    take_foreground: bool,
+}
+
+/// TaskDialog callback that puts keyboard focus on a chosen button. Runs
+/// on the UI thread while `TaskDialogIndirect` pumps its own loop.
+///
+/// `nDefaultButton` alone is not enough for the remote-upload dialogs.
+/// They are normally raised *while another app holds the foreground* —
+/// the editor the user just saved in — and a dialog that is never
+/// activated never hands keyboard focus to its default control.
+/// Alt-tabbing back then lands on a dialog whose focus sits on the frame:
+/// a screen reader announces nothing, and Tab is needed before Enter does
+/// anything. Focus set here is recorded as the dialog's focused control,
+/// so it is what gets restored whenever the window is finally activated,
+/// however long that takes.
+unsafe extern "system" fn task_dialog_focus_callback(
+    hwnd: HWND,
+    msg: windows::Win32::UI::Controls::TASKDIALOG_NOTIFICATIONS,
+    _wparam: WPARAM,
+    _lparam: LPARAM,
+    data: isize,
+) -> windows::core::HRESULT {
+    use windows::Win32::UI::Controls::TDN_CREATED;
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    use windows::Win32::UI::WindowsAndMessaging::{GetDlgItem, SetForegroundWindow};
+
+    if msg == TDN_CREATED && data != 0 {
+        unsafe {
+            let focus = &*(data as *const DialogFocus);
+            if let Ok(btn) = GetDlgItem(Some(hwnd), focus.button) {
+                let _ = SetFocus(Some(btn));
+            }
+            if focus.take_foreground {
+                let _ = SetForegroundWindow(hwnd);
+            }
+        }
+    }
+    windows::core::HRESULT(0)
+}
+
+/// Ask the user whether to upload `staged` back to its origin remote.
+/// Called on the UI thread from the WMAPP_REMOTE_EDIT arm so the dialog
+/// gets a real parent hwnd and can be announced properly.
+///
+/// Built on TaskDialog rather than `MessageBoxW` for one reason: it takes
+/// a callback, which is the only way to put keyboard focus on Yes at
+/// creation time. See [`upload_prompt_callback`].
 fn prompt_remote_upload(hwnd: HWND, state: &Arc<crate::app::AppState>, staged: std::path::PathBuf) {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, IDYES, MB_DEFBUTTON1, MB_ICONQUESTION, MB_SETFOREGROUND, MB_YESNO,
-        MessageBoxW,
+    use windows::Win32::UI::Controls::{
+        TASKDIALOG_FLAGS, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
+        TDCBF_NO_BUTTON, TDCBF_YES_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
+        TDF_POSITION_RELATIVE_TO_WINDOW, TaskDialogIndirect,
     };
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IDYES};
     use windows::core::PCWSTR;
 
     let Some(remote) = state.remote_cache.remote_for(&staged) else {
@@ -1514,32 +1589,60 @@ fn prompt_remote_upload(hwnd: HWND, state: &Arc<crate::app::AppState>, staged: s
         return;
     };
     let remote_display = remote.rclone_arg().unwrap_or_else(|| remote.to_string());
+    let heading = format!("{} was modified.", remote.file_name());
     let body = format!(
-        "The file you opened from {} was modified.\n\n\
+        "The copy you opened from {} has changed on disk.\n\n\
          Upload the changes back to the remote?",
         remote_display,
     );
     let title_w: Vec<u16> = "Upload to remote?".encode_utf16().chain([0]).collect();
+    let heading_w: Vec<u16> = heading.encode_utf16().chain([0]).collect();
     let body_w: Vec<u16> = body.encode_utf16().chain([0]).collect();
-    // If navigator already holds foreground, bring the dialog up front
-    // so the user can act on it immediately. If another app is active
-    // (e.g. the editor that triggered the save), stay passive — the
-    // prompt will surface once the user alt-tabs back. Never steal.
-    let is_foreground = unsafe { GetForegroundWindow() } == hwnd;
-    let mut flags = MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1;
-    if is_foreground {
-        flags |= MB_SETFOREGROUND;
-    }
-    let rc = unsafe {
-        MessageBoxW(
-            Some(hwnd),
-            PCWSTR(body_w.as_ptr()),
-            PCWSTR(title_w.as_ptr()),
-            flags,
-        )
-        .0
+
+    // If navigator already holds foreground, the dialog may come forward —
+    // that right was already ours. If another app is active (typically the
+    // editor that triggered the save), stay passive: the prompt surfaces
+    // when the user alt-tabs back, with Yes focused. Never steal.
+    let focus = DialogFocus {
+        button: IDYES.0,
+        take_foreground: unsafe { GetForegroundWindow() } == hwnd,
     };
-    if rc == IDYES.0 {
+
+    let config = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: hwnd,
+        hInstance: Default::default(),
+        // Esc declines, which costs nothing: the staged file stays put and
+        // the next save prompts again.
+        dwFlags: TASKDIALOG_FLAGS(0)
+            | TDF_POSITION_RELATIVE_TO_WINDOW
+            | TDF_ALLOW_DIALOG_CANCELLATION,
+        dwCommonButtons: TDCBF_YES_BUTTON | TDCBF_NO_BUTTON,
+        pszWindowTitle: PCWSTR(title_w.as_ptr()),
+        Anonymous1: TASKDIALOGCONFIG_0::default(),
+        pszMainInstruction: PCWSTR(heading_w.as_ptr()),
+        pszContent: PCWSTR(body_w.as_ptr()),
+        cButtons: 0,
+        pButtons: std::ptr::null(),
+        nDefaultButton: IDYES.0,
+        cRadioButtons: 0,
+        pRadioButtons: std::ptr::null(),
+        nDefaultRadioButton: 0,
+        pszVerificationText: PCWSTR::null(),
+        pszExpandedInformation: PCWSTR::null(),
+        pszExpandedControlText: PCWSTR::null(),
+        pszCollapsedControlText: PCWSTR::null(),
+        Anonymous2: TASKDIALOGCONFIG_1::default(),
+        pszFooter: PCWSTR::null(),
+        pfCallback: Some(task_dialog_focus_callback),
+        lpCallbackData: &focus as *const DialogFocus as isize,
+        cxWidth: 0,
+    };
+
+    let mut button = 0i32;
+    let rc = unsafe { TaskDialogIndirect(&config, Some(&mut button), None, None) };
+    // A dialog that failed to open is not consent to upload.
+    if rc.is_ok() && button == IDYES.0 {
         state.op_remote_upload(staged, remote);
     } else {
         // Re-baseline so we don't re-prompt immediately on the same save;
@@ -1547,6 +1650,161 @@ fn prompt_remote_upload(hwnd: HWND, state: &Arc<crate::app::AppState>, staged: s
         let mtime = staged.metadata().ok().and_then(|m| m.modified().ok());
         state.remote_cache.finish_prompt(&staged, mtime);
     }
+}
+
+/// Report a failed write-back and offer to run it again.
+///
+/// The write is `--inplace` (see [`crate::app::AppState::op_remote_upload`]),
+/// so a transfer that dies part-way leaves the remote file truncated
+/// rather than untouched. That is recoverable — `staged` still holds the
+/// complete new contents — but only if the user finds out, and the old
+/// spoken-only failure was easy to miss: it lands while they are still
+/// typing in the editor they saved from, and nothing survives it on
+/// screen. Hence a dialog, with Retry focused and defaulted.
+///
+/// Declining is safe but not free, and the body says so: the record lives
+/// only as long as this process, so quitting with a truncated remote and
+/// no retry leaves nothing pointing at the staged file. The staged path is
+/// named for exactly that case.
+fn prompt_remote_upload_failed(
+    hwnd: HWND,
+    state: &Arc<crate::app::AppState>,
+    staged: std::path::PathBuf,
+    remote: navigator_core::NavPath,
+    reason: String,
+    started: bool,
+) {
+    use windows::Win32::UI::Controls::{
+        TASKDIALOG_BUTTON, TASKDIALOG_FLAGS, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0,
+        TASKDIALOGCONFIG_1, TDF_ALLOW_DIALOG_CANCELLATION, TDF_POSITION_RELATIVE_TO_WINDOW,
+        TDF_USE_COMMAND_LINKS, TaskDialogIndirect,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    use windows::core::PCWSTR;
+
+    const ID_RETRY: i32 = 1101;
+    const ID_LATER: i32 = 1102;
+
+    let remote_display = remote.rclone_arg().unwrap_or_else(|| remote.to_string());
+    let title_w = wide_z("Upload failed");
+    let heading_w = wide_z(&format!("Could not upload {}.", remote.file_name()));
+
+    let body = upload_failure_body(&reason, &remote_display, &staged, started);
+    let body_w = wide_z(&body);
+
+    // Leave a trail that survives the dialog. "Not now" is a legitimate
+    // answer, but it ends with a possibly-truncated remote whose only
+    // remaining pointer is an in-memory record that dies with the process
+    // — so put both paths somewhere `NAVIGATOR_LOG` can recover them.
+    tracing::warn!(
+        "remote write-back failed: {} -> {} ({}); staged copy retained",
+        staged.display(),
+        remote_display,
+        reason,
+    );
+
+    let retry_w = wide_z("Retry upload\nSend the local copy to the remote again");
+    let later_w = wide_z(
+        "Not now\nKeep the edited copy on this PC. Saving the file again will ask once more",
+    );
+    let buttons = [
+        TASKDIALOG_BUTTON {
+            nButtonID: ID_RETRY,
+            pszButtonText: PCWSTR(retry_w.as_ptr()),
+        },
+        TASKDIALOG_BUTTON {
+            nButtonID: ID_LATER,
+            pszButtonText: PCWSTR(later_w.as_ptr()),
+        },
+    ];
+
+    let focus = DialogFocus {
+        button: ID_RETRY,
+        take_foreground: unsafe { GetForegroundWindow() } == hwnd,
+    };
+
+    let config = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: hwnd,
+        hInstance: Default::default(),
+        dwFlags: TASKDIALOG_FLAGS(0)
+            | TDF_POSITION_RELATIVE_TO_WINDOW
+            | TDF_ALLOW_DIALOG_CANCELLATION
+            | TDF_USE_COMMAND_LINKS,
+        dwCommonButtons: Default::default(),
+        pszWindowTitle: PCWSTR(title_w.as_ptr()),
+        Anonymous1: TASKDIALOGCONFIG_0::default(),
+        pszMainInstruction: PCWSTR(heading_w.as_ptr()),
+        pszContent: PCWSTR(body_w.as_ptr()),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: ID_RETRY,
+        cRadioButtons: 0,
+        pRadioButtons: std::ptr::null(),
+        nDefaultRadioButton: 0,
+        pszVerificationText: PCWSTR::null(),
+        pszExpandedInformation: PCWSTR::null(),
+        pszExpandedControlText: PCWSTR::null(),
+        pszCollapsedControlText: PCWSTR::null(),
+        Anonymous2: TASKDIALOGCONFIG_1::default(),
+        pszFooter: PCWSTR::null(),
+        pfCallback: Some(task_dialog_focus_callback),
+        lpCallbackData: &focus as *const DialogFocus as isize,
+        cxWidth: 0,
+    };
+
+    let mut button = 0i32;
+    let rc = unsafe { TaskDialogIndirect(&config, Some(&mut button), None, None) };
+    if rc.is_ok() && button == ID_RETRY {
+        // `prompting` is still set — the worker deliberately left it that
+        // way — so the retry runs without the watcher racing a fresh
+        // prompt against it, and a second failure comes back here.
+        state.op_remote_upload(staged, remote);
+    } else {
+        // Clear `prompting` without re-baselining the mtime, so the next
+        // save of this file prompts again from scratch.
+        state.remote_cache.finish_prompt(&staged, None);
+    }
+}
+
+/// Body text for the failed-write-back dialog. Pure so the wording —
+/// which is the entire safety value of the dialog — is testable without a
+/// window.
+///
+/// `started` is whether rclone actually ran. It gates the truncation
+/// warning because rclone can also fail before it opens the destination
+/// (bad auth, missing directory), which leaves the remote untouched;
+/// claiming damage every time would train the user to click past it.
+/// "may be incomplete" rather than "is" for the same reason — even a run
+/// that started can fail during listing, before a byte is written.
+///
+/// The staged path is always named. It is what a retry would send, and
+/// after a declined retry it is the only thing that can still recover the
+/// remote once this process exits.
+fn upload_failure_body(
+    reason: &str,
+    remote_display: &str,
+    staged: &std::path::Path,
+    started: bool,
+) -> String {
+    let mut body = format!("{reason}\n\n{remote_display}\n\n");
+    if started {
+        body.push_str(
+            "The copy on the remote may now be incomplete, because the upload \
+             writes into the existing file to preserve its permissions.\n\n",
+        );
+    }
+    body.push_str(
+        "Your edited copy is safe on this PC and still holds the full contents, \
+         so a retry can finish the job:\n    ",
+    );
+    body.push_str(&staged.to_string_lossy());
+    body
+}
+
+/// NUL-terminated UTF-16, for the Win32 string parameters above.
+fn wide_z(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain([0]).collect()
 }
 
 fn open_focused(data: &WindowData) {
@@ -2230,6 +2488,53 @@ fn select_all(data: &WindowData) {
 #[cfg(test)]
 mod tests {
     use super::rename_stem_select_end;
+    use super::upload_failure_body;
+
+    /// The truncation warning is the one thing the user cannot find out
+    /// any other way, so it must appear whenever rclone actually ran —
+    /// the write is `--inplace` and a part-way failure leaves a short
+    /// file. Verified against a real sftp remote: killing the transfer at
+    /// 51% left 1638400 of 3000000 bytes in place.
+    #[test]
+    fn a_started_upload_warns_that_the_remote_may_be_truncated() {
+        let body = upload_failure_body(
+            "connection lost",
+            "lin:etc/hosts",
+            std::path::Path::new(r"C:\nav\.remote-cache\lin\etc\hosts"),
+            true,
+        );
+        assert!(body.contains("may now be incomplete"), "{body}");
+        assert!(body.contains("connection lost"), "{body}");
+        assert!(body.contains("lin:etc/hosts"), "{body}");
+    }
+
+    /// An upload that never started left the remote alone, and saying
+    /// otherwise would teach the user to ignore the warning that matters.
+    #[test]
+    fn an_upload_that_never_ran_claims_no_damage() {
+        let body = upload_failure_body(
+            "rclone not found on PATH",
+            "lin:etc/hosts",
+            std::path::Path::new(r"C:\nav\.remote-cache\lin\etc\hosts"),
+            false,
+        );
+        assert!(!body.contains("incomplete"), "{body}");
+    }
+
+    /// The staged path is what a retry sends, and after a declined retry
+    /// it is the only route back to a truncated remote once the process
+    /// exits — so it is named either way.
+    #[test]
+    fn the_staged_path_is_always_named() {
+        let staged = std::path::Path::new(r"C:\nav\.remote-cache\lin\etc\hosts");
+        for started in [true, false] {
+            let body = upload_failure_body("x", "lin:etc/hosts", staged, started);
+            assert!(
+                body.contains(r"C:\nav\.remote-cache\lin\etc\hosts"),
+                "started={started}: {body}"
+            );
+        }
+    }
 
     #[test]
     fn file_with_extension_selects_stem() {
