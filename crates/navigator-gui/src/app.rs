@@ -24,6 +24,7 @@ use crate::remote_cache::RemoteCache;
 use crate::history::History;
 use crate::model::{Filter, Model};
 use crate::sound::SoundPlayer;
+use crate::spacemap::SpaceTree;
 use crate::speech::SpeechSink;
 use crate::window::{
     HwndSend, WMAPP_DIR_ERROR, WMAPP_DIR_LISTED, WMAPP_SEARCH_RESULTS, create as create_window,
@@ -136,6 +137,12 @@ pub struct AppState {
     /// will kill in-flight transfers (the job object terminates the
     /// rclone children on exit — see `navigator-rclone`).
     ops_in_flight: Arc<AtomicUsize>,
+    /// Kill switch for the space-breakdown scan in flight, if any. A new
+    /// scan trips the previous one, and closing the breakdown window
+    /// trips a rescan it was waiting on — otherwise that result would
+    /// re-open a window the user just dismissed. See
+    /// [`AppState::scan_space`].
+    space_scan_cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 /// RAII counter for in-flight operations. Increments on construction,
@@ -155,6 +162,18 @@ impl Drop for OpGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// What a space-breakdown scan came back with. Carried by
+/// [`crate::window::WMAPP_SPACE_SCANNED`].
+pub enum SpaceScanOutcome {
+    Done(SpaceTree),
+    /// The listing itself failed (an rclone error, typically). Spoken,
+    /// never rendered as an empty tree — a breakdown of zero bytes reads
+    /// as "this folder is empty", which is a different fact.
+    Failed(String),
+    /// Tripped by a newer scan or by the window closing. Dropped silently.
+    Cancelled,
 }
 
 const UNDO_STACK_MAX: usize = 50;
@@ -348,6 +367,7 @@ impl AppState {
             self_weak: OnceCell::new(),
             remote_cache: Arc::new(RemoteCache::new()),
             ops_in_flight: Arc::new(AtomicUsize::new(0)),
+            space_scan_cancel: Mutex::new(None),
         });
         let _ = me.self_weak.set(Arc::downgrade(&me));
         me
@@ -1449,13 +1469,6 @@ impl AppState {
             self.say("nothing selected", false);
             return;
         }
-        let paths: Vec<NavPath> = selected.iter().map(|(p, _)| p.clone()).collect();
-        crate::clipboard::push_history(crate::clipboard::HistoryEntry {
-            kind: "delete".into(),
-            sources: paths.iter().map(|p| p.to_string()).collect(),
-            dest: None,
-            ts: crate::clipboard::now_ts(),
-        });
 
         // Pick the row to land focus on after the delete completes so the
         // caret doesn't jump to row 0. Prefer the first unselected row at
@@ -1467,6 +1480,38 @@ impl AppState {
         if let Some(target) = next_focus {
             *self.pending_focus.lock() = Some(target);
         }
+
+        if !self.delete_targets(selected) {
+            // Nothing started — the remote confirm was declined, or no
+            // target resolved — so no listing is coming to consume the
+            // focus target, and leaving it armed would hand it to the next
+            // navigation anywhere.
+            self.pending_focus.lock().take();
+        }
+    }
+
+    /// Run the delete path on explicit `(path, is_dir)` targets rather
+    /// than the listview selection. This is the whole of `op_delete`
+    /// minus the selection bookkeeping, split out so the space breakdown
+    /// (Ctrl+Shift+S) can delete a row it names with exactly the same
+    /// endpoint routing — remote → confirm + purge with no undo, UNC →
+    /// the shell's prompt, local → `.trash` with undo — and never a
+    /// fourth path of its own.
+    ///
+    /// Returns whether anything was actually started. `false` means the
+    /// user declined the remote confirmation or nothing resolved; nothing
+    /// was touched and no worker is running.
+    pub fn delete_targets(&self, targets: Vec<(NavPath, bool)>) -> bool {
+        if targets.is_empty() {
+            return false;
+        }
+        let paths: Vec<NavPath> = targets.iter().map(|(p, _)| p.clone()).collect();
+        crate::clipboard::push_history(crate::clipboard::HistoryEntry {
+            kind: "delete".into(),
+            sources: paths.iter().map(|p| p.to_string()).collect(),
+            dest: None,
+            ts: crate::clipboard::now_ts(),
+        });
 
         // Split by endpoint, three ways.
         //
@@ -1491,7 +1536,7 @@ impl AppState {
         let mut remote_targets: Vec<(NavPath, bool)> = Vec::new();
         let mut unc: Vec<NavPath> = Vec::new();
         let mut local: Vec<NavPath> = Vec::new();
-        for (p, is_dir) in selected {
+        for (p, is_dir) in targets {
             if p.is_remote() {
                 remote_targets.push((p, is_dir));
             } else if p.is_unc() {
@@ -1500,6 +1545,7 @@ impl AppState {
                 local.push(p);
             }
         }
+        let mut started = false;
 
         if !remote_targets.is_empty() {
             let remote_paths: Vec<NavPath> =
@@ -1507,19 +1553,20 @@ impl AppState {
             if !confirm_remote_delete(self.main_hwnd(), &remote_paths) {
                 // User cancelled. Don't touch local either — avoids a
                 // half-delete where they confirmed one endpoint and not
-                // the other. Clear pending_focus since no op will fire.
-                self.pending_focus.lock().take();
-                return;
+                // the other.
+                return false;
             }
             self.spawn_remote_purge(remote_targets);
+            started = true;
         }
 
         if !unc.is_empty() {
             self.spawn_shell_delete(unc);
+            started = true;
         }
 
         if local.is_empty() {
-            return;
+            return started;
         }
 
         // Move each local target to `<volume_root>/.trash/<ts>_<n>/<basename>`
@@ -1541,7 +1588,7 @@ impl AppState {
         }
         if pairs.is_empty() {
             self.say("delete targets resolved to nothing", true);
-            return;
+            return started;
         }
         self.push_undo(UndoAction::Delete {
             pairs: pairs.clone(),
@@ -1552,6 +1599,7 @@ impl AppState {
             .name("navigator-batch-delete".into())
             .spawn(move || state.run_trash_batch(pairs))
             .expect("spawn delete batch");
+        true
     }
 
     /// Survey every `<drive>\.trash` so the confirmation can name what it
@@ -2730,6 +2778,157 @@ impl AppState {
             .expect("spawn dump-tree worker");
     }
 
+    /// Ctrl+Shift+S: a `du`-style breakdown of the focused folder — or of
+    /// the current folder when a file (or nothing) is focused, matching
+    /// Alt+L's rule. On This PC the focused row names a volume, so the
+    /// whole drive is scanned; that is the case the screen exists for.
+    ///
+    /// Only the target is resolved here. The scan runs on a worker via
+    /// [`Self::scan_space`], and the tree window opens from the UI thread
+    /// when the result lands.
+    pub fn op_space_breakdown(&self) {
+        let Some(cwd) = self.model.cwd() else {
+            return;
+        };
+        let sel = self.model.selection_snapshot();
+        let focused = sel.focus().and_then(|i| self.model.get(i));
+        let target = if cwd.is_this_pc() {
+            // A This PC row is a display string (`"D: (Data)"`), not a
+            // path — `cwd.join` on it would build an unstattable
+            // `\\?\NavigatorThisPC\D: (Data)` and the walk would report an
+            // empty drive. Same trap `op_show_properties` documents.
+            let Some(e) = focused else {
+                self.say("focus a drive first", true);
+                return;
+            };
+            match navigator_fs::drive_path_from_display(&e.name)
+                .and_then(|root| NavPath::new(root).ok())
+            {
+                Some(p) => p,
+                None => {
+                    self.say("not a drive", true);
+                    return;
+                }
+            }
+        } else {
+            focused
+                .filter(|e| e.is_dir())
+                .map(|e| cwd.join(&e.name))
+                .unwrap_or(cwd)
+        };
+        // The remotes sentinel is a list of configured remotes, not a
+        // directory — there is nothing below it to size.
+        if target.is_remotes_root() {
+            self.say("can't break down the remotes list", true);
+            return;
+        }
+        self.scan_space(target);
+    }
+
+    /// Size everything under `root` on a worker and hand the finished
+    /// tree to the UI thread as [`WMAPP_SPACE_SCANNED`]. Also the rescan
+    /// entry point for the breakdown window (F5).
+    ///
+    /// Local roots are walked straight into the arena
+    /// (`SpaceTree::scan_local`); remote roots are one
+    /// `rclone lsjson --recursive`, because that is the only rclone call
+    /// that returns every file's size in one round-trip — `lsjson` on a
+    /// directory reports `-1`, and `rclone size` answers one folder per
+    /// spawn, which for a breakdown would be a spawn per row.
+    ///
+    /// A drive scan can run for minutes, so the walker reports progress
+    /// and the worker speaks a running file count at the configured
+    /// announce cadence — silence that long reads as "nothing happened".
+    /// Starting a new scan trips the previous one's kill switch: the
+    /// user asked a new question and the old answer would only arrive
+    /// to replace the new one.
+    pub fn scan_space(&self, root: NavPath) {
+        let Some(hwnd) = self.hwnd() else {
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(prev) = self.space_scan_cancel.lock().replace(cancel.clone()) {
+            prev.store(true, Ordering::SeqCst);
+        }
+        let label = root.rclone_arg().unwrap_or_else(|| root.to_string());
+        self.say(&format!("scanning {label}…"), false);
+
+        let rclone = self.rclone.clone();
+        let speech = self.speech.handle();
+        let interval = self.config.read().general.announce_interval_secs;
+        std::thread::Builder::new()
+            .name("navigator-space-scan".into())
+            .spawn(move || {
+                let outcome = if root.is_remote() {
+                    let arg = root.rclone_arg().unwrap_or_default();
+                    match rclone.lsjson_recursive(&arg) {
+                        Ok(items) => {
+                            SpaceScanOutcome::Done(SpaceTree::from_remote_items(&label, &items))
+                        }
+                        Err(e) => SpaceScanOutcome::Failed(e.to_string()),
+                    }
+                } else {
+                    let mut last_spoken = std::time::Instant::now();
+                    let cadence = std::time::Duration::from_secs(u64::from(interval));
+                    let mut tick = |files: u64| -> bool {
+                        if cancel.load(Ordering::SeqCst) {
+                            return false;
+                        }
+                        if interval > 0 && last_spoken.elapsed() >= cadence {
+                            last_spoken = std::time::Instant::now();
+                            let _ = speech.try_send(crate::speech::Utterance {
+                                text: format!(
+                                    "scanning, {} files so far",
+                                    crate::spacemap::group_thousands(files)
+                                ),
+                                interrupt: false,
+                            });
+                        }
+                        true
+                    };
+                    match SpaceTree::scan_local_with(&root, &mut tick) {
+                        Some(tree) => SpaceScanOutcome::Done(tree),
+                        None => SpaceScanOutcome::Cancelled,
+                    }
+                };
+                if cancel.load(Ordering::SeqCst) {
+                    // Tripped after the walk finished (a remote listing can't
+                    // check mid-way). The answer is stale either way.
+                    return;
+                }
+                post_space_scanned(hwnd, root, outcome);
+            })
+            .expect("spawn space-scan worker");
+    }
+
+    /// Trip the space scan in flight, if any. Called when the breakdown
+    /// window closes so a rescan it was waiting on can't re-open it.
+    pub fn cancel_space_scan(&self) {
+        if let Some(c) = self.space_scan_cancel.lock().take() {
+            c.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The UI-thread half of [`Self::scan_space`]: open (or refill) the
+    /// breakdown window, or say why there is nothing to show.
+    pub fn show_space_breakdown(&self, root: NavPath, outcome: SpaceScanOutcome) {
+        let Some(hwnd) = self.hwnd() else {
+            return;
+        };
+        let Some(me) = self.self_weak.get().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        match outcome {
+            SpaceScanOutcome::Done(tree) => {
+                crate::space_window::show(hwnd.0, me, root, tree);
+            }
+            SpaceScanOutcome::Failed(err) => {
+                self.say(&format!("space breakdown failed: {err}"), true);
+            }
+            SpaceScanOutcome::Cancelled => {}
+        }
+    }
+
     /// File → Compare trees…: walk the folder the user is standing in,
     /// diff it against a tree they paste in, and show the result in the
     /// viewer.
@@ -3244,6 +3443,18 @@ fn post_extract_survey(
         let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
             Some(hwnd.0),
             crate::window::WMAPP_EXTRACT_SURVEYED,
+            WPARAM(0),
+            LPARAM(payload as isize),
+        );
+    }
+}
+
+fn post_space_scanned(hwnd: HwndSend, root: NavPath, outcome: SpaceScanOutcome) {
+    let payload = Box::into_raw(Box::new((root, outcome)));
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(hwnd.0),
+            crate::window::WMAPP_SPACE_SCANNED,
             WPARAM(0),
             LPARAM(payload as isize),
         );

@@ -182,6 +182,38 @@ error     = "uhoh.wav"
 Filenames are resolved inside `navigator_sounds/` only — a path or `..` in the
 value is rejected.
 
+## Where did the space go?
+
+**Ctrl+Shift+S** (Tools → Space breakdown) sizes everything under the
+focused folder — or the folder you're standing in, or, on This PC, the
+focused drive — and opens it as a tree, the way `du` would show it:
+every folder carries the total of what's beneath it, and at each level
+the biggest item is first. Walk down the top row and you're looking at
+the culprit.
+
+```
+D:\stuff — 118.2 GB, 45,301 files, 3,208 folders
+   games — 82.4 GB, 69%, 12,940 files, 611 folders
+   video — 24.1 GB, 20%, 318 files, 12 folders
+   …
+```
+
+Each row reads name, size, share of its parent, and for a folder how much
+is inside. Right arrow opens a folder, Left closes it or goes back up,
+type a letter to jump. **Enter** takes you there (a folder is opened, a
+file is focused in its folder) and closes the breakdown. **Delete** runs
+the ordinary delete on that row — to `.trash` with undo on a local drive,
+the shell's own prompt on a network share, confirm-then-purge on an rclone
+remote — and the row and its size vanish from every total above it.
+**F5** rescans, **Esc** closes.
+
+Remotes work too: one `rclone lsjson --recursive` is enough, since every
+file comes back with its size and the folder totals are added up here.
+Sizes are file lengths, not allocated blocks, so a folder of tiny files
+will read a little smaller than the drive's used-space figure. A scan of a
+whole drive takes a while; a running file count is spoken along the way,
+and the window opens by itself when it's done.
+
 ## Comparing two trees
 
 **File → Compare trees…** answers "what does that copy have that this one
@@ -244,5 +276,6 @@ inflating the missing list.
 | Ctrl + Shift + Z             | Zip the selection into a sibling `.zip`             |
 | Ctrl + Shift + B             | Back up focused item to per-volume `.navigator_backup` (local paths only) |
 | Ctrl + Shift + R             | Restore a backup taken from the current folder — current version goes to `.trash`, the backup is kept |
+| Ctrl + Shift + S             | Space breakdown — a `du`-style tree of what is taking the space under the focused folder or drive |
 | Ctrl + 1..9, Ctrl + 0        | Jump to hotspot slot 1..10                          |
 | Ctrl+Shift+1..9, Ctrl+Shift+0| Save selection to hotspot slot 1..10                |

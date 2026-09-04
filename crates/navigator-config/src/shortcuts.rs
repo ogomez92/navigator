@@ -155,6 +155,12 @@ pub enum InternalCommand {
     /// to `.trash`, then the backup is copied back over the original path.
     /// Default chord: Ctrl+Shift+R.
     RestoreBackup,
+    /// `du`-style breakdown of the focused folder (or the current one):
+    /// an accessible tree of what is taking the space, largest first,
+    /// with Enter to go there and Delete to run the normal delete path
+    /// on a row. Works on local paths, UNC shares and rclone remotes.
+    /// Default chord: Ctrl+Shift+S.
+    SpaceBreakdown,
 }
 
 impl InternalCommand {
@@ -327,6 +333,11 @@ pub fn default_actions() -> Vec<ShortcutAction> {
             RestoreBackup,
             chord(true, true, false, "R"),
         ),
+        internal(
+            "Space breakdown",
+            SpaceBreakdown,
+            chord(true, true, false, "S"),
+        ),
         // OS-clipboard cut + paste. Alt+C already copies to the OS
         // clipboard; Alt+X cuts (writes a MOVE hint) and Alt+V pastes via
         // the Windows shell copy engine (no rclone) so huge batches don't
@@ -417,6 +428,17 @@ mod tests {
         assert!(c.ctrl && c.shift && !c.alt);
         assert!(
             c.key.eq_ignore_ascii_case("r"),
+            "unexpected key: {:?}",
+            c.key
+        );
+    }
+
+    #[test]
+    fn space_breakdown_default_is_ctrl_shift_s() {
+        let c = default_chord(InternalCommand::SpaceBreakdown).expect("seeded");
+        assert!(c.ctrl && c.shift && !c.alt);
+        assert!(
+            c.key.eq_ignore_ascii_case("s"),
             "unexpected key: {:?}",
             c.key
         );

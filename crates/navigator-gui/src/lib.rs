@@ -39,6 +39,8 @@ pub mod search;
 pub mod shell_op;
 pub mod shortcut_editor;
 pub mod sound;
+pub mod space_window;
+pub mod spacemap;
 pub mod speech;
 pub mod tempsweep;
 pub mod viewer;

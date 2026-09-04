@@ -25,13 +25,14 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     ACCEL, AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateAcceleratorTableW, CreateMenu,
-    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW, HCURSOR, HICON, HMENU, IDC_ARROW,
-    IDI_APPLICATION, IsDialogMessageW, LoadCursorW, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR,
-    MF_STRING, MF_UNCHECKED, MSG, PostQuitMessage, RegisterClassExW, SendMessageW, SetMenu,
-    SetWindowLongPtrW, SetWindowTextW, TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE,
-    WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_NOTIFY, WM_SETFONT,
-    WM_SIZE, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GA_ROOT,
+    GWLP_USERDATA, GetAncestor, GetClientRect, GetMessageW, GetWindowLongPtrW, HCURSOR, HICON,
+    HMENU, IDC_ARROW, IDI_APPLICATION, IsDialogMessageW, LoadCursorW, LoadIconW, MF_CHECKED,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, PostQuitMessage, RegisterClassExW,
+    SendMessageW, SetMenu, SetWindowLongPtrW, SetWindowTextW, TranslateAcceleratorW,
+    TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY,
+    WM_KEYDOWN, WM_NOTIFY, WM_SETFONT, WM_SIZE, WNDCLASSEXW, WS_BORDER, WS_CHILD,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -88,6 +89,12 @@ pub const WMAPP_EXTRACT_SURVEYED: u32 = WM_APP + 11;
 /// staged copy is the complete new contents, so retrying is always the
 /// fix — see [`prompt_remote_upload_failed`].
 pub const WMAPP_REMOTE_UPLOAD_FAILED: u32 = WM_APP + 12;
+/// Space-breakdown scan finished. Payload is
+/// `Box<(NavPath, crate::app::SpaceScanOutcome)>` — the scanned root and
+/// the sized tree (or why there isn't one). Posted from the scan worker
+/// because the tree window, like every window, is created on the UI
+/// thread; the walk itself is unbounded IO and never runs here.
+pub const WMAPP_SPACE_SCANNED: u32 = WM_APP + 13;
 
 const IDC_LISTVIEW: u16 = 1001;
 const IDC_ADDRESS: u16 = 1002;
@@ -255,18 +262,29 @@ pub fn run_message_loop(hwnd: HWND) -> i32 {
                 .map(|d| *d.accel.lock())
                 .unwrap_or_default();
 
+            // The accelerator table belongs to the main window and its
+            // children only. `TranslateAcceleratorW` does not check which
+            // window a key message is addressed to — it matches the chord
+            // and sends `WM_COMMAND` to `hwnd` regardless — so a key typed
+            // into one of the modeless tool windows (viewer, progress,
+            // space breakdown) used to fire the main window's binding
+            // instead: F5 in the breakdown tree refreshed the listing
+            // rather than rescanning, Ctrl+C in the viewer ran Copy on the
+            // listview selection. Those windows own their own keys.
+            let for_main = GetAncestor(msg.hwnd, GA_ROOT) == hwnd;
+
             // Accelerators FIRST, dialog-manager second. The reverse
             // order lets `IsDialogMessageW` eat Ctrl+letter chords
             // (treating them as mnemonic lookups) before the accel
             // table ever sees them — that's what broke user-defined
             // Ctrl+T. Petzold's canonical pump is accel, then dialog.
-            if !accel.is_invalid() && TranslateAcceleratorW(hwnd, accel, &msg) != 0 {
+            if for_main && !accel.is_invalid() && TranslateAcceleratorW(hwnd, accel, &msg) != 0 {
                 continue;
             }
             // Dialog-manager tab traversal + default-button handling. This
             // is why plain top-level windows get Tab between children for
             // free when their controls have WS_TABSTOP.
-            if IsDialogMessageW(hwnd, &msg).as_bool() {
+            if for_main && IsDialogMessageW(hwnd, &msg).as_bool() {
                 continue;
             }
             let _ = TranslateMessage(&msg);
@@ -406,6 +424,7 @@ pub enum Commands {
     /// Paste, choosing the conflict mode first. Only route to Mirror.
     PasteSpecial = 151,
     CompareTrees = 152,
+    SpaceBreakdown = 153,
     // Help menu
     About = 160,
     // Shortcut/Action dynamic range
@@ -647,6 +666,12 @@ fn build_menu() -> HMENU {
             MF_STRING,
             Commands::DumpTree as usize,
             w!("&Dump folder tree\tAlt+L"),
+        );
+        let _ = AppendMenuW(
+            tools,
+            MF_STRING,
+            Commands::SpaceBreakdown as usize,
+            w!("&Space breakdown\tCtrl+Shift+S"),
         );
         let _ = AppendMenuW(
             tools,
@@ -1070,6 +1095,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let (staged, remote, reason, started) = *payload;
             let Some(data) = window_data(hwnd) else { return LRESULT(0) };
             prompt_remote_upload_failed(hwnd, &data.state, staged, remote, reason, started);
+            LRESULT(0)
+        },
+
+        WMAPP_SPACE_SCANNED => unsafe {
+            let payload: Box<(navigator_core::NavPath, crate::app::SpaceScanOutcome)> =
+                Box::from_raw(lp.0 as *mut _);
+            let (root, outcome) = *payload;
+            let Some(data) = window_data(hwnd) else { return LRESULT(0) };
+            data.state.show_space_breakdown(root, outcome);
             LRESULT(0)
         },
 
@@ -1840,6 +1874,7 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
         x if x == Commands::NavigateUp as u16 => data.state.navigate_up(),
         x if x == Commands::ShowProperties as u16 => data.state.op_show_properties(),
         x if x == Commands::DumpTree as u16 => data.state.op_dump_tree(),
+        x if x == Commands::SpaceBreakdown as u16 => data.state.op_space_breakdown(),
         x if x == Commands::CompareTrees as u16 => data.state.op_compare_trees(),
         x if x == Commands::Extract as u16 => data.state.op_extract(),
         x if x == Commands::Zip as u16 => data.state.op_zip(),
@@ -2312,6 +2347,7 @@ fn dispatch_internal(hwnd: HWND, data: &WindowData, ic: navigator_config::Intern
         IC::Zip => state.op_zip(),
         IC::Backup => state.op_backup(),
         IC::RestoreBackup => state.op_restore_backup(),
+        IC::SpaceBreakdown => state.op_space_breakdown(),
         IC::NewFolder => {
             crate::new_folder::open(hwnd, state.clone());
         }
