@@ -680,17 +680,12 @@ impl RcloneDriver {
             "--stats-one-line".into(),
             "--transfers".into(),
             self.transfers.to_string(),
-            // Treat local paths literally. rclone's default Windows local
-            // encoding maps shell-invalid chars (|, ?, *, :, ...) to their
-            // full-width Unicode equivalents, so a file literally named with
-            // a full-width `｜` (U+FF5C) on disk gets re-encoded to ASCII `|`
-            // and rclone then can't find it ("directory not found"). We hand
-            // rclone the exact on-disk name (local listings come from
-            // navigator-fs / FindFirstFileW, not rclone), so disabling the
-            // encoding makes those names round-trip. Only affects the *local*
-            // backend; remote backends keep their own encoding.
-            "--local-encoding".into(),
-            "None".into(),
+            // NOTE: rclone's *default* local encoding, deliberately. We
+            // used to pass `--local-encoding None` here to make on-disk
+            // names round-trip; it does the opposite. See
+            // `crate::encoding` — the names we hand rclone are translated
+            // into its namespace instead, which is the half that flag
+            // never addressed and which fails silently when it is wrong.
         ]
     }
 
@@ -1315,7 +1310,14 @@ fn path_arg(p: &Path) -> String {
     // colon-in-drive isn't mistaken for a remote. A leading `./` would
     // disambiguate but breaks absolute paths, so we rely on the `C:\...`
     // form which rclone recognises as local.
-    p.to_string_lossy().into_owned()
+    //
+    // The path is translated into rclone's namespace on the way out: a
+    // command-line path is *decoded* by the local backend before anything
+    // is opened, so an on-disk name carrying a full-width `｜` or an
+    // escaped `‛＂` comes back as "directory not found" if passed raw.
+    // Ordinary names contain nothing the encoder looks at and come
+    // through byte-identical. See `crate::encoding`.
+    crate::encoding::to_standard_path(&p.to_string_lossy())
 }
 
 #[cfg(test)]

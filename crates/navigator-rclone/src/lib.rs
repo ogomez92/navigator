@@ -15,10 +15,12 @@
 //! the chosen mode would actually destroy, so the UI can confirm only when
 //! data is genuinely at risk.
 
+pub mod encoding;
 pub mod error;
 pub mod log;
 pub mod op;
 
+pub use encoding::{to_standard_name, to_standard_path};
 pub use error::{ErrorCollector, ErrorKind, RcloneError};
 pub use log::{LogEvent, LogLevel, Stats, Transferring};
 pub use op::{

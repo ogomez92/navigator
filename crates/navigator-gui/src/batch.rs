@@ -134,6 +134,15 @@ impl TempList {
     /// keeps two navigator instances apart. Deliberately avoids the system
     /// temp dir being shared with a stale file of the same name by
     /// including both.
+    /// Names arrive in **OS** form, straight off `FindFirstFileExW`, and
+    /// are translated into rclone's namespace on the way in — see
+    /// [`navigator_rclone::encoding`]. That translation is the whole
+    /// reason this cannot be a plain `join("\n")`: rclone matches each
+    /// entry against its *own* listing of the source root, which is in
+    /// standard form, so a raw on-disk name carrying a full-width `｜` or
+    /// an escaped `‛＂` matches nothing. rclone then transfers nothing,
+    /// logs nothing, and exits 0 — the silent half of the bug, and the
+    /// one `--local-encoding None` never touched.
     pub fn write(names: &[String], seq: u64) -> std::io::Result<Self> {
         let path = std::env::temp_dir().join(format!(
             "{}{}-{}.txt",
@@ -145,7 +154,7 @@ impl TempList {
         // and treats \n as the separator; a trailing newline is fine.
         let mut body = String::with_capacity(names.iter().map(|n| n.len() + 1).sum());
         for n in names {
-            body.push_str(n);
+            body.push_str(&navigator_rclone::to_standard_name(n));
             body.push('\n');
         }
         std::fs::write(&path, body)?;
@@ -320,13 +329,35 @@ mod tests {
     }
 
     /// Non-ASCII names must round-trip as UTF-8 — rclone reads the list as
-    /// UTF-8 and these are exactly the names that broke before
-    /// `--local-encoding None` was added.
+    /// UTF-8, and an accent is not something its encoder looks at, so
+    /// these must reach the list byte-identical.
     #[test]
     fn temp_list_round_trips_unicode() {
         let names = vec!["acentuado-ñé.txt".to_string(), "日本語.txt".to_string()];
         let list = TempList::write(&names, 4243).unwrap();
         let body = std::fs::read_to_string(list.path()).unwrap();
         assert_eq!(body, "acentuado-ñé.txt\n日本語.txt\n");
+    }
+
+    /// The silent-loss case. `--files-from` entries are matched against
+    /// rclone's own listing of the source, which is in rclone's namespace,
+    /// so a name carrying a full-width twin or an escaped one has to be
+    /// translated on the way into the list. Getting this wrong costs no
+    /// error and no exit code — just files that never arrive.
+    #[test]
+    fn temp_list_translates_names_into_rclones_namespace() {
+        let names = vec![
+            // yt-dlp's full-width pipe, escaped by an earlier copy.
+            "10 Famous \u{201B}\u{FF5C} Andre Antunes [x].mp3".to_string(),
+            // A bare full-width quote, never escaped.
+            "\u{FF02}quoted\u{FF02}.mp3".to_string(),
+            "ordinary.mp3".to_string(),
+        ];
+        let list = TempList::write(&names, 4244).unwrap();
+        let body = std::fs::read_to_string(list.path()).unwrap();
+        assert_eq!(
+            body,
+            "10 Famous \u{FF5C} Andre Antunes [x].mp3\n\"quoted\".mp3\nordinary.mp3\n"
+        );
     }
 }
