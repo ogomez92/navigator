@@ -3922,19 +3922,29 @@ impl WorkerCtx {
             match self.rclone.conflicts(&op) {
                 Ok(report) => {
                     // With --files-from the reported objects are the listed
-                    // names themselves, so they need no prefixing.
-                    overwrites.extend(
-                        report
-                            .overwrites
-                            .iter()
-                            .map(|p| p.to_string_lossy().into_owned()),
-                    );
-                    deletes.extend(
-                        report
-                            .deletes
-                            .iter()
-                            .map(|p| p.to_string_lossy().into_owned()),
-                    );
+                    // names themselves, so they need no prefixing — but the
+                    // list was written in rclone's namespace, so rclone
+                    // answers in it too. Map each one back to the name the
+                    // user's file actually has before it reaches a dialog:
+                    // being asked to confirm overwriting `"quoted".mp3`
+                    // when the row on screen reads `＂quoted＂.mp3` is a
+                    // question about a file they can't identify. The group
+                    // holds both forms, so this is an exact lookup rather
+                    // than a reverse translation.
+                    let os_name: std::collections::HashMap<String, &String> = group
+                        .names
+                        .iter()
+                        .map(|n| (navigator_rclone::to_standard_name(n), n))
+                        .collect();
+                    let render = |p: &std::path::PathBuf| -> String {
+                        let reported = p.to_string_lossy().into_owned();
+                        os_name
+                            .get(&reported)
+                            .map(|n| (*n).clone())
+                            .unwrap_or(reported)
+                    };
+                    overwrites.extend(report.overwrites.iter().map(&render));
+                    deletes.extend(report.deletes.iter().map(&render));
                 }
                 Err(e) => {
                     tracing::warn!("batched conflict detection failed: {}", e);
