@@ -1,10 +1,12 @@
 //! Reaping our own leftovers in `%TEMP%`.
 //!
-//! Three operations stage a file in the system temp directory: the
+//! Four operations stage a file in the system temp directory: the
 //! `--files-from` list a batched paste hands rclone
 //! ([`crate::batch::TempList`]), the source list a detached shell copy
-//! hands its helper process ([`crate::shell_op`]), and the `--log-file` an
-//! elevated retry redirects rclone to ([`crate::elevated`]). Each of those
+//! hands its helper process ([`crate::shell_op`]), the `--log-file` an
+//! elevated retry redirects rclone to ([`crate::elevated`]), and the
+//! `/UNILOG` robocopy writes its output to
+//! ([`navigator_rclone::robocopy`]). Each of those
 //! deletes its own file on the normal path, and that stays the primary
 //! cleanup — this module is the backstop for the paths where a destructor
 //! never runs:
@@ -29,8 +31,17 @@ use std::time::{Duration, SystemTime};
 pub const FILES_FROM_PREFIX: &str = "navigator-files-from-";
 pub const SHELL_OP_PREFIX: &str = "navigator-shellop-";
 pub const ELEVATED_LOG_PREFIX: &str = "navigator-elevated-";
+/// robocopy's `/UNILOG` files. Defined by the driver that writes them —
+/// it lives in another crate — and re-exported so this list stays the one
+/// place every prefix is named.
+pub const ROBOCOPY_LOG_PREFIX: &str = navigator_rclone::robocopy::LOG_PREFIX;
 
-const PREFIXES: [&str; 3] = [FILES_FROM_PREFIX, SHELL_OP_PREFIX, ELEVATED_LOG_PREFIX];
+const PREFIXES: [&str; 4] = [
+    FILES_FROM_PREFIX,
+    SHELL_OP_PREFIX,
+    ELEVATED_LOG_PREFIX,
+    ROBOCOPY_LOG_PREFIX,
+];
 
 /// How long a file is left alone regardless of who owns it.
 ///
@@ -176,6 +187,7 @@ mod tests {
         assert_eq!(owner_pid("navigator-files-from-1234-7.txt"), Some(1234));
         assert_eq!(owner_pid("navigator-shellop-99-0.txt"), Some(99));
         assert_eq!(owner_pid("navigator-elevated-4321.log"), Some(4321));
+        assert_eq!(owner_pid("navigator-robocopy-555-12.log"), Some(555));
     }
 
     /// The temp directory belongs to the whole machine. Anything we did

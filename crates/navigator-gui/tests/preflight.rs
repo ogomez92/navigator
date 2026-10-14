@@ -315,3 +315,48 @@ fn local_destinations_keep_the_cheap_prefilter() {
         "no collision means no dry-run and no dialog"
     );
 }
+
+/// A move that protected some destinations keeps their sources, and says
+/// so — with the reason, since "done" alone reads as "it all moved".
+#[test]
+fn a_move_names_what_it_left_behind_and_why() {
+    use navigator_core::ConflictMode;
+    use navigator_gui::preflight::left_behind;
+    assert_eq!(left_behind(Some(ConflictMode::Update), 0), None);
+    assert_eq!(
+        left_behind(Some(ConflictMode::Update), 1).as_deref(),
+        Some("1 item stayed in the source folder: the destination already has newer copies")
+    );
+    assert_eq!(
+        left_behind(Some(ConflictMode::AddNewOnly), 3).as_deref(),
+        Some("3 items stayed in the source folder: they already exist at the destination")
+    );
+    assert_eq!(
+        left_behind(None, 2).as_deref(),
+        Some("2 items stayed in the source folder")
+    );
+}
+
+/// The Mirror confirmation leads with what it deletes — the part the user
+/// never selected — and says when there is nothing to lose.
+#[test]
+fn mirror_confirmation_names_deletions_first() {
+    use navigator_gui::preflight::mirror_confirm_text;
+    let (h, b) = mirror_confirm_text(
+        &["photos\\a.jpg".to_string()],
+        &["photos\\old".to_string(), "photos\\x.txt".to_string()],
+    );
+    assert_eq!(
+        h,
+        "Mirror will delete 2 item(s) and replace 1 item(s) at the destination."
+    );
+    let del = b.find("will be deleted").unwrap();
+    let rep = b.find("will be replaced").unwrap();
+    assert!(del < rep, "{b}");
+    assert!(b.contains("photos\\old"));
+    assert!(b.contains("not recoverable"));
+
+    let (h, b) = mirror_confirm_text(&[], &[]);
+    assert_eq!(h, "Mirror would not replace or delete anything.");
+    assert!(!b.contains("not recoverable"));
+}

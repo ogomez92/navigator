@@ -134,9 +134,16 @@ pub enum Operation {
     /// owned by the caller and kept alive for the whole operation.
     /// Destinations land directly in `dest_dir` (this is `copy`, not
     /// `copyto`, so no source basename is appended).
+    ///
+    /// `names` is the same set in **OS** form, for the robocopy engine
+    /// ([`crate::robocopy`]): `list_file` is written in rclone's namespace
+    /// (see [`crate::encoding`]) and that translation is not reversible.
+    /// An empty `names` keeps the op on rclone — robocopy given no file
+    /// filter copies the *whole* source folder.
     CopyBatch {
         src_root: NavPath,
         list_file: PathBuf,
+        names: Vec<String>,
         dest_dir: NavPath,
         mode: ConflictMode,
     },
@@ -144,6 +151,7 @@ pub enum Operation {
     MoveBatch {
         src_root: NavPath,
         list_file: PathBuf,
+        names: Vec<String>,
         dest_dir: NavPath,
         mode: ConflictMode,
     },
@@ -244,7 +252,7 @@ impl ConflictReport {
 }
 
 /// Read the [`ConflictMode`] out of an operation, if it carries one.
-fn mode_of(op: &Operation) -> Option<ConflictMode> {
+pub(crate) fn mode_of(op: &Operation) -> Option<ConflictMode> {
     match op {
         Operation::Copy { mode, .. }
         | Operation::Move { mode, .. }
@@ -256,7 +264,7 @@ fn mode_of(op: &Operation) -> Option<ConflictMode> {
 
 /// Force an operation onto a different [`ConflictMode`]. No-op for ops
 /// that have no mode. Used to build the second dry-run pass.
-fn set_mode(op: &mut Operation, new: ConflictMode) {
+pub(crate) fn set_mode(op: &mut Operation, new: ConflictMode) {
     match op {
         Operation::Copy { mode, .. }
         | Operation::Move { mode, .. }
@@ -356,6 +364,22 @@ pub struct OpHandle {
 }
 
 impl OpHandle {
+    /// Assemble a handle around an engine other than rclone's own `spawn`
+    /// (see [`crate::robocopy`]). `child` is the slot the [`Canceller`]
+    /// kills; the engine swaps each process it starts into it.
+    pub(crate) fn from_parts(
+        events: Receiver<OpEvent>,
+        child: Arc<Mutex<Option<Child>>>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            events,
+            child,
+            cancelled,
+        }
+    }
+
     pub fn cancel(&self) {
         self.canceller().cancel();
     }
@@ -1224,12 +1248,14 @@ pub fn op_args(op: &Operation, dry_run: bool) -> Vec<String> {
             list_file,
             dest_dir,
             mode,
+            ..
         }
         | Operation::MoveBatch {
             src_root,
             list_file,
             dest_dir,
             mode,
+            ..
         } => {
             // Mirror must never reach a batch: `sync --files-from` would
             // consider only the listed names and prune everything else at
@@ -1556,6 +1582,7 @@ mod tests {
                 Operation::MoveBatch {
                     src_root: NavPath::new("C:\\src").unwrap(),
                     list_file: PathBuf::from("C:\\tmp\\list.txt"),
+                    names: Vec::new(),
                     dest_dir: NavPath::new("C:\\dst").unwrap(),
                     mode,
                 }
@@ -1563,6 +1590,7 @@ mod tests {
                 Operation::CopyBatch {
                     src_root: NavPath::new("C:\\src").unwrap(),
                     list_file: PathBuf::from("C:\\tmp\\list.txt"),
+                    names: Vec::new(),
                     dest_dir: NavPath::new("C:\\dst").unwrap(),
                     mode,
                 }

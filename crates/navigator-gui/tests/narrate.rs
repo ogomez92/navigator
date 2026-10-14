@@ -58,6 +58,7 @@ fn a_real_batch_copy_narrates_monotonic_progress() {
         .spawn(Operation::CopyBatch {
             src_root: NavPath::new(src_dir.path().to_path_buf()).unwrap(),
             list_file: list.clone(),
+            names: Vec::new(),
             dest_dir: NavPath::new(dst_dir.path().to_path_buf()).unwrap(),
             mode: ConflictMode::Update,
         })

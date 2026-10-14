@@ -52,6 +52,7 @@ const ID_EDIT_INTERVAL: u16 = 300;
 const ID_CHECK_PROG: u16 = 700;
 const ID_EDIT_TRANSFERS: u16 = 701;
 const ID_COMBO_CONFLICT: u16 = 702;
+const ID_CHECK_ROBOCOPY: u16 = 703;
 const ID_CHECK_EXTRACT_DELETE: u16 = 800;
 const ID_CHECK_EXTRACT_FOLDER: u16 = 801;
 const ID_LIST_PLUGINS: u16 = 400;
@@ -545,12 +546,14 @@ struct RcloneData {
     check_prog: HWND,
     edit_transfers: HWND,
     combo_conflict: HWND,
+    check_robocopy: HWND,
 }
 
 /// Modes offered as the *default* for a plain paste. Mirror is deliberately
 /// absent: it deletes destination files the user never selected, so it is
-/// reachable only from Paste special where the choice is explicit. A
-/// hand-edited `config.toml` that sets it is still honoured.
+/// only ever an explicit per-paste choice (Paste special, or the Mirror…
+/// button on a Ctrl+V conflict prompt). A hand-edited `config.toml` that
+/// sets it is still honoured.
 const DEFAULT_CONFLICT_MODES: [ConflictMode; 3] = [
     ConflictMode::AddNewOnly,
     ConflictMode::Update,
@@ -625,7 +628,16 @@ unsafe extern "system" fn page_rclone_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp
                 430,
             );
 
+            let check_robocopy = create_checkbox(
+                hwnd,
+                "Use &robocopy for copies between local drives and network shares",
+                12,
+                224,
+                ID_CHECK_ROBOCOPY,
+            );
+
             apply_font_to(check_prog);
+            apply_font_to(check_robocopy);
             apply_font_to(lbl);
             apply_font_to(edit_transfers);
             apply_font_to(lbl_conflict);
@@ -634,6 +646,7 @@ unsafe extern "system" fn page_rclone_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp
             apply_font_to(lbl_hint2);
 
             set_check(check_prog, r.progress_window);
+            set_check(check_robocopy, r.robocopy);
             set_text(edit_transfers, &r.transfers_clamped().to_string());
 
             let data = Box::new(RcloneData {
@@ -641,6 +654,7 @@ unsafe extern "system" fn page_rclone_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp
                 check_prog,
                 edit_transfers,
                 combo_conflict,
+                check_robocopy,
             });
             SetWindowLongPtrW(hwnd, DWLP_USER, Box::into_raw(data) as isize);
             1
@@ -652,6 +666,7 @@ unsafe extern "system" fn page_rclone_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp
                 if raw != 0 {
                     let d = &mut *(raw as *mut RcloneData);
                     let prog = get_check(d.check_prog);
+                    let robocopy = get_check(d.check_robocopy);
                     // Fall back to the current configured value if the
                     // edit is empty or unparseable so a stray keystroke
                     // can't silently reset the setting to 1.
@@ -669,6 +684,7 @@ unsafe extern "system" fn page_rclone_proc(hwnd: HWND, msg: u32, _wp: WPARAM, lp
                     d.state.config.with_mut(|c| {
                         c.rclone.progress_window = prog;
                         c.rclone.transfers = entered;
+                        c.rclone.robocopy = robocopy;
                         if let Some(m) = mode {
                             c.rclone.on_conflict = m;
                         }

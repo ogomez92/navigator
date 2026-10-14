@@ -14,11 +14,16 @@
 //! `--dry-run` passes and diffs them to find which existing destinations
 //! the chosen mode would actually destroy, so the UI can confirm only when
 //! data is genuinely at risk.
+//!
+//! Transfers between two filesystem paths (local drives, UNC shares) run
+//! on robocopy instead — see [`robocopy`]. It speaks the same
+//! [`op::OpEvent`] stream, so callers only choose which driver to spawn.
 
 pub mod encoding;
 pub mod error;
 pub mod log;
 pub mod op;
+pub mod robocopy;
 
 pub use encoding::{to_standard_name, to_standard_path};
 pub use error::{ErrorCollector, ErrorKind, RcloneError};
@@ -27,3 +32,4 @@ pub use op::{
     Canceller, ConflictReport, OpHandle, Operation, PreflightReport, Progress, RcloneDriver,
     RemoteSize, RemoteStat, RemoteTreeItem, kill_child_with_process, victims,
 };
+pub use robocopy::RobocopyDriver;

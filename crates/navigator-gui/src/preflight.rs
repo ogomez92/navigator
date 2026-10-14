@@ -9,9 +9,13 @@
 //!   actually be destroyed — see [`prompt_conflicts`]. A purely additive
 //!   paste never shows a dialog.
 //! * **Ctrl+Shift+V** (Paste special) always asks, offering every mode as a
-//!   radio group — see [`prompt_mode`]. This is the only route to
-//!   [`ConflictMode::Mirror`], which deletes destination files the user
-//!   never selected.
+//!   radio group — see [`prompt_mode`].
+//!
+//! [`ConflictMode::Mirror`] deletes destination files the user never
+//! selected, so it is never a default and never one keystroke away. It is
+//! reached from Paste special, or from the **Mirror…** button on the
+//! Ctrl+V prompt — which only opens [`confirm_mirror`], listing what would
+//! be deleted with Back as the default.
 //!
 //! Requires ComCtl32 v6; the binary's manifest declares the dependency so
 //! `TaskDialogIndirect` is always available at runtime.
@@ -45,9 +49,22 @@ pub enum PasteChoice {
     Cancel,
 }
 
+/// What the Ctrl+V conflict prompt answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictAnswer {
+    /// A final choice.
+    Choose(PasteChoice),
+    /// The user pressed Mirror…: check what a mirror would delete and ask
+    /// again with that list. Never a decision to mirror by itself.
+    ReviewMirror,
+}
+
 const ID_PROCEED: i32 = 1001;
 const ID_ADD_NEW_ONLY: i32 = 1002;
 const ID_KEEP_BOTH: i32 = 1003;
+const ID_MIRROR: i32 = 1004;
+const ID_MIRROR_GO: i32 = 1005;
+const ID_BACK: i32 = 1006;
 
 const ID_RADIO_BASE: i32 = 2001;
 /// Radio id for the Keep-both row, which is not a [`ConflictMode`] and so
@@ -120,13 +137,18 @@ pub fn conflict_candidates(sources: &[NavPath], dest_dir: &NavPath) -> Vec<NavPa
 ///
 /// `overwrites` and `deletes` are the destination paths at risk, already
 /// stringified by the caller (which knows how to render remote paths).
+///
+/// `mirror_offered` adds a **Mirror…** button, last and never the default.
+/// It answers [`ConflictAnswer::ReviewMirror`]; the caller then runs the
+/// mirror dry-run and [`confirm_mirror`].
 pub fn prompt_conflicts(
     parent: Option<HwndSend>,
     mode: ConflictMode,
     overwrites: &[String],
     deletes: &[String],
     keep_both_offered: bool,
-) -> PasteChoice {
+    mirror_offered: bool,
+) -> ConflictAnswer {
     let title_w = wide("Paste");
     let heading = match (overwrites.len(), deletes.len()) {
         (n, 0) => format!("{} will replace {} existing item(s).", mode.label(), n),
@@ -166,6 +188,8 @@ pub fn prompt_conflicts(
     ));
     let add_new_w = wide("Add new only\nLeave everything that already exists untouched");
     let keep_both_w = wide("Keep both\nGive each conflicting item a new numbered name");
+    let mirror_w =
+        wide("Mirror…\nMake the destination match the source. Shows what would be deleted first");
 
     let mut buttons = vec![
         TASKDIALOG_BUTTON {
@@ -181,6 +205,12 @@ pub fn prompt_conflicts(
         buttons.push(TASKDIALOG_BUTTON {
             nButtonID: ID_KEEP_BOTH,
             pszButtonText: PCWSTR(keep_both_w.as_ptr()),
+        });
+    }
+    if mirror_offered {
+        buttons.push(TASKDIALOG_BUTTON {
+            nButtonID: ID_MIRROR,
+            pszButtonText: PCWSTR(mirror_w.as_ptr()),
         });
     }
 
@@ -222,14 +252,100 @@ pub fn prompt_conflicts(
     if rc.is_err() {
         // API failure — treat as Cancel so a broken dialog can never
         // silently green-light a destructive paste.
-        return PasteChoice::Cancel;
+        return ConflictAnswer::Choose(PasteChoice::Cancel);
     }
-    match button {
+    ConflictAnswer::Choose(match button {
         ID_PROCEED => PasteChoice::Mode(mode),
         ID_ADD_NEW_ONLY => PasteChoice::Mode(ConflictMode::AddNewOnly),
         ID_KEEP_BOTH => PasteChoice::KeepBoth,
+        ID_MIRROR => return ConflictAnswer::ReviewMirror,
         _ => PasteChoice::Cancel,
+    })
+}
+
+/// Heading and body of the Mirror confirmation. Pure so the wording —
+/// above all, that deletions are named and come first — is testable.
+pub fn mirror_confirm_text(overwrites: &[String], deletes: &[String]) -> (String, String) {
+    let heading = match (overwrites.len(), deletes.len()) {
+        (0, 0) => "Mirror would not replace or delete anything.".to_string(),
+        (n, 0) => format!("Mirror will replace {n} item(s) and delete nothing."),
+        (0, d) => format!("Mirror will delete {d} item(s) at the destination."),
+        (n, d) => {
+            format!("Mirror will delete {d} item(s) and replace {n} item(s) at the destination.")
+        }
+    };
+    let mut body = String::new();
+    if !deletes.is_empty() {
+        body.push_str("These exist only at the destination and will be deleted:\n");
+        body.push_str(&summarize_paths(deletes));
     }
+    if !overwrites.is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("These will be replaced:\n");
+        body.push_str(&summarize_paths(overwrites));
+    }
+    if overwrites.is_empty() && deletes.is_empty() {
+        body.push_str("The destination already matches, apart from new items to copy.");
+    } else {
+        body.push_str("\nDeleted and replaced items are not recoverable.");
+    }
+    (heading, body)
+}
+
+/// Second step of the Mirror… button: the mirror dry-run's findings, and
+/// a deliberate yes. Defaults to **Back**; Cancel and Esc are Back too.
+pub fn confirm_mirror(parent: Option<HwndSend>, overwrites: &[String], deletes: &[String]) -> bool {
+    let (heading, body) = mirror_confirm_text(overwrites, deletes);
+    let title_w = wide("Mirror");
+    let heading_w = wide(&heading);
+    let body_w = wide(&body);
+    let go_w = wide(&format!(
+        "Mirror\nDelete {} and replace {} item(s)",
+        deletes.len(),
+        overwrites.len()
+    ));
+    let back_w = wide("Back\nReturn to the paste choices");
+    let buttons = [
+        TASKDIALOG_BUTTON {
+            nButtonID: ID_MIRROR_GO,
+            pszButtonText: PCWSTR(go_w.as_ptr()),
+        },
+        TASKDIALOG_BUTTON {
+            nButtonID: ID_BACK,
+            pszButtonText: PCWSTR(back_w.as_ptr()),
+        },
+    ];
+    let config = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: parent.map(|h| h.0).unwrap_or_default(),
+        hInstance: Default::default(),
+        dwFlags: TASKDIALOG_FLAGS(0) | TDF_POSITION_RELATIVE_TO_WINDOW | TDF_USE_COMMAND_LINKS,
+        dwCommonButtons: TDCBF_CANCEL_BUTTON,
+        pszWindowTitle: PCWSTR(title_w.as_ptr()),
+        Anonymous1: TASKDIALOGCONFIG_0::default(),
+        pszMainInstruction: PCWSTR(heading_w.as_ptr()),
+        pszContent: PCWSTR(body_w.as_ptr()),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: ID_BACK,
+        cRadioButtons: 0,
+        pRadioButtons: std::ptr::null(),
+        nDefaultRadioButton: 0,
+        pszVerificationText: PCWSTR::null(),
+        pszExpandedInformation: PCWSTR::null(),
+        pszExpandedControlText: PCWSTR::null(),
+        pszCollapsedControlText: PCWSTR::null(),
+        Anonymous2: TASKDIALOGCONFIG_1::default(),
+        pszFooter: PCWSTR::null(),
+        pfCallback: None,
+        lpCallbackData: 0,
+        cxWidth: 0,
+    };
+    let mut button = 0i32;
+    let rc = unsafe { TaskDialogIndirect(&config, Some(&mut button), None, None) };
+    rc.is_ok() && button == ID_MIRROR_GO
 }
 
 /// Paste special: pick the mode up front. `allow_mirror` is false for a cut
@@ -382,6 +498,35 @@ pub fn paste_summary(
         msg.push_str(&format!(", {} skipped", skipped));
     }
     msg
+}
+
+/// The sentence a move adds when some of what it was asked to move is
+/// still in the source. `None` when everything left.
+///
+/// A mode that protects a destination also keeps that item's *source*:
+/// robocopy's move never deletes a file it chose not to copy. That is
+/// deliberate — rclone's `move --update` deletes the skipped source, which
+/// destroys the only copy of that version without a word — but it means a
+/// move can finish "done" with files still where they were, and a user
+/// who can't see the folder needs telling, and telling why.
+pub fn left_behind(mode: Option<ConflictMode>, count: usize) -> Option<String> {
+    if count == 0 {
+        return None;
+    }
+    let items = if count == 1 {
+        "1 item".to_string()
+    } else {
+        format!("{count} items")
+    };
+    Some(match mode {
+        Some(ConflictMode::Update) => {
+            format!("{items} stayed in the source folder: the destination already has newer copies")
+        }
+        Some(ConflictMode::AddNewOnly) => {
+            format!("{items} stayed in the source folder: they already exist at the destination")
+        }
+        _ => format!("{items} stayed in the source folder"),
+    })
 }
 
 /// Given a destination path that may or may not already exist, produce a

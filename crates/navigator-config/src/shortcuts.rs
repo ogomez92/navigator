@@ -51,8 +51,9 @@ pub enum InternalCommand {
     AppendCut,
     Paste,
     /// Paste, but choose the conflict mode first instead of using the
-    /// configured default. The only route to Mirror (`rclone sync`), which
-    /// deletes destination files the user never selected.
+    /// configured default. One of the two routes to Mirror (the other is
+    /// the Mirror… button on a Ctrl+V conflict prompt), which deletes
+    /// destination files the user never selected.
     PasteSpecial,
     CopyPaths,
     Delete,

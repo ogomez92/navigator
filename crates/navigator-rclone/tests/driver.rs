@@ -780,6 +780,7 @@ fn copy_batch_transfers_every_listed_file() {
         Operation::CopyBatch {
             src_root: nav(src.path()),
             list_file: list_file(lst.path(), &all),
+            names: Vec::new(),
             dest_dir: nav(dst.path()),
             mode: ConflictMode::Update,
         },
@@ -821,6 +822,7 @@ fn files_from_silently_ignores_directories() {
         Operation::CopyBatch {
             src_root: nav(src.path()),
             list_file: list_file(lst.path(), &["keep.txt", "adir"]),
+            names: Vec::new(),
             dest_dir: nav(dst.path()),
             mode: ConflictMode::Update,
         },
@@ -858,6 +860,7 @@ fn move_batch_removes_sources() {
         Operation::MoveBatch {
             src_root: nav(src.path()),
             list_file: list_file(lst.path(), &["a.txt", "b.txt"]),
+            names: Vec::new(),
             dest_dir: nav(dst.path()),
             mode: ConflictMode::Update,
         },
@@ -889,6 +892,7 @@ fn batch_honours_add_new_only() {
         Operation::CopyBatch {
             src_root: nav(src.path()),
             list_file: list_file(lst.path(), &["keep.txt", "fresh.txt"]),
+            names: Vec::new(),
             dest_dir: nav(dst.path()),
             mode: ConflictMode::AddNewOnly,
         },
@@ -927,6 +931,7 @@ fn batch_conflict_detection_finds_overwrites() {
         .conflicts(&Operation::CopyBatch {
             src_root: nav(src.path()),
             list_file: list_file(lst.path(), &["differs.txt", "brandnew.txt"]),
+            names: Vec::new(),
             dest_dir: nav(dst.path()),
             mode: ConflictMode::Update,
         })

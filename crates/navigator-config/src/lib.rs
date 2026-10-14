@@ -158,6 +158,12 @@ pub struct Rclone {
     /// a hand-edited config that sets it only affects which radio Paste
     /// special pre-selects.
     pub on_conflict: ConflictMode,
+    /// Run copies and moves between two filesystem paths (local drives,
+    /// UNC shares) on Windows' robocopy instead of rclone. Remotes always
+    /// use rclone, as do renames, deletes and a move within one drive
+    /// (rclone renames; robocopy would copy every byte). `transfers` feeds
+    /// robocopy's `/MT:n` too. Off = everything on rclone, as before.
+    pub robocopy: bool,
 }
 
 impl Default for Rclone {
@@ -166,6 +172,7 @@ impl Default for Rclone {
             progress_window: false,
             transfers: 8,
             on_conflict: ConflictMode::Update,
+            robocopy: true,
         }
     }
 }

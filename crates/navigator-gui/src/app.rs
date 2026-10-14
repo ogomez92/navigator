@@ -16,7 +16,7 @@ use navigator_config::{ConfigHandle, SoundEvent};
 use navigator_core::{ConflictMode, NavPath};
 use navigator_fs::read_dir;
 use navigator_plugin_api::host::HostCallbacks;
-use navigator_rclone::{Operation, RcloneDriver, op::OpEvent};
+use navigator_rclone::{Operation, RcloneDriver, RobocopyDriver, op::OpEvent};
 
 use crate::plugins::{Host as PluginHost, PluginRegistry};
 use crate::remote_cache::RemoteCache;
@@ -1364,8 +1364,9 @@ impl AppState {
 
     /// Paste special (Ctrl+Shift+V): ask for the conflict mode up front,
     /// then paste in it without the after-the-fact confirmation — the user
-    /// has already made the destructive choice explicitly. Mirror is only
-    /// reachable from here, and only for a copy clipboard.
+    /// has already made the destructive choice explicitly. Mirror is
+    /// offered here for a copy clipboard; the only other route is the
+    /// Mirror… button on a Ctrl+V conflict prompt, which confirms first.
     pub fn op_paste_special(&self) {
         let Some(dest) = self.model.cwd() else {
             return;
@@ -2144,12 +2145,13 @@ impl AppState {
     /// of the closure so we don't leak `Arc<Self>` into threads that only
     /// need to speak + spawn rclone.
     fn clone_for_worker(&self) -> WorkerCtx {
-        let (progress_on, announce_interval_secs, transfers) = {
+        let (progress_on, announce_interval_secs, transfers, robocopy) = {
             let g = self.config.read();
             (
                 g.rclone.progress_window,
                 g.general.announce_interval_secs,
                 g.rclone.transfers_clamped(),
+                g.rclone.robocopy,
             )
         };
         let progress = if progress_on {
@@ -2162,6 +2164,7 @@ impl AppState {
         // without needing to restart the app.
         WorkerCtx {
             rclone: self.rclone.clone().with_transfers(transfers),
+            robocopy: robocopy.then(|| RobocopyDriver::from_path().with_threads(transfers)),
             speech: self.speech.handle(),
             sound: self.sound.clone(),
             refresh_target: self.model.cwd(),
@@ -3478,6 +3481,11 @@ fn post_viewer(hwnd: HwndSend, title: String, body: String) {
 #[derive(Clone)]
 struct WorkerCtx {
     rclone: RcloneDriver,
+    /// The engine for transfers between two filesystem paths, `None` when
+    /// `[rclone] robocopy = false`. Which ops it takes is
+    /// [`RobocopyDriver::handles`]; everything else stays on `rclone`. See
+    /// [`WorkerCtx::spawn_transfer`].
+    robocopy: Option<RobocopyDriver>,
     speech: Sender<crate::speech::Utterance>,
     /// Event sounds. Carried by value like the speech sender so a worker
     /// never has to upgrade the `Weak<AppState>` just to chime.
@@ -3848,6 +3856,11 @@ impl WorkerCtx {
     /// collisions returns immediately without spawning rclone at all — and
     /// a non-destructive mode never needs to ask. Dry-run passes are paid
     /// for only on the handful of items that genuinely collide.
+    ///
+    /// The prompt can also offer **Mirror…**, which never runs straight
+    /// from that button: it re-checks the destination as a mirror and puts
+    /// what would be deleted in front of the user first, defaulting to
+    /// Back. See [`Self::review_mirror`].
     fn resolve_conflicts(
         &self,
         sources: &[NavPath],
@@ -3855,7 +3868,9 @@ impl WorkerCtx {
         cut: bool,
         mode: ConflictMode,
     ) -> crate::preflight::PasteChoice {
-        use crate::preflight::{PasteChoice, conflict_candidates, prompt_conflicts};
+        use crate::preflight::{
+            ConflictAnswer, PasteChoice, conflict_candidates, prompt_conflicts,
+        };
 
         if !mode.is_destructive() {
             return PasteChoice::Mode(mode);
@@ -3865,17 +3880,106 @@ impl WorkerCtx {
             return PasteChoice::Mode(mode);
         }
 
-        let mut overwrites: Vec<String> = Vec::new();
-        let mut deletes: Vec<String> = Vec::new();
-        // If detection itself fails we must not assume "no conflict" — fall
-        // back to naming the colliding top-level items, which we know exist.
-        let mut detection_failed = false;
-
         // We are about to spawn dry-runs, and rclone has to scan both trees
         // before either answers. On a large or remote paste that is seconds
         // of silence between Ctrl+V and anything happening, which reads as
         // a dropped keystroke — say what we're waiting for.
         self.say("checking destination", false);
+
+        let found = self.detect_conflicts(&candidates, dest_dir, cut, mode);
+        // If detection itself fails we must not assume "no conflict" — fall
+        // back to naming the colliding top-level items, which we know exist.
+        let mut overwrites = found.overwrites;
+        if found.failed && overwrites.is_empty() {
+            overwrites = candidates
+                .iter()
+                .map(|s| s.file_name().to_string())
+                .collect();
+        }
+        if overwrites.is_empty() && found.deletes.is_empty() {
+            // Everything that collides is either identical or protected by
+            // the mode (e.g. a newer destination under Update). Nothing to
+            // warn about — run without a dialog.
+            return PasteChoice::Mode(mode);
+        }
+
+        // Mirror only means something for a folder pasted onto an existing
+        // one: on a file it is just Replace, and a move has no mirror.
+        let mirror_offered =
+            !cut && mode != ConflictMode::Mirror && candidates.iter().any(|s| self.path_is_dir(s));
+
+        loop {
+            match prompt_conflicts(
+                self.hwnd,
+                mode,
+                &overwrites,
+                &found.deletes,
+                // Keep-both needs a true existence check to pick `foo (1)`,
+                // and `unique_numbered_path` can only probe the local
+                // filesystem. On a remote destination it would return the
+                // name unchanged and the item would quietly fall through to
+                // an additive copy (i.e. skip) instead of keeping both — so
+                // don't offer it there.
+                /*keep_both_offered=*/
+                !dest_dir.is_remote(),
+                mirror_offered,
+            ) {
+                ConflictAnswer::Choose(choice) => return choice,
+                ConflictAnswer::ReviewMirror => {
+                    if self.review_mirror(&candidates, dest_dir) {
+                        return PasteChoice::Mode(ConflictMode::Mirror);
+                    }
+                    // Back: the first question again, unchanged.
+                }
+            }
+        }
+    }
+
+    /// The Mirror… button. Runs the mirror dry-run over the colliding
+    /// items and asks, listing everything that would be replaced and
+    /// deleted. `true` only on an explicit confirm.
+    ///
+    /// A failed check never confirms: Mirror's whole risk is the deletion
+    /// list, and a dialog that cannot show it must not offer to proceed.
+    fn review_mirror(&self, candidates: &[NavPath], dest_dir: &NavPath) -> bool {
+        self.say("checking what mirror would delete", false);
+        let found = self.detect_conflicts(candidates, dest_dir, false, ConflictMode::Mirror);
+        if found.failed {
+            self.say("could not check what mirror would delete", true);
+            crate::dialogs::show_error(
+                self.hwnd,
+                "Mirror",
+                "Could not work out what Mirror would delete at the destination, so it was not started.",
+            );
+            return false;
+        }
+        crate::preflight::confirm_mirror(self.hwnd, &found.overwrites, &found.deletes)
+    }
+
+    /// The mode one item actually runs in. Mirror applies to a folder; on
+    /// a file it means Replace — `rclone sync a.txt dst\a.txt` fails
+    /// outright, and robocopy degrades it the same way.
+    fn item_mode(&self, mode: ConflictMode, src: &NavPath) -> ConflictMode {
+        if mode == ConflictMode::Mirror && !self.path_is_dir(src) {
+            ConflictMode::Replace
+        } else {
+            mode
+        }
+    }
+
+    /// Dry-run `candidates` under `mode` on the engine that will run the
+    /// paste, and name what it would replace and delete.
+    fn detect_conflicts(
+        &self,
+        candidates: &[NavPath],
+        dest_dir: &NavPath,
+        cut: bool,
+        mode: ConflictMode,
+    ) -> DetectedConflicts {
+        let mut overwrites: Vec<String> = Vec::new();
+        let mut deletes: Vec<String> = Vec::new();
+        // A check that fails is reported, never read as "no conflict".
+        let mut detection_failed = false;
 
         // Detection is two dry-run spawns per operation, so it has to batch
         // for the same reason the transfer does: overwriting 200 files would
@@ -3886,7 +3990,7 @@ impl WorkerCtx {
         let part = if mode == ConflictMode::Mirror {
             crate::batch::Partition {
                 groups: Vec::new(),
-                singles: candidates.clone(),
+                singles: candidates.to_vec(),
             }
         } else {
             // Must be `path_is_dir`, not `as_path().is_dir()`: the latter
@@ -3895,7 +3999,7 @@ impl WorkerCtx {
             // silently — detection would report no conflicts and the real
             // (correctly per-item) run would then overwrite the folder's
             // contents with no dialog. Same predicate as `run_batch`.
-            crate::batch::partition(&candidates, |s| self.path_is_dir(s))
+            crate::batch::partition(candidates, |s| self.path_is_dir(s))
         };
 
         for group in &part.groups {
@@ -3908,6 +4012,7 @@ impl WorkerCtx {
                 Operation::MoveBatch {
                     src_root: group.src_root.clone(),
                     list_file: list.path().to_path_buf(),
+                    names: group.names.clone(),
                     dest_dir: dest_dir.clone(),
                     mode,
                 }
@@ -3915,12 +4020,13 @@ impl WorkerCtx {
                 Operation::CopyBatch {
                     src_root: group.src_root.clone(),
                     list_file: list.path().to_path_buf(),
+                    names: group.names.clone(),
                     dest_dir: dest_dir.clone(),
                     mode,
                 }
             };
-            match self.rclone.conflicts(&op) {
-                Ok(report) => {
+            match self.conflicts_for(&op) {
+                Ok((report, rclone_names)) => {
                     // With --files-from the reported objects are the listed
                     // names themselves, so they need no prefixing — but the
                     // list was written in rclone's namespace, so rclone
@@ -3936,8 +4042,14 @@ impl WorkerCtx {
                         .iter()
                         .map(|n| (navigator_rclone::to_standard_name(n), n))
                         .collect();
+                    //
+                    // robocopy needs none of this: it was handed, and
+                    // answers with, the OS names themselves.
                     let render = |p: &std::path::PathBuf| -> String {
                         let reported = p.to_string_lossy().into_owned();
+                        if !rclone_names {
+                            return reported;
+                        }
                         os_name
                             .get(&reported)
                             .map(|n| (*n).clone())
@@ -3954,6 +4066,7 @@ impl WorkerCtx {
         }
 
         for src in &part.singles {
+            let mode = self.item_mode(mode, src);
             let op = if cut {
                 Operation::Move {
                     sources: vec![src.clone()],
@@ -3967,9 +4080,9 @@ impl WorkerCtx {
                     mode,
                 }
             };
-            match self.rclone.conflicts(&op) {
-                Ok(report) => {
-                    // rclone reports destination-relative object paths: the
+            match self.conflicts_for(&op) {
+                Ok((report, _)) => {
+                    // Both engines report destination-relative paths: the
                     // bare filename for a single-file copy, or a path inside
                     // the tree for a directory copy. Prefix the latter so the
                     // dialog shows where the file actually lives.
@@ -3993,31 +4106,11 @@ impl WorkerCtx {
             }
         }
 
-        if detection_failed && overwrites.is_empty() {
-            overwrites = candidates
-                .iter()
-                .map(|s| s.file_name().to_string())
-                .collect();
+        DetectedConflicts {
+            overwrites,
+            deletes,
+            failed: detection_failed,
         }
-        if overwrites.is_empty() && deletes.is_empty() {
-            // Everything that collides is either identical or protected by
-            // the mode (e.g. a newer destination under Update). Nothing to
-            // warn about — run without a dialog.
-            return PasteChoice::Mode(mode);
-        }
-        prompt_conflicts(
-            self.hwnd,
-            mode,
-            &overwrites,
-            &deletes,
-            // Keep-both needs a true existence check to pick `foo (1)`, and
-            // `unique_numbered_path` can only probe the local filesystem. On
-            // a remote destination it would return the name unchanged and
-            // the item would quietly fall through to an additive copy (i.e.
-            // skip) instead of keeping both — so don't offer it there.
-            /*keep_both_offered=*/
-            !dest_dir.is_remote(),
-        )
     }
 
     /// Copy or move one batchable group in a single rclone invocation.
@@ -4067,6 +4160,7 @@ impl WorkerCtx {
             Operation::MoveBatch {
                 src_root: group.src_root.clone(),
                 list_file: list.path().to_path_buf(),
+                names: group.names.clone(),
                 dest_dir: dest_dir.clone(),
                 mode,
             }
@@ -4074,6 +4168,7 @@ impl WorkerCtx {
             Operation::CopyBatch {
                 src_root: group.src_root.clone(),
                 list_file: list.path().to_path_buf(),
+                names: group.names.clone(),
                 dest_dir: dest_dir.clone(),
                 mode,
             }
@@ -4155,6 +4250,13 @@ impl WorkerCtx {
         plan.publish(undo_created, undo_originals);
 
         let total = sources.len();
+        // Kept for the after-the-fact check of what a move left behind;
+        // `sources` itself is consumed by the batching below.
+        let moved_from: Vec<NavPath> = if cut {
+            sources.iter().filter(|s| !s.is_remote()).cloned().collect()
+        } else {
+            Vec::new()
+        };
         let mut failed = 0u32;
         let mut skipped = 0u32;
         let mut renamed = 0u32;
@@ -4205,18 +4307,26 @@ impl WorkerCtx {
 
         // Collapse plain file copies into one `--files-from` invocation per
         // source folder. Skipped entirely for Keep-both (every item needs
-        // its own renamed destination) and for Mirror (`sync --files-from`
-        // would prune everything unlisted at the destination). Directories
-        // always stay per-item: `--files-from` ignores them silently.
+        // its own renamed destination). Directories always stay per-item:
+        // `--files-from` ignores them silently — and they are the only
+        // thing Mirror mirrors, so the files batched here run as Replace,
+        // never as `sync --files-from`, which would prune everything
+        // unlisted at the destination.
         let sources = match mode {
-            Some(m) if m != ConflictMode::Mirror => {
+            Some(m) => {
+                let file_mode = if m == ConflictMode::Mirror {
+                    ConflictMode::Replace
+                } else {
+                    m
+                };
                 let part = crate::batch::partition(&sources, |s| self.path_is_dir(s));
                 for group in &part.groups {
                     if prog.cancelled() {
                         break;
                     }
                     let n = group.names.len();
-                    let (ok, first) = self.run_group(group, &dest_dir, cut, m, total, &mut prog);
+                    let (ok, first) =
+                        self.run_group(group, &dest_dir, cut, file_mode, total, &mut prog);
                     if ok {
                         if first_created.is_none() {
                             first_created = first;
@@ -4286,6 +4396,7 @@ impl WorkerCtx {
                     (op, dst_name)
                 }
                 Some(m) => {
+                    let m = self.item_mode(m, &src);
                     let op = if cut {
                         Operation::Move {
                             sources: vec![src],
@@ -4332,10 +4443,17 @@ impl WorkerCtx {
         }
         prog.finish(failed == 0);
         self.play_outcome(/*cancelled=*/ false, failed > 0, done);
-        self.say(
-            crate::preflight::paste_summary(mode, total, failed, skipped, renamed),
-            failed > 0,
-        );
+        let mut summary = crate::preflight::paste_summary(mode, total, failed, skipped, renamed);
+        // Only on a clean run: after a failure the failed items are still
+        // in the source too, and the failure report already names them.
+        // One stat per selected item, on this worker.
+        if failed == 0 {
+            let left = moved_from.iter().filter(|s| s.as_path().exists()).count();
+            if let Some(more) = crate::preflight::left_behind(mode, left) {
+                summary = format!("{summary}. {more}");
+            }
+        }
+        self.say(summary, failed > 0);
         self.refresh_with_focus(first_created);
     }
 
@@ -4680,6 +4798,43 @@ impl WorkerCtx {
     /// an `rclone lsjson --stat`. Defaults to `false` (treat as a file)
     /// when the remote stat can't answer — a wrong guess just surfaces
     /// rclone's own "is a file/directory" error rather than mis-deleting.
+    /// The robocopy driver, if it should run `op`.
+    fn robocopy_for(&self, op: &Operation) -> Option<&RobocopyDriver> {
+        self.robocopy
+            .as_ref()
+            .filter(|_| RobocopyDriver::handles(op))
+    }
+
+    /// Start `op` on whichever engine runs it. A robocopy that won't start
+    /// falls back to rclone rather than failing the paste — both engines
+    /// carry out the same `Operation`.
+    fn spawn_transfer(&self, op: Operation) -> std::io::Result<navigator_rclone::OpHandle> {
+        if let Some(rc) = self.robocopy_for(&op) {
+            match rc.spawn(op.clone()) {
+                Ok(h) => return Ok(h),
+                Err(e) => tracing::warn!("robocopy did not start ({e}); using rclone"),
+            }
+        }
+        self.rclone.spawn(op)
+    }
+
+    /// Conflict report from the engine that will run `op`, so the dialog
+    /// describes what will actually happen. The bool is `true` when names
+    /// came back in rclone's namespace and need mapping back to the OS
+    /// names the user sees; robocopy reports OS names as they are.
+    fn conflicts_for(
+        &self,
+        op: &Operation,
+    ) -> std::io::Result<(navigator_rclone::ConflictReport, bool)> {
+        if let Some(rc) = self.robocopy_for(op) {
+            match rc.conflicts(op) {
+                Ok(r) => return Ok((r, false)),
+                Err(e) => tracing::warn!("robocopy conflict check failed ({e}); asking rclone"),
+            }
+        }
+        self.rclone.conflicts(op).map(|r| (r, true))
+    }
+
     fn path_is_dir(&self, p: &NavPath) -> bool {
         if !p.is_remote() {
             return p.as_path().is_dir();
@@ -4716,7 +4871,7 @@ impl WorkerCtx {
     /// progress-window preference.
     fn run_op(&self, op: Operation, prog: &mut OpProgress) -> bool {
         let op_for_retry = op.clone();
-        let handle = match self.rclone.spawn(op) {
+        let handle = match self.spawn_transfer(op) {
             Ok(h) => h,
             Err(e) => {
                 error!("rclone spawn: {e}");
@@ -4835,6 +4990,14 @@ impl WorkerCtx {
         }
         false
     }
+}
+
+/// What a conflict dry-run found, rendered for a dialog.
+struct DetectedConflicts {
+    overwrites: Vec<String>,
+    deletes: Vec<String>,
+    /// Some check failed, so the lists may be short.
+    failed: bool,
 }
 
 /// Present-tense verb for the progress window's caption. Used for one-off
