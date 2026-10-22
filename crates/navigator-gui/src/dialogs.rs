@@ -7,7 +7,8 @@
 use std::iter::once;
 
 use windows::Win32::UI::WindowsAndMessaging::{
-    IDCANCEL, IDNO, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNOCANCEL, MessageBoxW,
+    IDCANCEL, IDNO, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO,
+    MB_YESNOCANCEL, MessageBoxW,
 };
 use windows::core::PCWSTR;
 
@@ -55,6 +56,13 @@ pub fn ask_overwrite(parent: Option<HwndSend>, conflicts: &[NavPath]) -> Option<
 /// the "progress window" preference — failures should never go silent.
 pub fn show_error(parent: Option<HwndSend>, title: &str, body: &str) {
     msgbox(parent, title, body, MB_OK | MB_ICONWARNING);
+}
+
+/// Yes/No question, defaulting to Yes. For choices that cost the user a
+/// prompt or a wait, never for ones that destroy data — those default to
+/// No and live next to the code that owns them.
+pub fn ask_yes_no(parent: Option<HwndSend>, title: &str, body: &str) -> bool {
+    msgbox(parent, title, body, MB_YESNO | MB_ICONQUESTION) == IDYES.0
 }
 
 /// Plain informational OK dialog.

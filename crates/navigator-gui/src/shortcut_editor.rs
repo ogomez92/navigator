@@ -409,6 +409,22 @@ const PRESETS: &[Preset] = &[
         args: &[],
         single: false,
     },
+    Preset {
+        label: "Built-in: Permanent delete (no trash, no undo)",
+        name: "Permanent delete",
+        internal: Some(InternalCommand::PermanentDelete),
+        command: "",
+        args: &[],
+        single: false,
+    },
+    Preset {
+        label: "Built-in: Eject drive (This PC)",
+        name: "Eject drive",
+        internal: Some(InternalCommand::EjectDrive),
+        command: "",
+        args: &[],
+        single: false,
+    },
     // External launch templates.
     Preset {
         label: "Open in Terminal",

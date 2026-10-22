@@ -162,6 +162,15 @@ pub enum InternalCommand {
     /// on a row. Works on local paths, UNC shares and rclone remotes.
     /// Default chord: Ctrl+Shift+S.
     SpaceBreakdown,
+    /// Delete the selection for good — no `.trash` staging, no undo.
+    /// Always confirms first with a dialog that names every item and its
+    /// size (folders are walked on a worker to total them) and defaults
+    /// to No. Default chord: Ctrl+Shift+Delete.
+    PermanentDelete,
+    /// Eject the focused drive on This PC (lock → dismount → eject).
+    /// Anywhere else, or on a row that is not a drive, it announces an
+    /// error and does nothing. Default chord: Ctrl+Shift+E.
+    EjectDrive,
 }
 
 impl InternalCommand {
@@ -327,6 +336,12 @@ pub fn default_actions() -> Vec<ShortcutAction> {
             chord(false, false, true, "C"),
         ),
         internal("Extract archive", Extract, chord(true, false, false, "E")),
+        internal("Eject drive", EjectDrive, chord(true, true, false, "E")),
+        internal(
+            "Permanent delete",
+            PermanentDelete,
+            chord(true, true, false, "Delete"),
+        ),
         internal("Zip selection", Zip, chord(true, true, false, "Z")),
         internal("Backup", Backup, chord(true, true, false, "B")),
         internal(

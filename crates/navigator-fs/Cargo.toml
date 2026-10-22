@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 navigator-core = { workspace = true }
 thiserror      = { workspace = true }
+serde          = { workspace = true }
 tracing        = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

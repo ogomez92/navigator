@@ -116,7 +116,7 @@ pub fn run(driver: &RcloneDriver, op: &Operation) -> std::io::Result<Outcome> {
 /// space or quote, and escapes embedded backslashes preceding the
 /// closing quote. Without this, paths with spaces (`C:\Program Files`)
 /// would be split into two args by the elevated child's parser.
-fn quote_argv(argv: &[String]) -> String {
+pub(crate) fn quote_argv(argv: &[String]) -> String {
     let mut out = String::new();
     for (i, a) in argv.iter().enumerate() {
         if i > 0 {

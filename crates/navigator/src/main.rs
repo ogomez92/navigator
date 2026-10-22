@@ -24,6 +24,9 @@ fn main() -> anyhow_lite::Result<()> {
     if let Some(code) = navigator_gui::try_run_shell_op(&args) {
         std::process::exit(code);
     }
+    if let Some(code) = navigator_gui::try_run_drive_users_helper(&args) {
+        std::process::exit(code);
+    }
 
     let initial_path = match parse_args(&args) {
         ParsedArgs::Path(p) => p,

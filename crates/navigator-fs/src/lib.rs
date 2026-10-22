@@ -12,6 +12,12 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use navigator_core::{Entry, EntryKind, Error, FileTime, NavPath, Result};
+
+mod eject;
+pub use eject::{
+    DriveUser, EjectFailure, MAX_PATHS_PER_PROCESS, eject_volume, is_elevated,
+    processes_using_drive,
+};
 use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE,
 };

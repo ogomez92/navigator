@@ -309,6 +309,7 @@ name = "navigator-fs"
 version = "0.1.0"
 dependencies = [
  "navigator-core",
+ "serde",
  "tempfile",
  "thiserror",
  "tracing",

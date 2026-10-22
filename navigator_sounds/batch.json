@@ -1,0 +1,1183 @@
+{
+  "out_dir": "navigator_sounds",
+  "normalize": -12.0,
+  "max_loudness": -20.0,
+  "sounds": [
+    {
+      "out": "startup.wav",
+      "normalize": -14.0,
+      "duration": 0.75,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "solenoid",
+          "params": {
+            "size": 0.2,
+            "bounce": 0.3,
+            "thump": 0.6
+          },
+          "gain": 0.4
+        },
+        {
+          "type": "sfx",
+          "kind": "noise",
+          "params": {
+            "dur": 0.6,
+            "color": "brown"
+          },
+          "gain": 0.5,
+          "at": 0.05,
+          "fx": [
+            {
+              "type": "sweep",
+              "kind": "lowpass",
+              "start": 250,
+              "end": 2200,
+              "q": 1.0
+            },
+            {
+              "type": "fade",
+              "in": 0.05,
+              "out": 0.3
+            }
+          ]
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 3000
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "navigate.wav",
+      "duration": 0.12,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "click",
+          "params": {
+            "tone": 1200
+          },
+          "gain": 0.45
+        },
+        {
+          "type": "sfx",
+          "kind": "noise",
+          "params": {
+            "dur": 0.03,
+            "color": "brown"
+          },
+          "gain": 0.35,
+          "fx": [
+            {
+              "type": "lowpass",
+              "cutoff": 1200
+            }
+          ]
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 3500
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "navigate_up.wav",
+      "duration": 0.15,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "click",
+          "params": {
+            "tone": 900
+          },
+          "gain": 0.4
+        },
+        {
+          "type": "sfx",
+          "kind": "click",
+          "params": {
+            "tone": 1900
+          },
+          "gain": 0.4,
+          "at": 0.055
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 4000
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "back.wav",
+      "duration": 0.2,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "whoosh",
+          "params": {
+            "dur": 0.12,
+            "low": 500,
+            "high": 3000,
+            "direction": "down"
+          },
+          "gain": 0.4
+        },
+        {
+          "type": "sfx",
+          "kind": "click",
+          "params": {
+            "tone": 1000
+          },
+          "gain": 0.4,
+          "at": 0.1
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 4000
+        },
+        {
+          "type": "pan",
+          "pos": -0.5
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "forward.wav",
+      "duration": 0.2,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "whoosh",
+          "params": {
+            "dur": 0.12,
+            "low": 500,
+            "high": 3000,
+            "direction": "up"
+          },
+          "gain": 0.4
+        },
+        {
+          "type": "sfx",
+          "kind": "click",
+          "params": {
+            "tone": 1600
+          },
+          "gain": 0.4,
+          "at": 0.1
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 4000
+        },
+        {
+          "type": "pan",
+          "pos": 0.5
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "copy.wav",
+      "normalize": -13.0,
+      "duration": 0.25,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "click",
+          "params": {
+            "tone": 1800
+          },
+          "gain": 0.4
+        },
+        {
+          "type": "sfx",
+          "kind": "noise",
+          "params": {
+            "dur": 0.05,
+            "color": "pink"
+          },
+          "gain": 0.25,
+          "at": 0.01,
+          "fx": [
+            {
+              "type": "highpass",
+              "cutoff": 1500
+            }
+          ]
+        },
+        {
+          "type": "sfx",
+          "kind": "click",
+          "params": {
+            "tone": 1300
+          },
+          "gain": 0.35,
+          "at": 0.06
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 4000
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "cut.wav",
+      "normalize": -13.0,
+      "duration": 0.25,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "noise",
+          "params": {
+            "dur": 0.035,
+            "color": "white"
+          },
+          "gain": 0.3,
+          "fx": [
+            {
+              "type": "highpass",
+              "cutoff": 3000
+            }
+          ]
+        },
+        {
+          "type": "sfx",
+          "kind": "click",
+          "params": {
+            "tone": 2600
+          },
+          "gain": 0.4,
+          "at": 0.02
+        },
+        {
+          "type": "sfx",
+          "kind": "steel_ball",
+          "params": {
+            "surface": "metal",
+            "force": 0.3
+          },
+          "gain": 0.3,
+          "at": 0.05
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 5000
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "paste_start.wav",
+      "normalize": -13.0,
+      "duration": 0.35,
+      "layers": [
+        {
+          "type": "synth",
+          "inst": "fm_bass",
+          "notes": "C3",
+          "dur": 0.1,
+          "vel": 0.5,
+          "params": {
+            "bite": 0.5
+          }
+        },
+        {
+          "type": "sfx",
+          "kind": "noise",
+          "params": {
+            "dur": 0.08,
+            "color": "brown"
+          },
+          "gain": 0.4,
+          "fx": [
+            {
+              "type": "lowpass",
+              "cutoff": 900
+            }
+          ]
+        }
+      ],
+      "fx": [
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "copy_done.wav",
+      "duration": 0.5,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "noise",
+          "params": {
+            "dur": 0.32,
+            "color": "pink"
+          },
+          "gain": 0.3,
+          "fx": [
+            {
+              "type": "bandpass",
+              "center": 900,
+              "q": 1.2
+            },
+            {
+              "type": "tremolo",
+              "rate": 38,
+              "depth": 0.9,
+              "shape": "square"
+            }
+          ]
+        },
+        {
+          "type": "sfx",
+          "kind": "whoosh",
+          "params": {
+            "dur": 0.2,
+            "low": 500,
+            "high": 2500,
+            "direction": "up"
+          },
+          "gain": 0.3,
+          "at": 0.04
+        },
+        {
+          "type": "sfx",
+          "kind": "click",
+          "params": {
+            "tone": 1600
+          },
+          "gain": 0.3,
+          "repeat": 4,
+          "every": 0.08
+        },
+        {
+          "type": "sfx",
+          "kind": "solenoid",
+          "params": {
+            "size": 0.1,
+            "bounce": 0.4,
+            "thump": 0.5
+          },
+          "gain": 0.4,
+          "at": 0.34
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 3200
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "move_done.wav",
+      "normalize": -11.0,
+      "duration": 0.5,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "swoosh",
+          "params": {
+            "dur": 0.2
+          },
+          "gain": 0.4
+        },
+        {
+          "type": "sfx",
+          "kind": "steel_ball",
+          "params": {
+            "surface": "wood",
+            "force": 0.5
+          },
+          "gain": 0.6,
+          "at": 0.18
+        },
+        {
+          "type": "synth",
+          "inst": "fm_bass",
+          "notes": "C3",
+          "dur": 0.08,
+          "vel": 0.35,
+          "gain": 0.4,
+          "at": 0.18,
+          "params": {
+            "bite": 0.3
+          }
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 3000
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "delete_done.wav",
+      "duration": 0.4,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "noise",
+          "params": {
+            "dur": 0.15,
+            "color": "brown"
+          },
+          "gain": 0.5,
+          "fx": [
+            {
+              "type": "lowpass",
+              "cutoff": 900
+            }
+          ]
+        },
+        {
+          "type": "sfx",
+          "kind": "steel_ball",
+          "params": {
+            "surface": "plastic",
+            "force": 0.4
+          },
+          "gain": 0.5,
+          "at": 0.1
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 3000
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "permanent_delete_done.wav",
+      "normalize": -11.0,
+      "duration": 0.6,
+      "layers": [
+        {
+          "type": "synth",
+          "inst": "fm_bass",
+          "notes": "C2",
+          "dur": 0.2,
+          "vel": 0.6,
+          "params": {
+            "bite": 0.4
+          }
+        },
+        {
+          "type": "sfx",
+          "kind": "noise",
+          "params": {
+            "dur": 0.3,
+            "color": "brown"
+          },
+          "gain": 0.6,
+          "fx": [
+            {
+              "type": "lowpass",
+              "cutoff": 600
+            }
+          ]
+        },
+        {
+          "type": "synth",
+          "inst": "synth",
+          "notes": "Eb3",
+          "dur": 0.12,
+          "vel": 0.35,
+          "gain": 0.5,
+          "at": 0.08,
+          "params": {
+            "wave": "fm",
+            "ratio": 1.0,
+            "index": 0.8,
+            "attack": 0.003,
+            "decay": 0.15,
+            "sustain": 0.0,
+            "release": 0.1,
+            "cutoff": 1200
+          }
+        }
+      ],
+      "fx": [
+        {
+          "type": "reverb",
+          "mix": 0.1,
+          "size": 0.4
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "rename_done.wav",
+      "normalize": -13.0,
+      "duration": 0.35,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "typewriter",
+          "gain": 0.35
+        },
+        {
+          "type": "sfx",
+          "kind": "typewriter",
+          "gain": 0.3,
+          "at": 0.07
+        },
+        {
+          "type": "sfx",
+          "kind": "typewriter",
+          "gain": 0.35,
+          "at": 0.15
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 4000
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "new_item.wav",
+      "duration": 0.35,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "pop",
+          "params": {
+            "freq": 520
+          },
+          "gain": 0.5
+        },
+        {
+          "type": "sfx",
+          "kind": "typewriter",
+          "gain": 0.35,
+          "at": 0.05
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 3500
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "extract_done.wav",
+      "duration": 0.5,
+      "layers": [
+        {
+          "type": "group",
+          "layers": [
+            {
+              "type": "sfx",
+              "kind": "click",
+              "params": {
+                "tone": 2000
+              },
+              "gain": 0.4,
+              "repeat": 12,
+              "every": 0.022
+            }
+          ],
+          "fx": [
+            {
+              "type": "sweep",
+              "kind": "lowpass",
+              "start": 700,
+              "end": 4000,
+              "q": 0.8
+            }
+          ]
+        },
+        {
+          "type": "sfx",
+          "kind": "noise",
+          "params": {
+            "dur": 0.14,
+            "color": "pink"
+          },
+          "gain": 0.3,
+          "at": 0.27,
+          "fx": [
+            {
+              "type": "bandpass",
+              "center": 1500,
+              "q": 0.8
+            }
+          ]
+        }
+      ],
+      "fx": [
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "zip_done.wav",
+      "duration": 0.5,
+      "layers": [
+        {
+          "type": "group",
+          "layers": [
+            {
+              "type": "sfx",
+              "kind": "click",
+              "params": {
+                "tone": 2400
+              },
+              "gain": 0.4,
+              "repeat": 12,
+              "every": 0.022
+            }
+          ],
+          "fx": [
+            {
+              "type": "sweep",
+              "kind": "lowpass",
+              "start": 4000,
+              "end": 700,
+              "q": 0.8
+            }
+          ]
+        },
+        {
+          "type": "sfx",
+          "kind": "solenoid",
+          "params": {
+            "size": 0.0,
+            "bounce": 0.4
+          },
+          "gain": 0.35,
+          "at": 0.3
+        }
+      ],
+      "fx": [
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "undo_done.wav",
+      "duration": 0.4,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "noise",
+          "params": {
+            "dur": 0.24,
+            "color": "pink"
+          },
+          "gain": 0.4,
+          "fx": [
+            {
+              "type": "bandpass",
+              "center": 1200,
+              "q": 1.0
+            },
+            {
+              "type": "reverse"
+            }
+          ]
+        },
+        {
+          "type": "sfx",
+          "kind": "click",
+          "params": {
+            "tone": 1500
+          },
+          "gain": 0.35,
+          "at": 0.25
+        }
+      ],
+      "fx": [
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "search_done.wav",
+      "normalize": -13.0,
+      "duration": 0.45,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "whoosh",
+          "params": {
+            "dur": 0.07,
+            "low": 800,
+            "high": 4000,
+            "direction": "down"
+          },
+          "gain": 0.35,
+          "repeat": 3,
+          "every": 0.09
+        },
+        {
+          "type": "sfx",
+          "kind": "click",
+          "params": {
+            "tone": 1600
+          },
+          "gain": 0.35,
+          "at": 0.3
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 4500
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "backup_done.wav",
+      "duration": 0.4,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "solenoid",
+          "params": {
+            "size": 0.4,
+            "bounce": 0.5,
+            "thump": 0.7,
+            "metal": 0.2
+          },
+          "gain": 0.5
+        },
+        {
+          "type": "synth",
+          "inst": "fm_bass",
+          "notes": "G2",
+          "dur": 0.12,
+          "vel": 0.4,
+          "gain": 0.5,
+          "at": 0.02,
+          "params": {
+            "bite": 0.3
+          }
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 3000
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "restore_done.wav",
+      "duration": 0.5,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "spring",
+          "params": {
+            "action": "pull",
+            "tension": 0.5
+          },
+          "gain": 0.35
+        },
+        {
+          "type": "sfx",
+          "kind": "solenoid",
+          "params": {
+            "size": 0.3,
+            "bounce": 0.6,
+            "thump": 0.5
+          },
+          "gain": 0.45,
+          "at": 0.14
+        },
+        {
+          "type": "sfx",
+          "kind": "noise",
+          "params": {
+            "dur": 0.1,
+            "color": "pink"
+          },
+          "gain": 0.2,
+          "at": 0.2,
+          "fx": [
+            {
+              "type": "bandpass",
+              "center": 1500,
+              "q": 0.8
+            }
+          ]
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 3500
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "trash_emptied.wav",
+      "duration": 0.6,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "noise",
+          "params": {
+            "dur": 0.35,
+            "color": "brown"
+          },
+          "gain": 0.6,
+          "fx": [
+            {
+              "type": "sweep",
+              "kind": "lowpass",
+              "start": 1200,
+              "end": 300,
+              "q": 0.8
+            }
+          ]
+        },
+        {
+          "type": "synth",
+          "inst": "fm_bass",
+          "notes": "C2",
+          "dur": 0.15,
+          "vel": 0.4,
+          "gain": 0.6,
+          "at": 0.25,
+          "params": {
+            "bite": 0.3
+          }
+        }
+      ],
+      "fx": [
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "eject.wav",
+      "duration": 0.5,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "solenoid",
+          "params": {
+            "size": 0.5,
+            "bounce": 0.6,
+            "thump": 0.6,
+            "metal": 0.3
+          },
+          "gain": 0.5
+        },
+        {
+          "type": "sfx",
+          "kind": "spring",
+          "params": {
+            "action": "release",
+            "tension": 0.4
+          },
+          "gain": 0.25,
+          "at": 0.06
+        },
+        {
+          "type": "synth",
+          "inst": "fm_bass",
+          "notes": "G2",
+          "dur": 0.12,
+          "vel": 0.4,
+          "gain": 0.6,
+          "at": 0.02,
+          "params": {
+            "bite": 0.4
+          }
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 3500
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "hotspot_set.wav",
+      "normalize": -13.0,
+      "duration": 0.3,
+      "layers": [
+        {
+          "type": "drum",
+          "kind": "woodblock",
+          "vel": 0.6,
+          "params": {
+            "tune": 1200
+          },
+          "gain": 0.45
+        },
+        {
+          "type": "sfx",
+          "kind": "click",
+          "params": {
+            "tone": 2200
+          },
+          "gain": 0.3,
+          "at": 0.03
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 4000
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "upload_done.wav",
+      "duration": 0.45,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "whoosh",
+          "params": {
+            "dur": 0.25,
+            "low": 300,
+            "high": 3000,
+            "direction": "up"
+          },
+          "gain": 0.45
+        },
+        {
+          "type": "sfx",
+          "kind": "click",
+          "params": {
+            "tone": 1800
+          },
+          "gain": 0.35,
+          "at": 0.26
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 4000
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "scan_done.wav",
+      "normalize": -13.0,
+      "duration": 0.3,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "click",
+          "params": {
+            "tone": 1400
+          },
+          "gain": 0.35,
+          "repeat": 2,
+          "every": 0.06
+        },
+        {
+          "type": "sfx",
+          "kind": "click",
+          "params": {
+            "tone": 2400
+          },
+          "gain": 0.4,
+          "at": 0.13
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 4500
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "cancelled.wav",
+      "duration": 0.4,
+      "layers": [
+        {
+          "type": "sfx",
+          "kind": "noise",
+          "params": {
+            "dur": 0.22,
+            "color": "pink"
+          },
+          "gain": 0.45,
+          "fx": [
+            {
+              "type": "sweep",
+              "kind": "lowpass",
+              "start": 2500,
+              "end": 250,
+              "q": 1.0
+            }
+          ]
+        },
+        {
+          "type": "sfx",
+          "kind": "steel_ball",
+          "params": {
+            "surface": "rubber",
+            "force": 0.4
+          },
+          "gain": 0.5,
+          "at": 0.2
+        }
+      ],
+      "fx": [
+        {
+          "type": "lowpass",
+          "cutoff": 3000
+        },
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    },
+    {
+      "out": "error.wav",
+      "normalize": -11.0,
+      "duration": 0.5,
+      "layers": [
+        {
+          "type": "seq",
+          "inst": "fm_bass",
+          "steps": "Eb2:0.09 Eb2:0.15",
+          "vel": 0.5,
+          "params": {
+            "bite": 0.5
+          }
+        },
+        {
+          "type": "sfx",
+          "kind": "error",
+          "params": {
+            "freq": 140,
+            "dur": 0.22
+          },
+          "gain": 0.2,
+          "fx": [
+            {
+              "type": "lowpass",
+              "cutoff": 900
+            }
+          ]
+        }
+      ],
+      "fx": [
+        {
+          "type": "trim",
+          "threshold": -42
+        }
+      ]
+    }
+  ]
+}

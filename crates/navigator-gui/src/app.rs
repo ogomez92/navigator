@@ -864,6 +864,7 @@ impl AppState {
             }
         });
         let _ = self.config.save();
+        self.play(SoundEvent::HotspotSet);
         self.say(
             &format!("hotspot {} set to {}", slot, target.file_name()),
             false,
@@ -1603,6 +1604,223 @@ impl AppState {
         true
     }
 
+    /// Ctrl+Shift+Delete: delete the selection for good — no `.trash`
+    /// staging, no undo entry.
+    ///
+    /// Always confirms, and the confirmation names every item with its
+    /// size, which for a folder means walking it. That walk is unbounded
+    /// IO, so this runs the survey on `navigator-delete-survey` and posts
+    /// [`crate::window::WMAPP_PERMANENT_DELETE_SURVEYED`] back; the dialog
+    /// and the delete itself continue from
+    /// [`Self::confirm_permanent_delete_survey`]. Same shape as the
+    /// empty-trash survey, for the same reason.
+    ///
+    /// Every endpoint runs through rclone's `purge` / `deletefile` — the
+    /// one path that is equally permanent on a local drive, a share and
+    /// a remote, and the file-operations invariant anyway. The shell's
+    /// delete engine (the UNC path of a normal delete) is not used here
+    /// because its prompt would make this a two-dialog delete.
+    pub fn op_permanent_delete(&self) {
+        let Some(cwd) = self.model.cwd() else {
+            return;
+        };
+        if cwd.is_this_pc() {
+            self.say("can't delete a drive", true);
+            self.play(SoundEvent::Error);
+            return;
+        }
+        if cwd.is_remotes_root() {
+            self.say("can't delete a remote from here", true);
+            self.play(SoundEvent::Error);
+            return;
+        }
+        let sel = self.model.selection_snapshot();
+        let entries: Vec<navigator_core::Entry> =
+            sel.iter().filter_map(|i| self.model.get(i)).collect();
+        if entries.is_empty() {
+            self.say("nothing selected", false);
+            return;
+        }
+        let Some(hwnd) = self.hwnd() else {
+            return;
+        };
+        let next_focus = self.pick_post_delete_focus();
+        let rclone = self.rclone.clone();
+        let n = entries.len();
+        self.say(
+            &format!("sizing {} {}…", n, if n == 1 { "item" } else { "items" }),
+            false,
+        );
+        std::thread::Builder::new()
+            .name("navigator-delete-survey".into())
+            .spawn(move || {
+                let mut targets: Vec<(NavPath, bool)> = Vec::with_capacity(entries.len());
+                let mut items: Vec<crate::permadelete::SurveyedItem> =
+                    Vec::with_capacity(entries.len());
+                for e in entries {
+                    let path = cwd.join(&e.name);
+                    let is_dir = e.is_dir();
+                    let (bytes, files_inside) = if !is_dir {
+                        (Some(e.size), None)
+                    } else if path.is_remote() {
+                        // `rclone size` is the only recursive total a
+                        // remote folder offers; a listing-based walk would
+                        // be one spawn per directory.
+                        match path.rclone_arg().map(|a| rclone.size(&a)) {
+                            Some(Ok(sz)) => {
+                                (u64::try_from(sz.bytes).ok(), u64::try_from(sz.count).ok())
+                            }
+                            _ => (None, None),
+                        }
+                    } else {
+                        let stats = crate::props::compute_folder_stats(&path);
+                        (Some(stats.total_size), Some(stats.file_count))
+                    };
+                    items.push(crate::permadelete::SurveyedItem {
+                        name: e.name.clone(),
+                        is_dir,
+                        bytes,
+                        files_inside,
+                    });
+                    targets.push((path, is_dir));
+                }
+                let body = crate::permadelete::confirm_body(&items);
+                post_permanent_delete_survey(hwnd, targets, body, next_focus);
+            })
+            .expect("spawn delete-survey worker");
+    }
+
+    /// UI-thread half of [`Self::op_permanent_delete`]: show the surveyed
+    /// list, defaulting to No, and on Yes spawn the worker. `next_focus`
+    /// is armed only now — armed before the dialog, a declined delete
+    /// would hand it to the next listing anywhere.
+    pub fn confirm_permanent_delete_survey(
+        &self,
+        targets: Vec<(NavPath, bool)>,
+        body: String,
+        next_focus: Option<NavPath>,
+    ) {
+        if targets.is_empty() {
+            return;
+        }
+        if !confirm_default_no(self.main_hwnd(), "Permanently delete?", &body) {
+            self.say("cancelled", false);
+            return;
+        }
+        if let Some(target) = next_focus {
+            *self.pending_focus.lock() = Some(target);
+        }
+        let state = self.clone_for_worker();
+        std::thread::Builder::new()
+            .name("navigator-permanent-delete".into())
+            .spawn(move || state.run_permanent_delete(targets))
+            .expect("spawn permanent-delete worker");
+    }
+
+    /// Ctrl+E: eject the drive focused on This PC.
+    ///
+    /// Anywhere other than This PC, or on a row that is not a drive, this
+    /// announces the problem and does nothing — the chord is bound
+    /// globally and a wrong-place press must not be silent. The eject
+    /// itself (lock → dismount → eject, with lock retries) can block for
+    /// a second or two, so it runs on `navigator-eject`; the outcome is
+    /// spoken and the drive list re-read if the user is still on it.
+    pub fn op_eject_drive(&self) {
+        let Some(cwd) = self.model.cwd() else {
+            return;
+        };
+        if !cwd.is_this_pc() {
+            self.say("eject only works on a drive in This PC", true);
+            self.play(SoundEvent::Error);
+            return;
+        }
+        let sel = self.model.selection_snapshot();
+        let focused = sel.focus().and_then(|i| self.model.get(i));
+        let Some(root) = focused
+            .as_ref()
+            .and_then(|e| navigator_fs::drive_path_from_display(&e.name))
+        else {
+            self.say("focus a drive to eject", true);
+            self.play(SoundEvent::Error);
+            return;
+        };
+        let display = focused.map(|e| e.name).unwrap_or_else(|| root.clone());
+        self.say(&format!("ejecting {}…", display), false);
+
+        let speech = self.speech.handle();
+        let sound = self.sound.clone();
+        let hwnd = self.hwnd();
+        let state_weak = self.self_weak.get().cloned().unwrap_or_else(Weak::new);
+        std::thread::Builder::new()
+            .name("navigator-eject".into())
+            .spawn(move || {
+                match navigator_fs::eject_volume(&root) {
+                    Ok(()) => {
+                        sound.play(SoundEvent::Eject);
+                        let _ = speech.send(crate::speech::Utterance {
+                            text: format!("ejected {}", display),
+                            interrupt: false,
+                        });
+                        if let Some(state) = state_weak.upgrade() {
+                            state.refresh_dir(&NavPath::this_pc());
+                        }
+                    }
+                    Err(failure) => {
+                        // Find out who is holding the drive *before*
+                        // speaking, so the sentence can name the culprit;
+                        // the scan is a few hundred milliseconds.
+                        let mut users = navigator_fs::processes_using_drive(&root);
+                        warn!("eject {}: {} | {:?}", root, failure.summary, failure.veto);
+                        // An empty unelevated scan is not "nobody": an
+                        // elevated program or a service (indexer, antivirus,
+                        // an admin terminal parked on the drive) refuses the
+                        // peek. Offer to look again as administrator — a
+                        // helper process, so navigator itself stays
+                        // unelevated.
+                        let mut note = None;
+                        if users.is_empty() && !navigator_fs::is_elevated() {
+                            let _ = speech.send(crate::speech::Utterance {
+                                text: format!(
+                                    "eject failed: {}. Nothing found as your user; asking to scan as administrator",
+                                    failure.summary
+                                ),
+                                interrupt: true,
+                            });
+                            let ask = format!(
+                                "Could not eject {}.\n{}\n\n\
+                                 No program running as your user has files open on the drive. \
+                                 The culprit may be a program running as administrator or a \
+                                 Windows service (Search indexer, antivirus, an elevated terminal).\n\n\
+                                 Scan as administrator? Windows will show a permission prompt.",
+                                display, failure.summary
+                            );
+                            if crate::dialogs::ask_yes_no(hwnd, "Eject failed", &ask) {
+                                match crate::drive_users::scan_elevated(&root) {
+                                    Ok(found) => {
+                                        users = found;
+                                        note = Some("Scanned as administrator.".to_string());
+                                    }
+                                    Err(e) => {
+                                        warn!("elevated drive-users scan: {}", e);
+                                        note = Some(format!("Administrator scan unavailable: {}.", e));
+                                    }
+                                }
+                            }
+                        }
+                        let report =
+                            crate::eject_report::build(&display, &failure, &users, note.as_deref());
+                        sound.play(SoundEvent::Error);
+                        let _ = speech.send(crate::speech::Utterance {
+                            text: report.spoken,
+                            interrupt: true,
+                        });
+                        crate::dialogs::show_error(hwnd, "Eject failed", &report.body);
+                    }
+                }
+            })
+            .expect("spawn eject worker");
+    }
+
     /// Survey every `<drive>\.trash` so the confirmation can name what it
     /// is about to destroy, then hand the result to the UI thread.
     ///
@@ -1689,6 +1907,7 @@ impl AppState {
 
         let speech = self.speech.handle();
         let state_weak = self.self_weak.get().cloned().unwrap_or_else(Weak::new);
+        let sound = self.sound.clone();
         let total_freed = total;
         std::thread::Builder::new()
             .name("navigator-empty-trash".into())
@@ -1707,6 +1926,11 @@ impl AppState {
                         }
                     }
                 }
+                sound.play(if failed == 0 {
+                    SoundEvent::TrashEmptied
+                } else {
+                    SoundEvent::Error
+                });
                 let msg = if failed == 0 {
                     format!(
                         "emptied .trash on {} drive(s); {} freed",
@@ -2923,6 +3147,7 @@ impl AppState {
         };
         match outcome {
             SpaceScanOutcome::Done(tree) => {
+                self.play(SoundEvent::ScanDone);
                 crate::space_window::show(hwnd.0, me, root, tree);
             }
             SpaceScanOutcome::Failed(err) => {
@@ -3134,6 +3359,7 @@ impl AppState {
         let speech = self.speech.handle();
         let rclone = self.rclone.clone();
         let cache = Arc::clone(&self.remote_cache);
+        let sound = self.sound.clone();
         let remote_display = remote.rclone_arg().unwrap_or_else(|| remote.to_string());
         let state_weak = self.self_weak.get().cloned().unwrap_or_else(Weak::new);
         let guard = self.op_guard();
@@ -3190,6 +3416,7 @@ impl AppState {
                 if success {
                     let mtime = staged.metadata().ok().and_then(|m| m.modified().ok());
                     cache.finish_prompt(&staged, mtime);
+                    sound.play(SoundEvent::UploadDone);
                     let _ = speech.send(crate::speech::Utterance {
                         text: format!("uploaded to {}", remote_display),
                         interrupt: false,
@@ -3321,6 +3548,36 @@ fn confirm_remote_delete(parent: Option<HWND>, targets: &[NavPath]) -> bool {
     rc == IDYES.0
 }
 
+/// Yes/No warning dialog that defaults to **No**, so an absent-minded
+/// Enter declines. Used wherever the answer destroys data with no undo.
+fn confirm_default_no(parent: Option<HWND>, title: &str, body: &str) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_YESNO,
+        MessageBoxW,
+    };
+    use windows::core::PCWSTR;
+
+    let title_w: Vec<u16> = title.encode_utf16().chain([0]).collect();
+    let body_w: Vec<u16> = body.encode_utf16().chain([0]).collect();
+    let is_foreground = parent
+        .map(|h| unsafe { GetForegroundWindow() } == h)
+        .unwrap_or(false);
+    let mut flags = MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2;
+    if is_foreground {
+        flags |= MB_SETFOREGROUND;
+    }
+    let rc = unsafe {
+        MessageBoxW(
+            parent,
+            PCWSTR(body_w.as_ptr()),
+            PCWSTR(title_w.as_ptr()),
+            flags,
+        )
+        .0
+    };
+    rc == IDYES.0
+}
+
 /// Confirm a permanent trash purge across all drives. Defaults to No.
 /// `body` is built by the caller because it lists per-drive sizes that
 /// only the trash-walking pass knows about.
@@ -3426,6 +3683,26 @@ fn post_empty_trash_survey(hwnd: HwndSend, dirs: Vec<PathBuf>, body: String, tot
         let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
             Some(hwnd.0),
             crate::window::WMAPP_EMPTY_TRASH_SURVEYED,
+            WPARAM(0),
+            LPARAM(payload as isize),
+        );
+    }
+}
+
+/// Hand a finished permanent-delete survey to the UI thread. Same
+/// leak-a-`Box` shape as [`post_empty_trash_survey`]; the window proc
+/// reclaims it.
+fn post_permanent_delete_survey(
+    hwnd: HwndSend,
+    targets: Vec<(NavPath, bool)>,
+    body: String,
+    next_focus: Option<NavPath>,
+) {
+    let payload = Box::into_raw(Box::new((targets, body, next_focus)));
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(hwnd.0),
+            crate::window::WMAPP_PERMANENT_DELETE_SURVEYED,
             WPARAM(0),
             LPARAM(payload as isize),
         );
@@ -4574,6 +4851,50 @@ impl WorkerCtx {
         self.refresh();
     }
 
+    /// Permanently delete `targets` through rclone, one `purge` /
+    /// `deletefile` per item, reporting as one job. No undo entry exists
+    /// for this — the confirmation dialog was the last chance.
+    fn run_permanent_delete(self, targets: Vec<(NavPath, bool)>) {
+        let _guard = self.state.upgrade().map(|s| s.op_guard());
+        let total = targets.len();
+        let mut failed = 0usize;
+        let mut prog = OpProgress::new(&self, "Deleting", total as u64);
+        prog.opening(
+            "permanently deleting",
+            targets.first().map(|(p, _)| p.file_name()),
+        );
+        for (path, is_dir) in targets {
+            if prog.cancelled() {
+                break;
+            }
+            prog.begin(1);
+            let ok = self.run_op(
+                Operation::Delete {
+                    targets: vec![path],
+                    is_dir,
+                },
+                &mut prog,
+            );
+            prog.end();
+            if !ok {
+                failed += 1;
+            }
+        }
+        prog.finish(failed == 0);
+        self.play_outcome(
+            prog.cancelled(),
+            failed > 0,
+            SoundEvent::PermanentDeleteDone,
+        );
+        let ok = total - failed;
+        if prog.cancelled() {
+            self.say(format!("cancelled after {} of {}", ok, total), true);
+        } else {
+            self.say(crate::permadelete::summary(ok, failed), failed > 0);
+        }
+        self.refresh();
+    }
+
     /// Reverse a delete. Each `(trash, original)` gets renamed back. If
     /// the original path has been repopulated by something new, we skip
     /// that entry rather than clobbering the user's fresh file.
@@ -4676,7 +4997,7 @@ impl WorkerCtx {
         );
         prog.end();
         prog.finish(ok);
-        self.play_outcome(prog.cancelled(), !ok, SoundEvent::CopyDone);
+        self.play_outcome(prog.cancelled(), !ok, SoundEvent::BackupDone);
 
         if ok && !prog.cancelled() {
             crate::backup::record_backup(record);
@@ -4745,7 +5066,7 @@ impl WorkerCtx {
             prog.end();
             if !ok || prog.cancelled() {
                 prog.finish(false);
-                self.play_outcome(prog.cancelled(), !ok, SoundEvent::UndoDone);
+                self.play_outcome(prog.cancelled(), !ok, SoundEvent::RestoreDone);
                 self.say(
                     if prog.cancelled() {
                         "restore cancelled"
@@ -4768,7 +5089,7 @@ impl WorkerCtx {
         );
         prog.end();
         prog.finish(ok);
-        self.play_outcome(prog.cancelled(), !ok, SoundEvent::UndoDone);
+        self.play_outcome(prog.cancelled(), !ok, SoundEvent::RestoreDone);
         // A cancel here is not a clean abort: the current version is
         // already staged in `.trash` and the copy-back stopped partway.
         // Saying "failed" would hide where the user's data went.

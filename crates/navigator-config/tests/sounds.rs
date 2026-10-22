@@ -38,6 +38,11 @@ fn keys_are_stable() {
     assert_eq!(SoundEvent::NavigateUp.key(), "navigate_up");
     assert_eq!(SoundEvent::Back.key(), "back");
     assert_eq!(SoundEvent::Error.key(), "error");
+    assert_eq!(
+        SoundEvent::PermanentDeleteDone.key(),
+        "permanent_delete_done"
+    );
+    assert_eq!(SoundEvent::Eject.key(), "eject");
 }
 
 #[test]

@@ -158,9 +158,11 @@ The events:
 | Lifecycle  | Application started                                                        |
 | Navigation | Opened a folder · Went up one folder · Went back / forward in history       |
 | Clipboard  | Copied to clipboard · Cut to clipboard · Paste started                      |
-| Operations | Copy / Move / Delete / Rename / Undo finished · New file or folder created  |
+| Operations | Copy / Move / Delete (to trash) / Permanent delete / Rename / Undo finished · New file or folder created |
 | Archives   | Extraction finished · Zip finished                                          |
-| Other      | Search finished · Operation cancelled · Operation failed                    |
+| Backups    | Backup finished · Restore finished · Trash emptied                          |
+| Drives     | Drive ejected · Space scan finished                                         |
+| Other      | Search finished · Hotspot saved · Remote upload finished · Operation cancelled · Operation failed |
 
 A failed or cancelled operation always plays *its* sound rather than the
 success one, so a copy that didn't work can never sound like a copy that did.
@@ -267,12 +269,14 @@ inflating the missing list.
 | Ctrl + Alt + V               | Paste from OS clipboard via Windows shell — runs detached, survives quitting |
 | Ctrl + Z                     | Undo last clipboard / paste / delete                |
 | Del                          | Delete to per-volume `.trash`                       |
+| Ctrl + Shift + Del           | Permanent delete — skips `.trash`, no undo; confirms with every item and its size (folders are walked), defaulting to No |
 | Ctrl + N                     | New folder (prompts for name)                       |
 | Ctrl + Shift + N             | New file (name needs a `.type`) + open in default app |
 | F2                           | Rename                                              |
 | Ctrl + F                     | Find in folder                                      |
 | Ctrl + H / Ctrl + Shift + H  | Toggle hidden / system files                        |
 | Ctrl + E                     | Extract archives — on a folder, sweeps it and its subfolders and unpacks each archive in place (asks first) |
+| Ctrl + Shift + E             | Eject the focused drive (This PC only). Works like Safely Remove Hardware; if something holds the drive, a dialog lists the programs and files |
 | Ctrl + Shift + Z             | Zip the selection into a sibling `.zip`             |
 | Ctrl + Shift + B             | Back up focused item to per-volume `.navigator_backup` (local paths only) |
 | Ctrl + Shift + R             | Restore a backup taken from the current folder — current version goes to `.trash`, the backup is kept |

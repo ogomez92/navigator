@@ -96,6 +96,19 @@ pub const WMAPP_REMOTE_UPLOAD_FAILED: u32 = WM_APP + 12;
 /// thread; the walk itself is unbounded IO and never runs here.
 pub const WMAPP_SPACE_SCANNED: u32 = WM_APP + 13;
 
+/// Permanent-delete survey finished. Payload is
+/// `Box<(Vec<(NavPath, bool)>, String, Option<NavPath>)>` — the targets,
+/// the confirmation body naming each with its size, and the row to focus
+/// afterwards. The folder walk behind the sizes is unbounded IO, so it
+/// runs on `navigator-delete-survey`; the dialog runs here.
+pub const WMAPP_PERMANENT_DELETE_SURVEYED: u32 = WM_APP + 14;
+/// Payload of [`WMAPP_PERMANENT_DELETE_SURVEYED`]: targets, body, next focus.
+pub type PermanentDeleteSurvey = (
+    Vec<(navigator_core::NavPath, bool)>,
+    String,
+    Option<navigator_core::NavPath>,
+);
+
 const IDC_LISTVIEW: u16 = 1001;
 const IDC_ADDRESS: u16 = 1002;
 
@@ -1036,6 +1049,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let payload: Box<(Vec<std::path::PathBuf>, String, u64)> = Box::from_raw(lp.0 as *mut _);
             let (dirs, body, total) = *payload;
             data.state.confirm_empty_trash_survey(dirs, body, total);
+            LRESULT(0)
+        },
+
+        WMAPP_PERMANENT_DELETE_SURVEYED => unsafe {
+            let payload: Box<PermanentDeleteSurvey> = Box::from_raw(lp.0 as *mut _);
+            let Some(data) = window_data(hwnd) else { return LRESULT(0) };
+            let (targets, body, next_focus) = *payload;
+            data.state.confirm_permanent_delete_survey(targets, body, next_focus);
             LRESULT(0)
         },
 
@@ -2348,6 +2369,8 @@ fn dispatch_internal(hwnd: HWND, data: &WindowData, ic: navigator_config::Intern
         IC::Backup => state.op_backup(),
         IC::RestoreBackup => state.op_restore_backup(),
         IC::SpaceBreakdown => state.op_space_breakdown(),
+        IC::PermanentDelete => state.op_permanent_delete(),
+        IC::EjectDrive => state.op_eject_drive(),
         IC::NewFolder => {
             crate::new_folder::open(hwnd, state.clone());
         }

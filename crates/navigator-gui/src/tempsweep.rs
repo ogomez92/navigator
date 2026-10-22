@@ -31,16 +31,19 @@ use std::time::{Duration, SystemTime};
 pub const FILES_FROM_PREFIX: &str = "navigator-files-from-";
 pub const SHELL_OP_PREFIX: &str = "navigator-shellop-";
 pub const ELEVATED_LOG_PREFIX: &str = "navigator-elevated-";
+/// The JSON an elevated drive-users scan hands back to its parent.
+pub const DRIVE_USERS_PREFIX: &str = "navigator-driveusers-";
 /// robocopy's `/UNILOG` files. Defined by the driver that writes them —
 /// it lives in another crate — and re-exported so this list stays the one
 /// place every prefix is named.
 pub const ROBOCOPY_LOG_PREFIX: &str = navigator_rclone::robocopy::LOG_PREFIX;
 
-const PREFIXES: [&str; 4] = [
+const PREFIXES: [&str; 5] = [
     FILES_FROM_PREFIX,
     SHELL_OP_PREFIX,
     ELEVATED_LOG_PREFIX,
     ROBOCOPY_LOG_PREFIX,
+    DRIVE_USERS_PREFIX,
 ];
 
 /// How long a file is left alone regardless of who owns it.
