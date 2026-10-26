@@ -65,6 +65,7 @@ const ID_KEEP_BOTH: i32 = 1003;
 const ID_MIRROR: i32 = 1004;
 const ID_MIRROR_GO: i32 = 1005;
 const ID_BACK: i32 = 1006;
+const ID_KEEP_NEWER: i32 = 1007;
 
 const ID_RADIO_BASE: i32 = 2001;
 /// Radio id for the Keep-both row, which is not a [`ConflictMode`] and so
@@ -261,6 +262,155 @@ pub fn prompt_conflicts(
         ID_MIRROR => return ConflictAnswer::ReviewMirror,
         _ => PasteChoice::Cancel,
     })
+}
+
+/// What [`prompt_restore`] offers: which buttons, which one is the default.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RestorePrompt {
+    pub heading: String,
+    pub body: String,
+    /// "Keep newer files" — run as Update. Offered whenever some local
+    /// file is newer than the backup.
+    pub keep_newer: bool,
+    /// "Add new only". Offered when there are older files too, which is
+    /// the only case where it differs from keeping the newer ones.
+    pub add_new_only: bool,
+    pub default_id: i32,
+}
+
+/// The restore conflict prompt, worded from what a restore would do to the
+/// differing files already at the destination. Pure for the tests.
+///
+/// `older` are files the backup would replace and that have not changed
+/// since it was taken (by mtime); `newer` are files changed *after* the
+/// backup. A file paste spares the newer ones silently — Update's whole
+/// point — but a restore is usually made *because* the file on disk is
+/// newer and broken, so keeping it without a word would quietly undo the
+/// restore. Hence a restore asks about both.
+///
+/// The default never replaces anything: Add new only when there is
+/// something older to replace, otherwise Keep newer files (which then
+/// replaces nothing either).
+pub fn restore_prompt(older: &[String], newer: &[String]) -> RestorePrompt {
+    let (o, n) = (older.len(), newer.len());
+    let heading = match (o, n) {
+        (o, 0) => format!("Restoring will replace {o} existing file(s) with the backed-up version."),
+        (0, n) => format!("{n} file(s) here changed after the backup was taken."),
+        (o, n) => format!(
+            "Restoring will replace {} file(s); {n} of them changed after the backup was taken.",
+            o + n
+        ),
+    };
+    let mut body = String::new();
+    if n > 0 {
+        body.push_str("Changed after the backup:\n");
+        body.push_str(&summarize_paths(newer));
+    }
+    if o > 0 {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("Not changed since the backup, but different from it:\n");
+        body.push_str(&summarize_paths(older));
+    }
+    body.push_str("\nReplaced files are not recoverable.");
+    let keep_newer = n > 0;
+    let add_new_only = o > 0;
+    RestorePrompt {
+        heading,
+        body,
+        keep_newer,
+        add_new_only,
+        default_id: if add_new_only { ID_ADD_NEW_ONLY } else { ID_KEEP_NEWER },
+    }
+}
+
+/// Ask how a restore should treat differing files at the destination.
+/// See [`restore_prompt`] for when and why.
+pub fn prompt_restore(parent: Option<HwndSend>, older: &[String], newer: &[String]) -> PasteChoice {
+    let p = restore_prompt(older, newer);
+    let title_w = wide("Restore");
+    let heading_w = wide(&p.heading);
+    let body_w = wide(&p.body);
+    let replace_w = wide(&format!(
+        "Replace with backup\nRestore the backed-up version of all {} file(s)",
+        older.len() + newer.len()
+    ));
+    let keep_newer_w = wide(&if older.is_empty() {
+        format!(
+            "Keep newer files\nKeep the {} file(s) changed since the backup; restore only what is missing",
+            newer.len()
+        )
+    } else {
+        format!(
+            "Keep newer files\nKeep the {} changed since the backup; replace the {} older",
+            newer.len(),
+            older.len()
+        )
+    });
+    let add_new_w = wide("Add new only\nRestore only what is missing; replace nothing");
+    let keep_both_w = wide("Keep both\nRestore each conflicting item under a new numbered name");
+
+    let mut buttons = vec![TASKDIALOG_BUTTON {
+        nButtonID: ID_PROCEED,
+        pszButtonText: PCWSTR(replace_w.as_ptr()),
+    }];
+    if p.keep_newer {
+        buttons.push(TASKDIALOG_BUTTON {
+            nButtonID: ID_KEEP_NEWER,
+            pszButtonText: PCWSTR(keep_newer_w.as_ptr()),
+        });
+    }
+    if p.add_new_only {
+        buttons.push(TASKDIALOG_BUTTON {
+            nButtonID: ID_ADD_NEW_ONLY,
+            pszButtonText: PCWSTR(add_new_w.as_ptr()),
+        });
+    }
+    buttons.push(TASKDIALOG_BUTTON {
+        nButtonID: ID_KEEP_BOTH,
+        pszButtonText: PCWSTR(keep_both_w.as_ptr()),
+    });
+
+    let flags = TASKDIALOG_FLAGS(0) | TDF_POSITION_RELATIVE_TO_WINDOW | TDF_USE_COMMAND_LINKS;
+    let config = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: parent.map(|h| h.0).unwrap_or_default(),
+        hInstance: Default::default(),
+        dwFlags: flags,
+        dwCommonButtons: TDCBF_CANCEL_BUTTON,
+        pszWindowTitle: PCWSTR(title_w.as_ptr()),
+        Anonymous1: TASKDIALOGCONFIG_0::default(),
+        pszMainInstruction: PCWSTR(heading_w.as_ptr()),
+        pszContent: PCWSTR(body_w.as_ptr()),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: p.default_id,
+        cRadioButtons: 0,
+        pRadioButtons: std::ptr::null(),
+        nDefaultRadioButton: 0,
+        pszVerificationText: PCWSTR::null(),
+        pszExpandedInformation: PCWSTR::null(),
+        pszExpandedControlText: PCWSTR::null(),
+        pszCollapsedControlText: PCWSTR::null(),
+        Anonymous2: TASKDIALOGCONFIG_1::default(),
+        pszFooter: PCWSTR::null(),
+        pfCallback: None,
+        lpCallbackData: 0,
+        cxWidth: 0,
+    };
+    let mut button = 0i32;
+    let rc = unsafe { TaskDialogIndirect(&config, Some(&mut button), None, None) };
+    if rc.is_err() {
+        return PasteChoice::Cancel;
+    }
+    match button {
+        ID_PROCEED => PasteChoice::Mode(ConflictMode::Replace),
+        ID_KEEP_NEWER => PasteChoice::Mode(ConflictMode::Update),
+        ID_ADD_NEW_ONLY => PasteChoice::Mode(ConflictMode::AddNewOnly),
+        ID_KEEP_BOTH => PasteChoice::KeepBoth,
+        _ => PasteChoice::Cancel,
+    }
 }
 
 /// Heading and body of the Mirror confirmation. Pure so the wording —
@@ -567,6 +717,36 @@ pub fn unique_numbered_path(dst: &std::path::Path) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_prompt_names_newer_files_and_defaults_to_replacing_nothing() {
+        let newer = vec![r"saves\slot1.dat".to_string()];
+        let older = vec!["a.txt".to_string(), "b.txt".to_string()];
+
+        let p = restore_prompt(&[], &newer);
+        assert_eq!(p.heading, "1 file(s) here changed after the backup was taken.");
+        assert!(p.body.contains(r"saves\slot1.dat"));
+        assert!(p.keep_newer && !p.add_new_only);
+        assert_eq!(p.default_id, ID_KEEP_NEWER);
+
+        let p = restore_prompt(&older, &[]);
+        assert!(p.heading.starts_with("Restoring will replace 2 existing file(s)"));
+        assert!(!p.keep_newer && p.add_new_only);
+        assert_eq!(p.default_id, ID_ADD_NEW_ONLY);
+
+        let p = restore_prompt(&older, &newer);
+        assert_eq!(
+            p.heading,
+            "Restoring will replace 3 file(s); 1 of them changed after the backup was taken."
+        );
+        assert!(p.keep_newer && p.add_new_only);
+        // Keep newer would still replace the older two, so it isn't the
+        // default: Enter must replace nothing.
+        assert_eq!(p.default_id, ID_ADD_NEW_ONLY);
+        let changed = p.body.find("Changed after").unwrap();
+        let unchanged = p.body.find("Not changed since").unwrap();
+        assert!(changed < unchanged, "the files at risk of a surprise come first");
+    }
 
     /// Radio ids are derived from position in `ConflictMode::ALL`, so the
     /// round-trip must hold for every mode plus the Keep-both row.

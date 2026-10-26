@@ -58,6 +58,7 @@ enum ParsedArgs {
 ///   navigator <path>                        — absolute/relative local path or `remote:sub`
 ///   navigator -r <remote[:sub]>             — explicit remote (name-only OK)
 ///   navigator --remote <remote[:sub]>       — long form of -r
+///   navigator --rustic <repo>               — browse a rustic backup repository
 ///   navigator -h | --help                   — usage
 /// A bare `mac:downloads` works without `-r` because `NavPath::new` already
 /// accepts rclone syntax; `-r` is just a discoverable shortcut and also
@@ -84,6 +85,10 @@ fn parse_args(args: &[String]) -> ParsedArgs {
                 Err(e) => ParsedArgs::BadArg(format!("invalid remote {:?}: {}", spec, e)),
             }
         }
+        "--rustic" => match args.get(1) {
+            Some(v) => ParsedArgs::Path(NavPath::rustic_repo(&rustic_repo_arg(v))),
+            None => ParsedArgs::BadArg("--rustic needs a repository argument".into()),
+        },
         _ => match parse_path_arg(first) {
             Ok(p) => ParsedArgs::Path(p),
             Err(_) => ParsedArgs::Path(NavPath::default_root()),
@@ -102,6 +107,26 @@ fn parse_path_arg(raw: &str) -> navigator_core::Result<NavPath> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// The repository `--rustic` names, spelled the way rustic takes `-r`.
+///
+/// Deliberately not checked: whether it really is a repository is found
+/// out by the first listing, which has to open it anyway — probing here
+/// would only add a startup delay to say the same thing. A local folder,
+/// relative or absolute, becomes an absolute backslashed path (rustic
+/// reads `D:/x` as a backend called `D`); a backend spec such as
+/// `rclone:remote:path` or `sftp:host:/repo` passes through untouched.
+fn rustic_repo_arg(raw: &str) -> String {
+    let b = raw.as_bytes();
+    let is_drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+    if !is_drive && raw.contains(':') {
+        return raw.to_string();
+    }
+    let abs = std::path::absolute(raw)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| raw.to_string());
+    navigator_core::path::normalize_rustic_repo(&abs)
 }
 
 fn should_resolve_relative(raw: &str, path: &std::path::Path) -> bool {
@@ -202,6 +227,30 @@ mod tests {
         assert_eq!(p.as_path(), std::path::absolute("src").unwrap());
     }
 
+    fn rustic_repo_of(p: &ParsedArgs) -> Option<String> {
+        match p {
+            ParsedArgs::Path(np) if np.is_rustic_repo_root() => np.rustic_parts().map(|r| r.repo),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn rustic_flag_opens_the_snapshot_list() {
+        let r = parse_args(&strings(&["--rustic", r"D:\backups\repo"]));
+        assert_eq!(rustic_repo_of(&r).as_deref(), Some(r"D:\backups\repo"));
+        // Forward slashes and a trailing separator are respelled for rustic.
+        let r = parse_args(&strings(&["--rustic", "D:/backups/repo/"]));
+        assert_eq!(rustic_repo_of(&r).as_deref(), Some(r"D:\backups\repo"));
+        // Relative to the current directory, like a plain path argument.
+        let r = parse_args(&strings(&["--rustic", "repo"]));
+        let want = std::path::absolute("repo").unwrap();
+        assert_eq!(rustic_repo_of(&r).as_deref(), want.to_str());
+        // A backend spec passes through.
+        let r = parse_args(&strings(&["--rustic", "rclone:nas:backups"]));
+        assert_eq!(rustic_repo_of(&r).as_deref(), Some("rclone:nas:backups"));
+        assert!(matches!(parse_args(&strings(&["--rustic"])), ParsedArgs::BadArg(_)));
+    }
+
     #[test]
     fn drive_relative_path_is_not_treated_as_cli_relative() {
         let r = parse_args(&strings(&["C:foo"]));
@@ -224,6 +273,7 @@ fn print_usage() {
          \n\
          OPTIONS:\n    \
             -r, --remote <SPEC>   Open an rclone remote. SPEC is `name` or `name:sub/path`\n    \
+            --rustic <REPO>       Browse a rustic backup repository (read-only; copy to restore)\n    \
             -h, --help            Print this help\n\
          \n\
          EXAMPLES:\n    \
@@ -232,7 +282,8 @@ fn print_usage() {
             navigator C:\\Users\\me\\Downloads\n    \
             navigator -r mac:Downloads/incoming\n    \
             navigator -r gdrive\n    \
-            navigator mac:Downloads/incoming\n"
+            navigator mac:Downloads/incoming\n    \
+            navigator --rustic D:\\backups\\repo\n"
     );
 }
 

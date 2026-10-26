@@ -48,6 +48,7 @@ pub struct Config {
     pub plugins: Plugins,
     pub rclone: Rclone,
     pub extraction: Extraction,
+    pub rustic: Rustic,
     pub sounds: Sounds,
     pub recent_paths: Vec<String>,
     #[serde(default = "shortcuts::default_actions")]
@@ -73,6 +74,7 @@ impl Default for Config {
             plugins: Plugins::default(),
             rclone: Rclone::default(),
             extraction: Extraction::default(),
+            rustic: Rustic::default(),
             sounds: Sounds::default(),
             recent_paths: Vec::new(),
             shortcuts: shortcuts::default_actions(),
@@ -206,6 +208,35 @@ impl Default for Extraction {
         Self {
             delete_when_extracted: true,
             create_folder: true,
+        }
+    }
+}
+
+/// Browsing rustic backup repositories (`navigator --rustic <repo>`).
+/// Navigator only reads them — browsing snapshots and restoring out of
+/// them — and never runs a backup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rustic {
+    /// The rustic binary. A bare name is looked up on `PATH`.
+    pub exe: String,
+    /// rustic config profile to use (`rustic -P <profile>`). Empty means
+    /// rustic's own default — `rustic.toml` in its config directory, if
+    /// there is one. A password set in the profile is used as-is.
+    pub profile: String,
+    /// File holding the repository password, handed to rustic for every
+    /// repository. Empty = take the password from the profile or the
+    /// `RUSTIC_PASSWORD*` environment, and otherwise ask. A password typed
+    /// into navigator's prompt is kept in memory for the session only.
+    pub password_file: String,
+}
+
+impl Default for Rustic {
+    fn default() -> Self {
+        Self {
+            exe: "rustic".into(),
+            profile: String::new(),
+            password_file: String::new(),
         }
     }
 }

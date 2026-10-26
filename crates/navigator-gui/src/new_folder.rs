@@ -87,6 +87,13 @@ fn open_kind(parent: HWND, state: Arc<AppState>, kind: Kind) {
     // created. Announces the reason so screen-reader users know why
     // nothing happened.
     if let Some(cwd) = state.model.cwd() {
+        if cwd.is_rustic() {
+            state.refuse_in_backup(match kind {
+                Kind::Folder => "creating a folder",
+                Kind::File => "creating a file",
+            });
+            return;
+        }
         if cwd.is_this_pc() || cwd.is_remotes_root() {
             let what = match kind {
                 Kind::Folder => "folder",

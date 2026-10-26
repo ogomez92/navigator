@@ -94,6 +94,7 @@ destination defaults to `~/stuff/bin/x.exe`, override with `NAVIGATOR_INSTALL`):
 |-------------------------|------------------------------------------------------------------|
 | `<PATH>`                | Local path (`C:\foo`, `.`) or rclone remote (`mac:downloads`)    |
 | `-r`, `--remote <SPEC>` | Open an rclone remote. `SPEC` is `name` or `name:sub/path`       |
+| `--rustic <REPO>`       | Browse a rustic backup repository (read-only; copy to restore)   |
 | `-h`, `--help`          | Print usage                                                      |
 
 Examples:
@@ -104,6 +105,7 @@ Examples:
     navigator -r mac:Downloads/incoming
     navigator -r gdrive                    # bare name = remote root
     navigator mac:Downloads/incoming       # same as -r, no flag needed
+    navigator --rustic D:\backups\repo     # browse backups, restore by copying
 
 ## Remotes (rclone)
 
@@ -133,6 +135,44 @@ flow:
    No leaves the staged copy alone.
 4. Staged files are never auto-purged. Same stance as `.trash/`: if you
    want to free disk, delete `.remote-cache/` manually.
+
+## Rustic backups
+
+`navigator --rustic D:\backups\repo` opens a [rustic](https://rustic.cli.rs)
+repository without mounting its WebDAV server (also: **Tools → Open as rustic
+backup** on a focused folder, or type `rustic:D:\backups\repo` in the address
+bar). Backups are still made on the command line; navigator only reads them.
+
+- **Remote repositories** work the same way. On a folder in an rclone
+  remote, **Tools → Open as rustic backup** opens it as
+  `rclone:<remote>:<path>` (rustic runs `rclone serve restic` itself).
+  `--rustic rclone:sb:/home/rustic` and `rustic:rclone:sb:/home/rustic` in
+  the address bar do the same. Expect a few seconds per folder the first
+  time: each listing reopens the repository over the network. A folder
+  you have already opened is remembered for the session.
+- The repository opens on its **snapshot list**, one row per snapshot:
+  `2026-10-22 10:13 Documents [daily] 4f13f557` — when, what, tags, id.
+  Enter opens the folder that snapshot backed up; Backspace walks up.
+- **Restore = copy and paste.** Ctrl+C on files or folders in a snapshot,
+  go to a local folder, Ctrl+V. If files already there differ from the
+  backup you are asked, including about files changed *after* the backup:
+  Replace with backup / Keep newer files / Add new only / Keep both. Enter
+  keeps what is there. Paste special (Ctrl+Shift+V) picks the mode up
+  front. Ctrl+Z removes what the restore created.
+- **Enter on a file** restores it to a cache folder and opens a read-only
+  copy. Those copies are deleted by **Empty trash**, which lists them
+  as "Opened backup files". **Alt+Enter** shows a snapshot's details (host, paths, size).
+- Nothing inside a backup can be changed: delete, rename, cut, new
+  folder and the rest say so instead.
+- **Password**: asked once per repository per session and kept in memory
+  only. No prompt when your rustic profile or environment
+  (`RUSTIC_PASSWORD_FILE`, …) already provides it, or when `config.toml`
+  names a file:
+
+      [rustic]
+      password_file = "C:\\Users\\me\\.config\\rustic\\repo.pw"
+      profile = ""         # rustic -P <profile>; empty = rustic's default
+      exe = "rustic"       # binary, looked up on PATH
 
 ## Sounds
 

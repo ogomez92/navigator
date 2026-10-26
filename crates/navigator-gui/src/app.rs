@@ -16,7 +16,8 @@ use navigator_config::{ConfigHandle, SoundEvent};
 use navigator_core::{ConflictMode, NavPath};
 use navigator_fs::read_dir;
 use navigator_plugin_api::host::HostCallbacks;
-use navigator_rclone::{Operation, RcloneDriver, RobocopyDriver, op::OpEvent};
+use navigator_rclone::rustic::{RusticError, RusticSettings};
+use navigator_rclone::{Operation, RcloneDriver, RobocopyDriver, RusticDriver, op::OpEvent};
 
 use crate::plugins::{Host as PluginHost, PluginRegistry};
 use crate::remote_cache::RemoteCache;
@@ -79,6 +80,10 @@ pub struct AppState {
     /// very next event with no restart and no re-wiring.
     pub sound: SoundPlayer,
     pub rclone: RcloneDriver,
+    /// rustic engine: lists backups and restores out of them. Clones share
+    /// one session, so a password typed once serves the scan worker, every
+    /// restore worker and every later listing until the process exits.
+    pub rustic: RusticDriver,
     pub config: ConfigHandle,
     plugin_reg: OnceCell<Arc<PluginRegistry>>,
     hwnd: Mutex<Option<HwndSend>>,
@@ -317,9 +322,11 @@ impl AppState {
         // concurrency is irrelevant for those one-shot commands, so we
         // don't re-read config here.
         let scan_rclone = RcloneDriver::from_path();
+        let rustic = RusticDriver::new(rustic_settings(&cfg.config.read().rustic));
+        let scan_rustic = rustic.clone();
         thread::Builder::new()
             .name("navigator-scan".into())
-            .spawn(move || scan_worker(rx, scan_rclone))
+            .spawn(move || scan_worker(rx, scan_rclone, scan_rustic))
             .expect("spawn scan worker");
 
         let model = Model::new();
@@ -348,6 +355,7 @@ impl AppState {
             speech: SpeechSink::start(),
             sound: SoundPlayer::start(cfg.config.clone()),
             rclone: RcloneDriver::from_path().with_transfers(transfers),
+            rustic,
             config: cfg.config.clone(),
             plugin_reg: OnceCell::new(),
             hwnd: Mutex::new(None),
@@ -448,7 +456,7 @@ impl AppState {
         // Virtual views (This PC, Remotes root) have no real directory
         // to watch; remote sub-paths live behind an rclone remote and
         // likewise can't be locally watched.
-        if path.is_this_pc() || path.is_remotes_root() || path.is_remote() {
+        if path.is_this_pc() || path.is_remotes_root() || path.is_remote() || path.is_rustic() {
             *self.watcher.lock() = None;
             return;
         }
@@ -555,6 +563,12 @@ impl AppState {
             self.say("nothing selected", false);
             return;
         }
+        // An action gets a path on its command line; a backup item has
+        // none an external program could open.
+        if paths.iter().any(|p| p.is_rustic()) {
+            self.refuse_in_backup("running actions");
+            return;
+        }
         let targets: &[NavPath] = if action.single {
             &paths[..1]
         } else {
@@ -582,6 +596,11 @@ impl AppState {
 
     pub fn set_hwnd(&self, hwnd: HWND) {
         *self.hwnd.lock() = Some(HwndSend(hwnd));
+        // A locked backup asks through the main window. Whatever thread
+        // runs rustic blocks in `SendMessageW` until the user answers.
+        let target = HwndSend(hwnd);
+        self.rustic
+            .set_prompter(Arc::new(move |repo, retry| ask_password(target, repo, retry)));
     }
     fn hwnd(&self) -> Option<HwndSend> {
         *self.hwnd.lock()
@@ -893,6 +912,7 @@ impl AppState {
         }
         if !cwd.is_remote()
             && !cwd.is_remotes_root()
+            && !cwd.is_rustic()
             && let Some(root) = volume_root_of(cwd.as_path()).and_then(|p| NavPath::new(p).ok())
         {
             self.set_pending_focus(root);
@@ -911,7 +931,18 @@ impl AppState {
             // Remember the child so the post-listing hook can re-focus
             // on it. Matching for folders is by name; for drive roots →
             // This PC we match via `drive_path_from_display` inverse.
-            *self.pending_focus.lock() = Some(cwd.clone());
+            //
+            // Leaving a backup's snapshot list lands in the folder holding
+            // the repository (local or remote), on the repository's own
+            // row — the stored name of the list is the escaped repo spec,
+            // not that row.
+            let focus = match cwd.rustic_parts() {
+                Some(p) if p.snapshot.is_none() => {
+                    navigator_core::path::rustic_repo_location(&p.repo)
+                }
+                _ => Some(cwd.clone()),
+            };
+            *self.pending_focus.lock() = focus;
             self.set_next_nav_sound(SoundEvent::NavigateUp);
             if let Some(parent) = cwd.parent() {
                 self.navigate(parent);
@@ -1023,6 +1054,10 @@ impl AppState {
     /// substring match on file/directory names). Runs on the scan worker
     /// thread; results land back via WMAPP_SEARCH_RESULTS.
     pub fn start_search(&self, root: NavPath, query: String) {
+        if root.is_rustic() {
+            self.refuse_in_backup("searching");
+            return;
+        }
         let Some(hwnd) = self.hwnd() else {
             return;
         };
@@ -1063,7 +1098,200 @@ impl AppState {
             self.open_remote_file(path);
             return;
         }
+        if path.is_rustic() {
+            self.open_rustic_file(path);
+            return;
+        }
         shell_open(path.as_path());
+    }
+
+    /// Refuse a command because the user is inside a rustic backup, which
+    /// is read-only. Spoken with the error sound, like every other refusal
+    /// of a global chord, so the keypress is never silently swallowed.
+    pub fn refuse_in_backup(&self, what: &str) {
+        self.play(SoundEvent::Error);
+        self.say(
+            &format!(
+                "{what} is not available in a backup. Backups are read only; copy items and paste them elsewhere to restore them."
+            ),
+            true,
+        );
+    }
+
+    /// `true` — with the refusal spoken — when the current folder is
+    /// inside a backup. The guard at the top of every command that would
+    /// change something.
+    fn in_backup(&self, what: &str) -> bool {
+        if self.model.cwd().is_some_and(|c| c.is_rustic()) {
+            self.refuse_in_backup(what);
+            return true;
+        }
+        false
+    }
+
+    /// Whether a paste of `clip` into `dest` may go ahead as far as backups
+    /// are concerned, speaking the reason when it may not. Pasting *into*
+    /// a backup never may; pasting *out of* one is a restore, which only
+    /// copies, only writes local folders, and runs on its own engine — so
+    /// a clipboard mixing backup items with ordinary ones is sent back.
+    fn restore_allowed(&self, clip: &crate::clipboard::ClipFile, dest: &NavPath) -> bool {
+        if dest.is_rustic() {
+            self.refuse_in_backup("pasting");
+            return false;
+        }
+        let from_backup = clip
+            .sources
+            .iter()
+            .filter(|s| NavPath::new(PathBuf::from(s)).is_ok_and(|p| p.is_rustic()))
+            .count();
+        if from_backup == 0 {
+            return true;
+        }
+        let refusal = if clip.cut {
+            Some("items in a backup can only be copied out, not moved")
+        } else if from_backup != clip.sources.len() {
+            Some("the clipboard mixes backup items with ordinary ones; paste them separately")
+        } else if dest.is_remote()
+            || dest.is_this_pc()
+            || dest.is_remotes_root()
+            || dest.is_unc_host_only()
+        {
+            Some("a backup can only be restored into a folder on this computer or a network share")
+        } else {
+            None
+        };
+        if let Some(r) = refusal {
+            self.play(SoundEvent::Error);
+            self.say(r, true);
+            return false;
+        }
+        true
+    }
+
+    /// Tools → Open as rustic backup: show the focused folder — or, when a
+    /// file or nothing is focused, the current one — as a rustic repository.
+    /// A folder on an rclone remote opens as `rclone:<remote:path>`, which
+    /// rustic reaches by running `rclone serve restic` itself.
+    /// Not checked first, same as `--rustic`: the snapshot listing opens
+    /// the repository anyway and says so if it isn't one.
+    pub fn op_open_rustic(&self) {
+        let Some(cwd) = self.model.cwd() else {
+            return;
+        };
+        if cwd.is_rustic() {
+            self.say("already in a backup", false);
+            return;
+        }
+        if cwd.is_this_pc() || cwd.is_remotes_root() {
+            self.play(SoundEvent::Error);
+            self.say("focus a folder holding a rustic repository first", true);
+            return;
+        }
+        let target = self
+            .model
+            .selection_snapshot()
+            .focus()
+            .and_then(|i| self.model.get(i))
+            .filter(|e| e.is_dir())
+            .map(|e| cwd.join(&e.name))
+            .unwrap_or(cwd);
+        let Some(repo) = navigator_core::path::rustic_repo_spec(&target) else {
+            return;
+        };
+        self.navigate(NavPath::rustic_repo(&repo));
+    }
+
+    /// Enter the snapshot named by row `row` of the snapshot list at
+    /// `list`. Lands in the folder the snapshot backed up — its root is
+    /// `C\Users\…` and walking down that chain by hand every time is the
+    /// whole cost of browsing a backup. Up still walks the chain, and Back
+    /// returns to the list.
+    pub fn open_rustic_snapshot(&self, list: &NavPath, row: &str) {
+        let Some(parts) = list.rustic_parts() else {
+            return;
+        };
+        let start = self
+            .rustic
+            .cached_snapshot(&parts.repo, row)
+            .map(|s| navigator_rclone::rustic::snapshot_start(&s))
+            .unwrap_or_default();
+        self.navigate(NavPath::rustic(&parts.repo, row, &start));
+    }
+
+    /// Enter on a symbolic link inside a backup: say where it points. A
+    /// restore can't follow it, and opening it would mean whatever the
+    /// target is on *this* machine, today.
+    pub fn describe_rustic_link(&self, link: NavPath) {
+        let rustic = self.rustic.clone();
+        let speech = self.speech.handle();
+        std::thread::Builder::new()
+            .name("navigator-rustic-link".into())
+            .spawn(move || {
+                let text = match rustic.node(&link) {
+                    Ok(Some(n)) => match n.linktarget {
+                        Some(t) => format!("link to {t}"),
+                        None => "link with no target recorded".into(),
+                    },
+                    _ => "link target unknown".into(),
+                };
+                let _ = speech.send(crate::speech::Utterance {
+                    text,
+                    interrupt: true,
+                });
+            })
+            .expect("spawn rustic link worker");
+    }
+
+    /// Open a file from a backup: restore it into the staging cache, mark
+    /// that copy read-only, and hand it to its default app.
+    ///
+    /// Read-only on purpose. A backup is not edited through navigator, and
+    /// unlike a remote file there is no upload back — a writable copy would
+    /// invite saving changes into a cache folder nobody looks at. To get an
+    /// editable file the user copies it out, which is a restore.
+    fn open_rustic_file(&self, path: NavPath) {
+        let Some(parts) = path.rustic_parts() else {
+            return;
+        };
+        let Some(id) = parts
+            .snapshot
+            .as_deref()
+            .and_then(navigator_rclone::rustic::snapshot_id_of)
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let staged =
+            crate::restore::stage_path(&self.remote_cache.root, &parts.repo, &id, &parts.sub);
+        let Ok(dst) = NavPath::new(staged.clone()) else {
+            self.say("cache path invalid", true);
+            return;
+        };
+        let ctx = self.clone_for_worker();
+        let name = path.file_name().to_string();
+        self.say(&format!("restoring {name} to open it"), false);
+        std::thread::Builder::new()
+            .name("navigator-rustic-open".into())
+            .spawn(move || {
+                // Counted like any restore: closing mid-way asks first.
+                let _guard = ctx.state.upgrade().map(|s| s.op_guard());
+                // A copy staged earlier is read-only; rustic must be able
+                // to bring it back in line with the snapshot.
+                set_readonly(&staged, false);
+                let op = Operation::RusticRestore {
+                    src: path,
+                    dst,
+                    excludes: Vec::new(),
+                    delete: false,
+                };
+                if !ctx.run_one(op) {
+                    return;
+                }
+                set_readonly(&staged, true);
+                ctx.say(format!("opening a read-only copy of {name}"), false);
+                shell_open(&staged);
+            })
+            .expect("spawn rustic open worker");
     }
 
     /// Download a remote file into the staging cache, then hand it to
@@ -1241,6 +1469,9 @@ impl AppState {
     }
 
     pub fn op_cut(&self) {
+        if self.in_backup("cutting") {
+            return;
+        }
         let paths = self.model.selected_paths();
         if paths.is_empty() {
             self.say("nothing selected", false);
@@ -1271,6 +1502,9 @@ impl AppState {
     /// rather than mixed — mixing cut and copy sources in one paste has
     /// no sensible semantics.
     pub fn op_append_clipboard(&self, cut_mode: bool) {
+        if cut_mode && self.in_backup("cutting") {
+            return;
+        }
         let incoming = self.model.selected_paths();
         if incoming.is_empty() {
             self.say("nothing selected", false);
@@ -1377,6 +1611,9 @@ impl AppState {
             self.say("clipboard empty", false);
             return;
         }
+        if !self.restore_allowed(&clip, &dest) {
+            return;
+        }
         let default = self.config.read().rclone.on_conflict;
         match crate::preflight::prompt_mode(
             self.hwnd(),
@@ -1413,6 +1650,10 @@ impl AppState {
             self.say("clipboard paths invalid", false);
             return;
         }
+        if !self.restore_allowed(&clip, &dest) {
+            return;
+        }
+        let restoring = sources.iter().any(|s| s.is_rustic());
 
         crate::clipboard::push_history(crate::clipboard::HistoryEntry {
             kind: "paste".into(),
@@ -1459,6 +1700,13 @@ impl AppState {
             m => m,
         };
         let state = self.clone_for_worker();
+        if restoring {
+            std::thread::Builder::new()
+                .name("navigator-restore".into())
+                .spawn(move || state.run_restore_batch(sources, dest, default_mode, choice, plan))
+                .expect("spawn restore worker");
+            return;
+        }
         std::thread::Builder::new()
             .name("navigator-batch-op".into())
             .spawn(move || state.run_batch(sources, dest, cut, default_mode, choice, plan))
@@ -1466,6 +1714,9 @@ impl AppState {
     }
 
     pub fn op_delete(&self) {
+        if self.in_backup("deleting") {
+            return;
+        }
         let selected = self.model.selected_paths_with_kind();
         if selected.is_empty() {
             self.say("nothing selected", false);
@@ -1621,6 +1872,9 @@ impl AppState {
     /// delete engine (the UNC path of a normal delete) is not used here
     /// because its prompt would make this a two-dialog delete.
     pub fn op_permanent_delete(&self) {
+        if self.in_backup("deleting") {
+            return;
+        }
         let Some(cwd) = self.model.cwd() else {
             return;
         };
@@ -1835,6 +2089,12 @@ impl AppState {
             return;
         };
         let speech = self.speech.handle();
+        // Opened backup files go with the trash: full-size, read-only
+        // copies of immutable snapshots, nothing else ever deletes them,
+        // and any one can be restored again in a keystroke. The rest of
+        // `.remote-cache` stays — a staged remote file can hold edits that
+        // were never uploaded.
+        let backup_copies = crate::restore::cache_dir(&self.remote_cache.root);
         self.say("checking trash…", false);
         std::thread::Builder::new()
             .name("navigator-trash-survey".into())
@@ -1856,19 +2116,31 @@ impl AppState {
                     };
                     let stats = crate::props::compute_folder_stats(&nav);
                     total = total.saturating_add(stats.total_size);
-                    entries.push((trash, d.name, stats.total_size));
+                    entries.push((trash, format!("{} — .trash", d.name), stats.total_size));
+                }
+                if backup_copies.exists()
+                    && let Ok(nav) = NavPath::new(&backup_copies)
+                {
+                    let stats = crate::props::compute_folder_stats(&nav);
+                    total = total.saturating_add(stats.total_size);
+                    entries.push((
+                        backup_copies,
+                        "Opened backup files (read-only copies)".into(),
+                        stats.total_size,
+                    ));
                 }
 
                 if entries.is_empty() {
                     let _ = speech.send(crate::speech::Utterance {
-                        text: ".trash is already empty on all drives".into(),
+                        text: "nothing to empty: no .trash on any drive and no opened backup files"
+                            .into(),
                         interrupt: false,
                     });
                     return;
                 }
 
                 let mut body = String::from(
-                    "Permanently delete .trash on the following drives?\n\
+                    "Permanently delete the following?\n\
                      This cannot be undone.\n\n",
                 );
                 for (_, label, size) in &entries {
@@ -1933,7 +2205,7 @@ impl AppState {
                 });
                 let msg = if failed == 0 {
                     format!(
-                        "emptied .trash on {} drive(s); {} freed",
+                        "emptied {} location(s); {} freed",
                         ok,
                         crate::listview::format_size(total_freed),
                     )
@@ -2217,6 +2489,9 @@ impl AppState {
     /// litters a file server's root) must never be taken, so the refusal
     /// happens here — before any copy — rather than at restore time.
     pub fn op_backup(&self) {
+        if self.in_backup("backing up") {
+            return;
+        }
         let Some(cwd) = self.model.cwd() else {
             return;
         };
@@ -2289,6 +2564,9 @@ impl AppState {
     /// moved to `.trash` first, and only then is the backup *copied* back
     /// — copied, so the same backup can be restored again later.
     pub fn op_restore_backup(&self) {
+        if self.in_backup("restoring a navigator backup") {
+            return;
+        }
         let all = crate::backup::load_backups();
         if all.is_empty() {
             self.say("no backups recorded", false);
@@ -2371,6 +2649,9 @@ impl AppState {
     fn clone_for_worker(&self) -> WorkerCtx {
         let (progress_on, announce_interval_secs, transfers, robocopy) = {
             let g = self.config.read();
+            // Same rule as `--transfers`: a config edit applies to the next
+            // operation, not the next launch.
+            self.rustic.set_settings(rustic_settings(&g.rustic));
             (
                 g.rclone.progress_window,
                 g.general.announce_interval_secs,
@@ -2389,6 +2670,7 @@ impl AppState {
         WorkerCtx {
             rclone: self.rclone.clone().with_transfers(transfers),
             robocopy: robocopy.then(|| RobocopyDriver::from_path().with_threads(transfers)),
+            rustic: self.rustic.clone(),
             speech: self.speech.handle(),
             sound: self.sound.clone(),
             refresh_target: self.model.cwd(),
@@ -2415,7 +2697,10 @@ impl AppState {
                 // Remote paths must cross as rclone `name:sub` syntax — the
                 // raw `\\?\NavigatorRemote\...` sentinel is useless in the Run
                 // dialog or a CLI arg. Local paths copy verbatim.
-                let s = p.rclone_arg().unwrap_or_else(|| p.to_string());
+                let s = p
+                    .rclone_arg()
+                    .or_else(|| p.rustic_display())
+                    .unwrap_or_else(|| p.to_string());
                 if s.chars().any(|c| c.is_whitespace()) {
                     format!("\"{}\"", s)
                 } else {
@@ -2448,6 +2733,9 @@ impl AppState {
     /// the new instance picks the path up via the same syntax the address
     /// bar accepts.
     pub fn op_open_containing_new_window(&self) {
+        if self.in_backup("opening a new window") {
+            return;
+        }
         let sel = self.model.selection_snapshot();
         let Some(idx) = sel.focus() else {
             self.say("nothing focused", false);
@@ -2505,6 +2793,12 @@ impl AppState {
             self.say("can't copy remote paths to OS clipboard", true);
             return;
         }
+        // Other programs would get paths to files that do not exist. Ctrl+C
+        // is how a backup item is copied out.
+        if paths.iter().any(|p| p.is_rustic()) {
+            self.refuse_in_backup("copying to the Windows clipboard");
+            return;
+        }
         let n = paths.len();
         let os_paths: Vec<std::path::PathBuf> =
             paths.iter().map(|p| p.as_path().to_path_buf()).collect();
@@ -2531,6 +2825,9 @@ impl AppState {
     /// The mirror of `op_copy_to_clipboard`; remote (rclone) paths are
     /// rejected — the shell can't resolve `\\?\NavigatorRemote\...`.
     pub fn op_cut_to_clipboard(&self) {
+        if self.in_backup("cutting") {
+            return;
+        }
         let paths = self.model.selected_paths();
         if paths.is_empty() {
             self.say("nothing selected", false);
@@ -2574,6 +2871,9 @@ impl AppState {
     /// the clipboard and launches the helper, and a small reaper thread
     /// announces the outcome if we are still around to hear it.
     pub fn op_paste_from_clipboard(&self) {
+        if self.in_backup("pasting") {
+            return;
+        }
         let Some(dest) = self.model.cwd() else {
             return;
         };
@@ -2688,6 +2988,9 @@ impl AppState {
     /// `[extraction]` config section. The file watcher folds new entries
     /// into the listing, so no refresh is needed.
     pub fn op_extract(&self) {
+        if self.in_backup("extracting") {
+            return;
+        }
         let selection = self.model.selected_paths_with_kind();
         if selection.is_empty() {
             self.say("nothing selected", false);
@@ -2805,6 +3108,9 @@ impl AppState {
     /// worker; the file watcher folds the new `.zip` into the listing so no
     /// refresh is needed.
     pub fn op_zip(&self) {
+        if self.in_backup("zipping") {
+            return;
+        }
         let selection = self.model.selected_paths();
         if selection.is_empty() {
             self.say("nothing selected", false);
@@ -2897,6 +3203,18 @@ impl AppState {
             return;
         }
 
+        if cwd.is_rustic() {
+            let rustic = self.rustic.clone();
+            std::thread::Builder::new()
+                .name("navigator-properties-rustic".into())
+                .spawn(move || {
+                    let body = rustic_properties(&rustic, &cwd, &entry, &path);
+                    post_viewer(hwnd, title, body);
+                })
+                .expect("spawn rustic properties worker");
+            return;
+        }
+
         if is_dir {
             self.say(&format!("scanning {}…", entry.name), false);
         }
@@ -2944,6 +3262,9 @@ impl AppState {
     /// path and reported an empty tree for every remote. One
     /// `rclone lsjson --recursive` replaces the whole walk.
     pub fn op_dump_tree(&self) {
+        if self.in_backup("the tree dump") {
+            return;
+        }
         let Some(cwd) = self.model.cwd() else {
             return;
         };
@@ -3014,6 +3335,9 @@ impl AppState {
     /// [`Self::scan_space`], and the tree window opens from the UI thread
     /// when the result lands.
     pub fn op_space_breakdown(&self) {
+        if self.in_backup("the space breakdown") {
+            return;
+        }
         let Some(cwd) = self.model.cwd() else {
             return;
         };
@@ -3171,6 +3495,9 @@ impl AppState {
     /// cannot see a `\\?\NavigatorRemote\…` path and would report the
     /// whole remote as missing rather than failing loudly.
     pub fn op_compare_trees(&self) {
+        if self.in_backup("comparing trees") {
+            return;
+        }
         let Some(cwd) = self.model.cwd() else {
             return;
         };
@@ -3227,6 +3554,9 @@ impl AppState {
     /// `pending_focus` so the caret lands on the renamed row after the
     /// post-op refresh — without it the listing rebuild defaults to row 0.
     pub fn op_rename(&self, old_name: &str, new_name: &str) {
+        if self.in_backup("renaming") {
+            return;
+        }
         let Some(cwd) = self.model.cwd() else {
             return;
         };
@@ -3242,6 +3572,9 @@ impl AppState {
     /// fires the op. Pending focus is armed so the newly created row gets
     /// the caret after the post-op refresh.
     pub fn op_new_folder(&self, name: String) {
+        if self.in_backup("creating a folder") {
+            return;
+        }
         let name = name.trim().to_string();
         if name.is_empty() {
             self.say("folder name empty", true);
@@ -3273,6 +3606,9 @@ impl AppState {
     /// is required so the shell has a type to resolve. Pending focus is
     /// armed so the created row gets the caret after the post-op refresh.
     pub fn op_new_file(&self, name: String) {
+        if self.in_backup("creating a file") {
+            return;
+        }
         let name = name.trim().to_string();
         if name.is_empty() {
             self.say("file name empty", true);
@@ -3588,7 +3924,7 @@ fn confirm_empty_trash(parent: Option<HWND>, body: &str) -> bool {
     };
     use windows::core::PCWSTR;
 
-    let title_w: Vec<u16> = "Empty .trash on all drives?"
+    let title_w: Vec<u16> = "Empty trash?"
         .encode_utf16()
         .chain([0])
         .collect();
@@ -3647,6 +3983,71 @@ fn confirm_extract_sweep(parent: Option<HWND>, body: &str) -> bool {
 
 /// Ask the Windows shell to open `path` with its default handler. Used
 /// for both local files and files downloaded out of rclone remotes.
+/// `[rustic]` config → driver settings.
+fn rustic_settings(c: &navigator_config::Rustic) -> RusticSettings {
+    let exe = c.exe.trim();
+    RusticSettings {
+        exe: PathBuf::from(if exe.is_empty() { "rustic" } else { exe }),
+        profile: c.profile.trim().to_string(),
+        password_file: c.password_file.trim().to_string(),
+    }
+}
+
+/// The rustic driver's prompter: ask on the UI thread, block until
+/// answered. Takes the whole `HwndSend` so the closure that calls it
+/// captures something `Send + Sync` rather than the bare `HWND` field.
+fn ask_password(target: HwndSend, repo: &str, retry: bool) -> Option<String> {
+    let mut req = crate::password_dialog::Request {
+        repo: repo.to_string(),
+        retry,
+        answer: None,
+    };
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+            target.0,
+            crate::window::WMAPP_RUSTIC_PASSWORD,
+            Some(WPARAM(0)),
+            Some(LPARAM(&raw mut req as isize)),
+        );
+    }
+    req.answer
+}
+
+/// Properties text for the focused row of a backup listing.
+fn rustic_properties(
+    rustic: &RusticDriver,
+    cwd: &NavPath,
+    entry: &navigator_core::Entry,
+    path: &NavPath,
+) -> String {
+    let Some(parts) = cwd.rustic_parts() else {
+        return String::new();
+    };
+    if parts.snapshot.is_none() {
+        let snap = rustic.cached_snapshot(&parts.repo, &entry.name).or_else(|| {
+            rustic.snapshots(&parts.repo).ok()?;
+            rustic.cached_snapshot(&parts.repo, &entry.name)
+        });
+        return match snap {
+            Some(s) => crate::restore::snapshot_properties(&parts.repo, &s),
+            None => format!("Snapshot {} is no longer in the repository.", entry.name),
+        };
+    }
+    let node = rustic.node(path).ok().flatten();
+    crate::restore::node_properties(entry, path, node.as_ref())
+}
+
+fn set_readonly(p: &std::path::Path, on: bool) {
+    if let Ok(m) = std::fs::metadata(p) {
+        let mut perm = m.permissions();
+        if perm.readonly() != on {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perm.set_readonly(on);
+            let _ = std::fs::set_permissions(p, perm);
+        }
+    }
+}
+
 fn shell_open(path: &std::path::Path) {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::UI::Shell::ShellExecuteW;
@@ -3763,6 +4164,8 @@ struct WorkerCtx {
     /// [`RobocopyDriver::handles`]; everything else stays on `rclone`. See
     /// [`WorkerCtx::spawn_transfer`].
     robocopy: Option<RobocopyDriver>,
+    /// Runs [`Operation::RusticRestore`]; shares the app's rustic session.
+    rustic: RusticDriver,
     speech: Sender<crate::speech::Utterance>,
     /// Event sounds. Carried by value like the speech sender so a worker
     /// never has to upgrade the `Weak<AppState>` just to chime.
@@ -4734,6 +5137,275 @@ impl WorkerCtx {
         self.refresh_with_focus(first_created);
     }
 
+    /// A paste whose clipboard comes from a rustic backup: a restore, one
+    /// `rustic restore` per item.
+    ///
+    /// Same shape as [`Self::run_batch`] — undo targets published first, one
+    /// conflict decision for the whole paste, one job-level meter, one
+    /// summary — but conflicts are found with `rustic diff` and handled with
+    /// excludes, because rustic has no conflict flags of its own. The rules
+    /// are in [`crate::restore`]. Holds an [`OpGuard`], so closing the window
+    /// mid-restore asks first.
+    fn run_restore_batch(
+        self,
+        sources: Vec<NavPath>,
+        dest_dir: NavPath,
+        default_mode: ConflictMode,
+        preset: Option<crate::preflight::PasteChoice>,
+        plan: Arc<PastePlan>,
+    ) {
+        use crate::preflight::{PasteChoice, prompt_restore, unique_numbered_path};
+        use crate::restore::{Landing, plan_item, shown};
+        let _guard = self.state.upgrade().map(|s| s.op_guard());
+
+        // Undo may only remove what this restore creates — see `run_batch`.
+        let (undo_created, undo_originals): (Vec<NavPath>, Vec<NavPath>) = sources
+            .iter()
+            .map(|s| (dest_dir.join(s.file_name()), s.clone()))
+            .filter(|(d, _)| !d.as_path().exists())
+            .unzip();
+        plan.publish(undo_created, undo_originals);
+
+        struct Item {
+            src: NavPath,
+            is_dir: bool,
+            dst: NavPath,
+            landing: Landing,
+            /// `None` when the comparison itself failed.
+            diff: Option<Vec<navigator_rclone::rustic::DiffEntry>>,
+        }
+        let password_cancelled = |me: &Self| {
+            me.play(SoundEvent::Cancelled);
+            me.say("restore cancelled, no password given", true);
+        };
+
+        let mut items = Vec::with_capacity(sources.len());
+        for src in sources {
+            // Usually answered from the listing the user just browsed. A
+            // clipboard from another session may need the repository opened
+            // — and its password asked for — first.
+            let is_dir = match self.rustic.is_dir(&src) {
+                Ok(d) => d,
+                Err(RusticError::PasswordCancelled) => return password_cancelled(&self),
+                Err(e) => {
+                    // The restore itself will fail and report it properly.
+                    warn!("rustic: cannot classify {}: {}", src, e);
+                    false
+                }
+            };
+            let dst = dest_dir.join(src.file_name());
+            let landing = crate::restore::landing(is_dir, dst.as_path());
+            items.push(Item {
+                src,
+                is_dir,
+                dst,
+                landing,
+                diff: Some(Vec::new()),
+            });
+        }
+
+        if items.iter().any(|i| i.landing == Landing::Merge) {
+            // A diff reads the existing local copy; on a big folder that is
+            // seconds of silence otherwise.
+            self.say("checking destination", false);
+        }
+        for it in items.iter_mut().filter(|i| i.landing == Landing::Merge) {
+            match self.rustic.diff(&it.src, it.dst.as_path()) {
+                Ok(d) => it.diff = Some(d),
+                Err(RusticError::PasswordCancelled) => return password_cancelled(&self),
+                Err(e) => {
+                    warn!("rustic diff {} vs {}: {}", it.src, it.dst, e);
+                    it.diff = None;
+                }
+            }
+        }
+
+        let choice = match preset {
+            Some(c) => c,
+            // Configured to never replace: honoured silently, as for files.
+            None if !default_mode.is_destructive() => PasteChoice::Mode(default_mode),
+            // Unlike a file paste, a restore also asks about files that
+            // are *newer* than the backup. Update spares those, which is
+            // right for a copy and backwards for a restore: the newer file
+            // is usually the broken one the user came to replace, and
+            // keeping it without a word quietly undoes the restore. Split
+            // every differing file by age and let `prompt_restore` say so.
+            None => {
+                let mut older: Vec<String> = Vec::new();
+                let mut newer: Vec<String> = Vec::new();
+                for it in items.iter().filter(|i| i.landing == Landing::Merge) {
+                    let name = it.src.file_name();
+                    match &it.diff {
+                        Some(d) => {
+                            let p = plan_item(ConflictMode::Update, d, |rel| {
+                                self.restore_local_newer(&it.src, &it.dst, it.is_dir, rel)
+                            });
+                            older.extend(p.overwrites.iter().map(|r| shown(name, r, it.is_dir)));
+                            // Update's excludes are the newer files plus the
+                            // type changes, which are reported separately.
+                            newer.extend(
+                                p.excludes
+                                    .iter()
+                                    .filter(|r| !p.retyped.contains(r))
+                                    .map(|r| shown(name, r, it.is_dir)),
+                            );
+                        }
+                        // Couldn't compare: name the whole item, never
+                        // assume there is nothing to lose.
+                        None => older.push(name.to_string()),
+                    }
+                }
+                if older.is_empty() && newer.is_empty() {
+                    PasteChoice::Mode(default_mode)
+                } else {
+                    prompt_restore(self.hwnd, &older, &newer)
+                }
+            }
+        };
+        let mode = match choice {
+            PasteChoice::Cancel => {
+                self.play(SoundEvent::Cancelled);
+                self.say("cancelled", false);
+                return;
+            }
+            PasteChoice::KeepBoth => None,
+            PasteChoice::Mode(m) => Some(m),
+        };
+        self.play(SoundEvent::PasteStart);
+
+        let total = items.len();
+        let mut prog = OpProgress::new(&self, "Restoring", total as u64);
+        prog.opening("restoring", items.first().map(|i| i.src.file_name()));
+        let (mut failed, mut skipped, mut renamed) = (0u32, 0u32, 0u32);
+        let mut retyped: Vec<String> = Vec::new();
+        let mut first_created: Option<NavPath> = None;
+
+        for it in &items {
+            if prog.cancelled() {
+                break;
+            }
+            let name = it.src.file_name().to_string();
+            let (dst, excludes, delete) = match (mode, it.landing) {
+                (_, Landing::Fresh) => (it.dst.clone(), Vec::new(), false),
+                // Keep both: a numbered sibling, restored fresh.
+                (None, _) => match NavPath::new(unique_numbered_path(it.dst.as_path())) {
+                    Ok(d) => {
+                        renamed += 1;
+                        (d, Vec::new(), false)
+                    }
+                    Err(_) => {
+                        skipped += 1;
+                        prog.skip(1);
+                        continue;
+                    }
+                },
+                (Some(_), Landing::KindClash) => {
+                    skipped += 1;
+                    prog.skip(1);
+                    retyped.push(name);
+                    continue;
+                }
+                (Some(m), Landing::Merge) if it.diff.is_none() => {
+                    if m.is_destructive() {
+                        // The user was shown this item by name above (or
+                        // chose the mode outright): rustic's own
+                        // overwrite-what-differs applies.
+                        (it.dst.clone(), Vec::new(), m == ConflictMode::Mirror && it.is_dir)
+                    } else {
+                        // Nothing to protect existing files *with*.
+                        skipped += 1;
+                        prog.skip(1);
+                        prog.record_problem("could not compare it with the existing copy", Some(name));
+                        continue;
+                    }
+                }
+                (Some(m), Landing::Merge) => {
+                    let diff = it.diff.as_deref().unwrap_or_default();
+                    let p = plan_item(m, diff, |rel| self.restore_local_newer(&it.src, &it.dst, it.is_dir, rel));
+                    retyped.extend(p.retyped.iter().map(|r| shown(&name, r, it.is_dir)));
+                    if it.is_dir {
+                        (it.dst.clone(), p.excludes, m == ConflictMode::Mirror)
+                    } else if !p.excludes.is_empty() {
+                        // A protected file: protecting it means leaving it.
+                        skipped += 1;
+                        prog.skip(1);
+                        continue;
+                    } else if p.overwrites.is_empty() {
+                        // Already identical to the backup.
+                        prog.skip(1);
+                        continue;
+                    } else {
+                        (it.dst.clone(), Vec::new(), false)
+                    }
+                }
+            };
+
+            prog.begin(1);
+            let ok = self.run_op(
+                Operation::RusticRestore {
+                    src: it.src.clone(),
+                    dst: dst.clone(),
+                    excludes,
+                    delete,
+                },
+                &mut prog,
+            );
+            prog.end();
+            if !ok {
+                failed += 1;
+                continue;
+            }
+            if !dst.as_path().exists() {
+                prog.record_problem("rustic reported success but nothing arrived", Some(name));
+                failed += 1;
+                continue;
+            }
+            if first_created.is_none() {
+                first_created = Some(dst);
+            }
+        }
+
+        if prog.cancelled() {
+            prog.finish(false);
+            self.play_outcome(/*cancelled=*/ true, failed > 0, SoundEvent::CopyDone);
+            self.say("cancelled", true);
+            self.refresh();
+            return;
+        }
+        prog.finish(failed == 0);
+        self.play_outcome(/*cancelled=*/ false, failed > 0, SoundEvent::CopyDone);
+        let mut summary = crate::preflight::paste_summary(mode, total, failed, skipped, renamed);
+        if let Some(note) = crate::restore::retyped_note(&retyped) {
+            summary = format!("{summary}. {note}");
+        }
+        self.say(summary, failed > 0);
+        self.refresh_with_focus(first_created);
+    }
+
+    /// Update's question for one differing file of a restore: is the local
+    /// copy newer than the backed-up one? `rel` is relative to the item
+    /// (and is the item's own name when the item is a file). When either
+    /// time can't be read the answer is yes — under Update, an unknown is
+    /// protected rather than overwritten.
+    fn restore_local_newer(&self, src: &NavPath, dst: &NavPath, is_dir: bool, rel: &str) -> bool {
+        let (local, backup) = if is_dir {
+            (dst.as_path().join(rel), src.join(&rel.replace('/', "\\")))
+        } else {
+            (dst.as_path().to_path_buf(), src.clone())
+        };
+        let backup_time = self
+            .rustic
+            .node(&backup)
+            .ok()
+            .flatten()
+            .and_then(|n| n.mtime)
+            .and_then(|t| navigator_rclone::rustic::parse_time(&t));
+        match (crate::restore::local_mtime(&local), backup_time) {
+            (Some(l), Some(b)) => crate::restore::is_newer(l, b),
+            _ => true,
+        }
+    }
+
     /// Reverse a paste. For copy-mode, delete each created entry. For
     /// cut-mode, move each `created[i]` back to `originals[i]`. Missing
     /// paths are skipped silently — the paste may have been partially
@@ -5130,6 +5802,9 @@ impl WorkerCtx {
     /// falls back to rclone rather than failing the paste — both engines
     /// carry out the same `Operation`.
     fn spawn_transfer(&self, op: Operation) -> std::io::Result<navigator_rclone::OpHandle> {
+        if matches!(op, Operation::RusticRestore { .. }) {
+            return self.rustic.spawn(op);
+        }
         if let Some(rc) = self.robocopy_for(&op) {
             match rc.spawn(op.clone()) {
                 Ok(h) => return Ok(h),
@@ -5157,6 +5832,9 @@ impl WorkerCtx {
     }
 
     fn path_is_dir(&self, p: &NavPath) -> bool {
+        if p.is_rustic() {
+            return self.rustic.is_dir(p).unwrap_or(false);
+        }
         if !p.is_remote() {
             return p.as_path().is_dir();
         }
@@ -5336,6 +6014,7 @@ fn op_verb(op: &Operation) -> &'static str {
         Operation::Rename { .. } => "Moving",
         Operation::Delete { .. } => "Deleting",
         Operation::Mkdir { .. } | Operation::Touch { .. } => "Creating",
+        Operation::RusticRestore { .. } => "Restoring",
     }
 }
 
@@ -5362,6 +6041,7 @@ fn op_subject(op: &Operation) -> Option<String> {
         Operation::Delete { targets, .. } => targets.first().and_then(name),
         Operation::Mkdir { dir } => name(dir),
         Operation::Touch { file } => name(file),
+        Operation::RusticRestore { src, .. } => name(src),
     }
 }
 
@@ -5656,7 +6336,11 @@ fn io_err(e: windows::core::Error) -> std::io::Error {
     std::io::Error::other(format!("{}", e))
 }
 
-fn scan_worker(rx: crossbeam_channel::Receiver<ScanCmd>, rclone: RcloneDriver) {
+fn scan_worker(
+    rx: crossbeam_channel::Receiver<ScanCmd>,
+    rclone: RcloneDriver,
+    rustic: RusticDriver,
+) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
             ScanCmd::Shutdown => break,
@@ -5702,6 +6386,28 @@ fn scan_worker(rx: crossbeam_channel::Receiver<ScanCmd>, rclone: RcloneDriver) {
                         Ok(e) => e,
                         Err(e) => {
                             error!("rclone lsjson {}: {}", target, e);
+                            let payload =
+                                Box::into_raw(Box::new((path.clone(), e.to_string()))) as isize;
+                            unsafe {
+                                let _ = PostMessageW(
+                                    Some(hwnd.0),
+                                    WMAPP_DIR_ERROR,
+                                    WPARAM(0),
+                                    LPARAM(payload),
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                } else if path.is_rustic() {
+                    // May block on a password prompt; this worker is what
+                    // the user is waiting on anyway.
+                    match rustic.list(&path) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            if e != RusticError::PasswordCancelled {
+                                error!("rustic list {}: {}", path, e);
+                            }
                             let payload =
                                 Box::into_raw(Box::new((path.clone(), e.to_string()))) as isize;
                             unsafe {

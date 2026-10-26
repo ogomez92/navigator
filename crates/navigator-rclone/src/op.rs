@@ -207,6 +207,22 @@ pub enum Operation {
     /// `rclone touch` is the cross-backend equivalent of Unix `touch`, so
     /// this works for local and remote endpoints alike.
     Touch { file: NavPath },
+    /// Restore `src` — a file or folder inside a rustic snapshot (see
+    /// [`NavPath::is_rustic`]) — to exactly `dst`, a local path. A folder's
+    /// *contents* land in `dst`, so callers pass `dest_dir\<name>`.
+    ///
+    /// Runs on [`crate::rustic::RusticDriver`], never on rclone, which
+    /// cannot read a rustic repository: [`RcloneDriver::spawn`] refuses it.
+    ///
+    /// `excludes` are paths relative to `src` that must not be written —
+    /// existing files a conflict mode protects. `delete` prunes files in
+    /// `dst` the snapshot doesn't have (Mirror).
+    RusticRestore {
+        src: NavPath,
+        dst: NavPath,
+        excludes: Vec<String>,
+        delete: bool,
+    },
 }
 
 /// What a `--dry-run` pass says an operation would do. Returned from
@@ -590,6 +606,12 @@ impl RcloneDriver {
     /// Kick off the real operation. Returns immediately with a handle; all
     /// progress and completion flows through `handle.events`.
     pub fn spawn(&self, op: Operation) -> std::io::Result<OpHandle> {
+        if matches!(op, Operation::RusticRestore { .. }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "a rustic restore runs on the rustic driver, not rclone",
+            ));
+        }
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let mut cmd = self.base_command();
         push_op_args(&mut cmd, &op, /*dry_run=*/ false);
@@ -1044,7 +1066,7 @@ struct LsItem {
 /// degrade gracefully to the nearest whole second, since the UI only
 /// ever renders this at second granularity. Returns `None` if the string
 /// doesn't even look like a date.
-fn parse_rfc3339_filetime(s: &str) -> Option<FileTime> {
+pub(crate) fn parse_rfc3339_filetime(s: &str) -> Option<FileTime> {
     // Expect at minimum `YYYY-MM-DDTHH:MM:SS`.
     let bytes = s.as_bytes();
     if bytes.len() < 19 {
@@ -1183,6 +1205,9 @@ pub fn local_dest_dir(op: &Operation) -> Option<std::path::PathBuf> {
                 .map(|p| p.to_path_buf());
         }
         Operation::Delete { .. } => return None,
+        // A restore is never retried elevated: the elevated path re-runs
+        // the op through rclone, which cannot read a rustic repository.
+        Operation::RusticRestore { .. } => return None,
     };
     if nav.is_remote() {
         return None;
@@ -1317,6 +1342,8 @@ pub fn op_args(op: &Operation, dry_run: bool) -> Vec<String> {
             out.push("touch".into());
             out.push(nav_arg(file));
         }
+        // Not an rclone verb; `spawn` refuses the op before getting here.
+        Operation::RusticRestore { .. } => {}
     }
     out
 }

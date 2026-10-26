@@ -697,7 +697,7 @@ pub fn toml_string(s: &str) -> String {
     out
 }
 
-fn format_size_with_bytes(n: u64) -> String {
+pub(crate) fn format_size_with_bytes(n: u64) -> String {
     if n < 1024 {
         format!("{} bytes", n)
     } else {

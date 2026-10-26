@@ -102,6 +102,11 @@ pub const WMAPP_SPACE_SCANNED: u32 = WM_APP + 13;
 /// afterwards. The folder walk behind the sizes is unbounded IO, so it
 /// runs on `navigator-delete-survey`; the dialog runs here.
 pub const WMAPP_PERMANENT_DELETE_SURVEYED: u32 = WM_APP + 14;
+/// A rustic repository needs its password. **Sent**, not posted: the
+/// asking worker blocks in `SendMessageW` until the dialog closes, and
+/// `lParam` points at a [`crate::password_dialog::Request`] on its stack,
+/// which the handler fills in with the answer.
+pub const WMAPP_RUSTIC_PASSWORD: u32 = WM_APP + 15;
 /// Payload of [`WMAPP_PERMANENT_DELETE_SURVEYED`]: targets, body, next focus.
 pub type PermanentDeleteSurvey = (
     Vec<(navigator_core::NavPath, bool)>,
@@ -438,6 +443,10 @@ pub enum Commands {
     PasteSpecial = 151,
     CompareTrees = 152,
     SpaceBreakdown = 153,
+    /// Open the focused folder (or the current one) as a rustic backup
+    /// repository — the in-app form of `navigator --rustic <folder>`.
+    /// Menu-only, like Compare trees.
+    OpenRustic = 154,
     // Help menu
     About = 160,
     // Shortcut/Action dynamic range
@@ -672,6 +681,12 @@ fn build_menu() -> HMENU {
             MF_STRING,
             Commands::ConnectRemote as usize,
             w!("&Connect to remote…"),
+        );
+        let _ = AppendMenuW(
+            tools,
+            MF_STRING,
+            Commands::OpenRustic as usize,
+            w!("Open as rustic &backup"),
         );
         let _ = AppendMenuW(tools, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(
@@ -1003,11 +1018,17 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             // claim either way, or every later worker would think the user
             // is in a folder they never reached and skip its refresh.
             data.state.settle_nav_target(&path);
-            data.state.say(&format!("cannot open {}: {}", path.file_name(), err), true);
+            // The user dismissed a backup's password prompt: their own
+            // choice, so it is acknowledged rather than reported.
+            if err == navigator_rclone::rustic::PASSWORD_CANCELLED {
+                data.state.say("not opened, no password given", true);
+                return LRESULT(0);
+            }
+            data.state.say(&format!("cannot open {}: {}", display_name(&path), err), true);
             crate::dialogs::show_error(
                 Some(HwndSend(hwnd)),
                 "Cannot open folder",
-                &format!("{}\n\n{}", path, err),
+                &format!("{}\n\n{}", address_display(&path), err),
             );
             // Leave the previous listing + title intact; the user can
             // correct the address bar and try again.
@@ -1049,6 +1070,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let payload: Box<(Vec<std::path::PathBuf>, String, u64)> = Box::from_raw(lp.0 as *mut _);
             let (dirs, body, total) = *payload;
             data.state.confirm_empty_trash_survey(dirs, body, total);
+            LRESULT(0)
+        },
+
+        WMAPP_RUSTIC_PASSWORD => unsafe {
+            let req = &mut *(lp.0 as *mut crate::password_dialog::Request);
+            if let Some(data) = window_data(hwnd) {
+                data.state.say(
+                    if req.retry { "password not accepted" } else { "backup password needed" },
+                    true,
+                );
+            }
+            req.answer = crate::password_dialog::ask(hwnd, &req.repo, req.retry);
             LRESULT(0)
         },
 
@@ -1161,6 +1194,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let lo = sign_extend_16((lp.0 as i32) & 0xFFFF);
             let hi = sign_extend_16(((lp.0 as i32) >> 16) & 0xFFFF);
             let from_keyboard = lo == -1 && hi == -1;
+            // The shell menu acts on real files (Delete, Rename, Open with,
+            // Send to…). Nothing inside a backup is one.
+            if data.state.model.cwd().is_some_and(|c| c.is_rustic()) {
+                data.state.refuse_in_backup("the context menu");
+                return LRESULT(0);
+            }
             let pt = compute_context_point(data, lp);
             let paths = data.state.model.selected_paths();
             if !paths.is_empty() {
@@ -1285,6 +1324,12 @@ unsafe fn handle_listview_notify(
             // initial selection to the stem (everything before the final
             // dot) — Explorer parity, and what users expect when F2-renaming
             // `report.txt` to keep `.txt`. Folders keep the full selection.
+            //
+            // Backups are read-only: cancel the edit before the field opens.
+            if data.state.model.cwd().is_some_and(|c| c.is_rustic()) {
+                data.state.refuse_in_backup("renaming");
+                return LRESULT(1);
+            }
             let disp = unsafe { &*(lp.0 as *const NMLVDISPINFOW) };
             let idx = disp.item.iItem as usize;
             if let Some(entry) = data.state.model.get(idx)
@@ -1492,6 +1537,16 @@ fn activate_index(state: &Arc<AppState>, idx: usize) {
         {
             state.navigate(p);
         }
+        return;
+    }
+    if cwd.is_rustic_repo_root() {
+        // A snapshot row: open what it backed up rather than its root,
+        // which is a chain of `C\Users\…` folders to walk down first.
+        state.open_rustic_snapshot(&cwd, &entry.name);
+        return;
+    }
+    if cwd.is_rustic() && entry.kind == navigator_core::EntryKind::Symlink {
+        state.describe_rustic_link(cwd.join(&entry.name));
         return;
     }
     if entry.is_dir() {
@@ -1897,6 +1952,7 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
         x if x == Commands::DumpTree as u16 => data.state.op_dump_tree(),
         x if x == Commands::SpaceBreakdown as u16 => data.state.op_space_breakdown(),
         x if x == Commands::CompareTrees as u16 => data.state.op_compare_trees(),
+        x if x == Commands::OpenRustic as u16 => data.state.op_open_rustic(),
         x if x == Commands::Extract as u16 => data.state.op_extract(),
         x if x == Commands::Zip as u16 => data.state.op_zip(),
         x if x == Commands::EmptyTrash as u16 => data.state.op_empty_trash(),
@@ -2079,8 +2135,26 @@ fn address_display(path: &NavPath) -> String {
         "Remotes".to_string()
     } else if path.is_remote() {
         path.rclone_arg().unwrap_or_else(|| path.to_string())
+    } else if let Some(r) = path.rustic_display() {
+        r
     } else {
         path.to_string()
+    }
+}
+
+/// The last component of `path` as a person would name it. Differs from
+/// `file_name` only at a rustic repository root, whose stored component is
+/// the escaped repository spec.
+pub fn display_name(path: &NavPath) -> String {
+    match path.rustic_parts() {
+        Some(p) if p.snapshot.is_none() => {
+            let name = std::path::Path::new(&p.repo)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or(p.repo);
+            format!("{name} backups")
+        }
+        _ => path.file_name().to_string(),
     }
 }
 
@@ -2103,6 +2177,10 @@ fn set_title_from_path(hwnd: HWND, path: &NavPath) {
         // Show `remote:sub/path` in the title so the user always sees
         // where they are even when the file name is empty (remote root).
         path.rclone_arg().unwrap_or_else(|| path.to_string())
+    } else if path.is_rustic() {
+        // Inside a backup the title says so: everything here is
+        // read-only, and the folder name alone looks like a live folder.
+        format!("{} (backup)", display_name(path))
     } else {
         let name = path.file_name();
         if name.is_empty() {

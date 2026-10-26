@@ -37,6 +37,11 @@ struct Data {
 static PARAMS: OnceCell<Mutex<Option<Arc<AppState>>>> = OnceCell::new();
 
 pub fn open(parent: HWND, state: Arc<AppState>) {
+    // The recursive search walks the filesystem; a backup isn't on it.
+    if state.model.cwd().is_some_and(|c| c.is_rustic()) {
+        state.refuse_in_backup("searching");
+        return;
+    }
     if let Err(e) = ensure_class() {
         tracing::error!("search class registration failed: {e:?}");
         return;

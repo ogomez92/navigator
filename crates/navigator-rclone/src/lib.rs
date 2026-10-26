@@ -24,6 +24,7 @@ pub mod error;
 pub mod log;
 pub mod op;
 pub mod robocopy;
+pub mod rustic;
 
 pub use encoding::{to_standard_name, to_standard_path};
 pub use error::{ErrorCollector, ErrorKind, RcloneError};
@@ -33,3 +34,4 @@ pub use op::{
     RemoteSize, RemoteStat, RemoteTreeItem, kill_child_with_process, victims,
 };
 pub use robocopy::RobocopyDriver;
+pub use rustic::RusticDriver;

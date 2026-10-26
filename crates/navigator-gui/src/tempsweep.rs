@@ -37,13 +37,17 @@ pub const DRIVE_USERS_PREFIX: &str = "navigator-driveusers-";
 /// it lives in another crate — and re-exported so this list stays the one
 /// place every prefix is named.
 pub const ROBOCOPY_LOG_PREFIX: &str = navigator_rclone::robocopy::LOG_PREFIX;
+/// The `--glob-file` of a rustic restore with excludes. Same arrangement
+/// as robocopy's log: named by the driver, listed here.
+pub const RUSTIC_GLOB_PREFIX: &str = navigator_rclone::rustic::GLOB_PREFIX;
 
-const PREFIXES: [&str; 5] = [
+const PREFIXES: [&str; 6] = [
     FILES_FROM_PREFIX,
     SHELL_OP_PREFIX,
     ELEVATED_LOG_PREFIX,
     ROBOCOPY_LOG_PREFIX,
     DRIVE_USERS_PREFIX,
+    RUSTIC_GLOB_PREFIX,
 ];
 
 /// How long a file is left alone regardless of who owns it.

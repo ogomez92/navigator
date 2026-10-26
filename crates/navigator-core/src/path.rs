@@ -35,6 +35,174 @@ pub const REMOTE_PREFIX: &str = r"\\?\NavigatorRemote\";
 /// `mac:/` (abs prefix, empty sub) is `\\?\NavigatorRemoteAbs\<name>`.
 pub const REMOTE_ABS_PREFIX: &str = r"\\?\NavigatorRemoteAbs\";
 
+/// Prefix encoding a path inside a rustic backup repository. Layout is
+/// `\\?\NavigatorRustic\<repo>[\<snapshot>[\<path\in\snapshot>]]`:
+///
+///   * `<repo>` is the repository exactly as rustic's `-r` takes it, with
+///     `%`, `\`, `/` and `:` percent-escaped so it stays one component
+///     (see [`encode_rustic_repo`]). The repo root lists snapshots.
+///   * `<snapshot>` is a snapshot *row name* — a human-readable label
+///     whose last space-separated token is the snapshot id. The label is
+///     what the user reads; only the id ever reaches rustic.
+///   * the rest is the path inside the snapshot's tree (`C\Users\…` for a
+///     Windows backup), backslash separated like everything else here so
+///     `parent` / `join` stay string operations.
+///
+/// Everything under this prefix is **read-only**: a backup is made on the
+/// command line, and navigator only browses it and restores out of it.
+pub const RUSTIC_PREFIX: &str = r"\\?\NavigatorRustic\";
+
+/// What the address bar and title show for a rustic path, and what
+/// [`NavPath::new`] parses back: `rustic:<repo>` for the snapshot list,
+/// then ` › <snapshot> › <path>` as the user descends.
+pub const RUSTIC_DISPLAY_PREFIX: &str = "rustic:";
+const RUSTIC_DISPLAY_SEP: &str = " › ";
+
+/// The three parts of a rustic path. See [`RUSTIC_PREFIX`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RusticParts {
+    /// Repository spec, decoded — what goes after `rustic -r`.
+    pub repo: String,
+    /// Snapshot row name; `None` at the repository root.
+    pub snapshot: Option<String>,
+    /// Forward-slash path inside the snapshot; empty at the snapshot root.
+    pub sub: String,
+}
+
+/// Escape a repository spec into a single path component. A local repo is
+/// `D:\backups\repo`; a remote one is `rclone:remote:path` or
+/// `sftp:user@host:/srv/repo` — every one of them carries separators or
+/// colons that would otherwise split or confuse the component.
+pub fn encode_rustic_repo(repo: &str) -> String {
+    let mut out = String::with_capacity(repo.len());
+    for c in repo.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '\\' => out.push_str("%5C"),
+            '/' => out.push_str("%2F"),
+            ':' => out.push_str("%3A"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Inverse of [`encode_rustic_repo`]. Unknown escapes are kept literally
+/// rather than rejected — the input only ever comes from the encoder.
+pub fn decode_rustic_repo(enc: &str) -> String {
+    let mut out = String::with_capacity(enc.len());
+    let mut rest = enc;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let esc = rest.get(i..i + 3).unwrap_or(&rest[i..]);
+        match esc {
+            "%25" => out.push('%'),
+            "%5C" | "%5c" => out.push('\\'),
+            "%2F" | "%2f" => out.push('/'),
+            "%3A" | "%3a" => out.push(':'),
+            other => out.push_str(other),
+        }
+        rest = &rest[i + esc.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Spell a local repository the way rustic needs it.
+///
+/// rustic reads `<word>:` as a backend name, so `C:/backups/repo` is
+/// rejected as "backend type `C` is not supported" — measured against
+/// rustic 0.11. Only the backslash spelling of a drive path is taken as a
+/// local directory, so forward slashes in a drive or UNC path are turned
+/// around here. Anything else (`rclone:…`, `sftp:…`, `local:…`) is a
+/// backend spec and passes through untouched.
+pub fn normalize_rustic_repo(repo: &str) -> String {
+    let b = repo.as_bytes();
+    let is_drive = b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b[2] == b'\\' || b[2] == b'/');
+    let is_unc = repo.starts_with("//") || repo.starts_with(r"\\");
+    let s = if is_drive || is_unc {
+        repo.replace('/', "\\")
+    } else {
+        repo.to_string()
+    };
+    // `D:\repo\` and `D:\repo` are one repository; keep a single spelling
+    // so the two don't become two cache keys and two password prompts.
+    if s.len() > 3 && (s.ends_with('\\') || s.ends_with('/')) && (is_drive || is_unc) {
+        s.trim_end_matches(['\\', '/']).to_string()
+    } else {
+        s
+    }
+}
+
+/// rustic's backend prefix for a repository reached through rclone. rustic
+/// runs `rclone serve restic <rest>` itself and talks to that, so any
+/// remote navigator can browse is a remote a repository can live on.
+pub const RUSTIC_RCLONE_BACKEND: &str = "rclone:";
+
+/// The repository spec for a folder the user is looking at: a local folder
+/// as-is (respelled by [`normalize_rustic_repo`]), an rclone remote folder
+/// as `rclone:<remote:path>`. `None` for a sentinel — This PC, the remotes
+/// list, or somewhere already inside a backup.
+pub fn rustic_repo_spec(folder: &NavPath) -> Option<String> {
+    if folder.is_remote() {
+        return folder
+            .rclone_arg()
+            .map(|a| format!("{RUSTIC_RCLONE_BACKEND}{a}"));
+    }
+    if folder.is_this_pc() || folder.is_remotes_root() || folder.is_rustic() {
+        return None;
+    }
+    Some(normalize_rustic_repo(&folder.to_string()))
+}
+
+/// Where repository `repo` lives as a browsable folder — the inverse of
+/// [`rustic_repo_spec`]. A local repository is its own path; an
+/// `rclone:<remote:path>` one is that remote folder. `None` for any other
+/// backend (`sftp:`, `rest:`, …), which has nowhere to browse to.
+///
+/// rustic itself reads `rclone:C:\…` as a *local* path (measured, 0.11.4),
+/// so an rclone spec counts only when the rest parses as a remote.
+pub fn rustic_repo_location(repo: &str) -> Option<NavPath> {
+    if let Some(rest) = repo.strip_prefix(RUSTIC_RCLONE_BACKEND) {
+        return NavPath::new(PathBuf::from(rest))
+            .ok()
+            .filter(NavPath::is_remote);
+    }
+    Path::new(repo)
+        .is_absolute()
+        .then(|| NavPath(PathBuf::from(repo)))
+}
+
+/// Parse the display form (`rustic:D:\repo › snapshot › C\Users`) back
+/// into a rustic path, or `None` when `s` isn't one.
+///
+/// `rustic:photos` stays an rclone remote called `rustic`: the text after
+/// the prefix must look like a repository — a drive or UNC path, another
+/// backend spec (it contains a colon), or the display separator.
+fn parse_rustic_display(s: &str) -> Option<NavPath> {
+    let rest = s.strip_prefix(RUSTIC_DISPLAY_PREFIX)?;
+    let mut parts = rest.split(RUSTIC_DISPLAY_SEP);
+    let repo = parts.next()?.trim();
+    let b = repo.as_bytes();
+    let looks_like_repo = rest.contains(RUSTIC_DISPLAY_SEP)
+        || repo.starts_with(r"\\")
+        || repo.starts_with("//")
+        || repo.contains(':')
+        || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':');
+    if repo.is_empty() || !looks_like_repo {
+        return None;
+    }
+    let repo = normalize_rustic_repo(repo);
+    let Some(snapshot) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Some(NavPath::rustic_repo(&repo));
+    };
+    let sub = parts.collect::<Vec<_>>().join(RUSTIC_DISPLAY_SEP);
+    Some(NavPath::rustic(&repo, snapshot, sub.trim()))
+}
+
 impl NavPath {
     pub fn new(p: impl Into<PathBuf>) -> crate::Result<Self> {
         let p = p.into();
@@ -42,6 +210,11 @@ impl NavPath {
             return Ok(Self(p));
         }
         let s = p.to_string_lossy();
+        // Checked before the rclone branch: `rustic:D:\repo` would
+        // otherwise parse as an rclone remote named `rustic`.
+        if let Some(r) = parse_rustic_display(&s) {
+            return Ok(r);
+        }
         // rclone-style remote syntax — `name:` or `name:sub/path`. Treat
         // this as a first-class NavPath so the address bar can accept
         // `gdrive:` / `gdrive:photos/2024` without special casing. A bare
@@ -285,6 +458,75 @@ impl NavPath {
         })
     }
 
+    /// The snapshot list of rustic repository `repo` (as rustic's `-r`
+    /// takes it). See [`RUSTIC_PREFIX`].
+    pub fn rustic_repo(repo: &str) -> Self {
+        let mut s = String::from(RUSTIC_PREFIX);
+        s.push_str(&encode_rustic_repo(repo));
+        Self(PathBuf::from(s))
+    }
+
+    /// A path inside snapshot `snapshot` (a row name) of `repo`. `sub` is
+    /// the path in the snapshot tree, either separator, empty for its root.
+    pub fn rustic(repo: &str, snapshot: &str, sub: &str) -> Self {
+        let mut s = String::from(RUSTIC_PREFIX);
+        s.push_str(&encode_rustic_repo(repo));
+        s.push('\\');
+        s.push_str(snapshot);
+        let sub = sub.trim_matches(|c| c == '/' || c == '\\');
+        if !sub.is_empty() {
+            s.push('\\');
+            for c in sub.chars() {
+                s.push(if c == '/' { '\\' } else { c });
+            }
+        }
+        Self(PathBuf::from(s))
+    }
+
+    /// `true` anywhere inside a rustic repository — the snapshot list,
+    /// a snapshot, or a path within one. All of it is read-only.
+    pub fn is_rustic(&self) -> bool {
+        self.0.to_string_lossy().starts_with(RUSTIC_PREFIX)
+    }
+
+    pub fn rustic_parts(&self) -> Option<RusticParts> {
+        let s = self.0.to_string_lossy();
+        let tail = s.strip_prefix(RUSTIC_PREFIX)?;
+        let mut it = tail.splitn(3, '\\');
+        let repo = decode_rustic_repo(it.next()?);
+        if repo.is_empty() {
+            return None;
+        }
+        let snapshot = it.next().filter(|s| !s.is_empty()).map(str::to_string);
+        let sub = it.next().unwrap_or("").replace('\\', "/");
+        Some(RusticParts {
+            repo,
+            snapshot,
+            sub,
+        })
+    }
+
+    /// `true` for a repository's snapshot list.
+    pub fn is_rustic_repo_root(&self) -> bool {
+        self.rustic_parts().is_some_and(|p| p.snapshot.is_none())
+    }
+
+    /// Address-bar / title form, `rustic:<repo> › <snapshot> › <path>`.
+    /// [`NavPath::new`] parses it back. `None` for non-rustic paths.
+    pub fn rustic_display(&self) -> Option<String> {
+        let p = self.rustic_parts()?;
+        let mut out = format!("{RUSTIC_DISPLAY_PREFIX}{}", p.repo);
+        if let Some(snap) = p.snapshot {
+            out.push_str(RUSTIC_DISPLAY_SEP);
+            out.push_str(&snap);
+            if !p.sub.is_empty() {
+                out.push_str(RUSTIC_DISPLAY_SEP);
+                out.push_str(&p.sub.replace('/', "\\"));
+            }
+        }
+        Some(out)
+    }
+
     /// Root path: drive root on Windows (`C:\`), `/` elsewhere.
     pub fn default_root() -> Self {
         #[cfg(windows)]
@@ -316,6 +558,19 @@ impl NavPath {
         }
         if self.is_remotes_root() {
             return None;
+        }
+        if let Some(parts) = self.rustic_parts() {
+            // Inside a snapshot: trim one component, and from the
+            // snapshot root step out to the snapshot list. From the list
+            // itself, the parent is the folder holding the repository —
+            // local or on an rclone remote — where the user would look for
+            // it in a plain listing. Any other backend has nowhere to go.
+            let s = self.0.to_string_lossy().into_owned();
+            if parts.snapshot.is_some() {
+                let idx = s.rfind('\\')?;
+                return Some(Self(PathBuf::from(&s[..idx])));
+            }
+            return rustic_repo_location(&parts.repo)?.parent();
         }
         if self.is_remote() {
             // At a remote root, step out to the Remotes listing; inside a
@@ -352,6 +607,15 @@ impl NavPath {
         // the remote root, not `\\?\NavigatorRemotes\gdrive`.
         if self.is_remotes_root() {
             return Self::remote(name, "");
+        }
+        // Plain concatenation for rustic paths: `PathBuf::join` replaces
+        // the whole path when the pushed name looks absolute or carries a
+        // drive prefix, and a snapshot tree is free to contain either.
+        if self.is_rustic() {
+            let mut s = self.0.to_string_lossy().into_owned();
+            s.push('\\');
+            s.push_str(name);
+            return Self(PathBuf::from(s));
         }
         Self(self.0.join(name))
     }
@@ -460,6 +724,117 @@ mod tests {
         let p = NavPath::new("mac:users").unwrap();
         assert!(!p.is_remote_abs());
         assert_eq!(p.rclone_arg().as_deref(), Some("mac:users"));
+    }
+
+    const SNAP: &str = "2026-10-22 10:13 data 4f13f557";
+
+    #[test]
+    fn rustic_repo_spec_survives_as_one_component() {
+        for repo in [
+            r"D:\backups\repo",
+            "rclone:mac:backups/repo",
+            "sftp:me@host:/srv/repo",
+            r"\\nas\share\repo",
+            "odd%name:x",
+        ] {
+            let p = NavPath::rustic_repo(repo);
+            assert!(p.is_rustic() && p.is_rustic_repo_root(), "{repo}");
+            let parts = p.rustic_parts().unwrap();
+            assert_eq!(parts.repo, repo);
+            assert_eq!(parts.snapshot, None);
+            assert!(!p.is_unc(), "a rustic path is not a network location");
+            assert!(!p.is_remote());
+        }
+    }
+
+    #[test]
+    fn rustic_join_and_parent_walk_the_tree() {
+        let root = NavPath::rustic_repo(r"D:\backups\repo");
+        let snap = root.join(SNAP);
+        assert_eq!(snap.rustic_parts().unwrap().snapshot.as_deref(), Some(SNAP));
+        assert_eq!(snap.file_name(), SNAP);
+        let deep = snap.join("C").join("Users").join("a.txt");
+        let parts = deep.rustic_parts().unwrap();
+        assert_eq!(parts.sub, "C/Users/a.txt");
+        assert_eq!(deep.file_name(), "a.txt");
+        assert_eq!(deep, NavPath::rustic(r"D:\backups\repo", SNAP, "C/Users/a.txt"));
+
+        let up = deep.parent().unwrap();
+        assert_eq!(up.rustic_parts().unwrap().sub, "C/Users");
+        let up = up.parent().unwrap().parent().unwrap();
+        assert_eq!(up, snap);
+        assert_eq!(up.parent().unwrap(), root);
+        // A local repository's parent is the folder holding it.
+        assert_eq!(root.parent().unwrap().as_path(), Path::new(r"D:\backups"));
+        // An rclone repository's parent is the remote folder holding it.
+        let up = NavPath::rustic_repo("rclone:sb:/home/rustic").parent().unwrap();
+        assert_eq!(up.rclone_arg().as_deref(), Some("sb:/home"));
+        let up = NavPath::rustic_repo("rclone:mac:repo").parent().unwrap();
+        assert!(up.is_remote_root());
+        // Any other backend has nowhere to browse to.
+        assert!(NavPath::rustic_repo("sftp:me@host:/srv/repo").parent().is_none());
+    }
+
+    #[test]
+    fn rustic_repo_spec_and_location_are_inverses() {
+        for (folder, spec) in [
+            (NavPath::new("sb:/home/rustic").unwrap(), "rclone:sb:/home/rustic"),
+            (NavPath::new("mac:backups/repo").unwrap(), "rclone:mac:backups/repo"),
+            (NavPath::new("mac:").unwrap(), "rclone:mac:"),
+            (NavPath::new(r"D:\backups\repo").unwrap(), r"D:\backups\repo"),
+        ] {
+            assert_eq!(rustic_repo_spec(&folder).as_deref(), Some(spec));
+            assert_eq!(rustic_repo_location(spec), Some(folder), "{spec}");
+        }
+        assert_eq!(rustic_repo_spec(&NavPath::this_pc()), None);
+        assert_eq!(rustic_repo_spec(&NavPath::remotes_root()), None);
+        assert_eq!(rustic_repo_spec(&NavPath::rustic_repo(r"D:\r")), None);
+        // rustic reads `rclone:C:\…` as a local path; it is no remote.
+        assert_eq!(rustic_repo_location(r"rclone:C:\r"), None);
+        assert_eq!(rustic_repo_location("rest:http://host/"), None);
+    }
+
+    #[test]
+    fn rustic_join_never_restarts_the_path() {
+        // `PathBuf::join("D:x")` would replace everything with `D:x`.
+        let snap = NavPath::rustic(r"D:\r", SNAP, "");
+        let p = snap.join("D:x");
+        assert_eq!(p.rustic_parts().unwrap().sub, "D:x");
+    }
+
+    #[test]
+    fn rustic_display_round_trips_through_new() {
+        for p in [
+            NavPath::rustic_repo(r"D:\backups\repo"),
+            NavPath::rustic(r"D:\backups\repo", SNAP, ""),
+            NavPath::rustic(r"D:\backups\repo", SNAP, "C/Users/with space"),
+            NavPath::rustic_repo("rclone:mac:repo"),
+        ] {
+            let shown = p.rustic_display().unwrap();
+            assert_eq!(NavPath::new(&shown).unwrap(), p, "{shown}");
+        }
+        assert_eq!(
+            NavPath::rustic(r"D:\r", SNAP, "C/Users").rustic_display().unwrap(),
+            format!(r"rustic:D:\r › {SNAP} › C\Users")
+        );
+    }
+
+    #[test]
+    fn rustic_prefix_does_not_steal_an_rclone_remote_named_rustic() {
+        let p = NavPath::new("rustic:photos").unwrap();
+        assert!(p.is_remote());
+        assert_eq!(p.rclone_arg().as_deref(), Some("rustic:photos"));
+    }
+
+    #[test]
+    fn rustic_local_repo_spelling_is_normalised() {
+        // rustic parses `D:/x` as a backend called `D`.
+        assert_eq!(normalize_rustic_repo("D:/backups/repo/"), r"D:\backups\repo");
+        assert_eq!(normalize_rustic_repo(r"D:\"), r"D:\");
+        assert_eq!(normalize_rustic_repo("//nas/share/r"), r"\\nas\share\r");
+        assert_eq!(normalize_rustic_repo("rclone:mac:a/b"), "rclone:mac:a/b");
+        let p = NavPath::new("rustic:D:/backups/repo").unwrap();
+        assert_eq!(p.rustic_parts().unwrap().repo, r"D:\backups\repo");
     }
 
     #[test]
