@@ -174,6 +174,43 @@ bar). Backups are still made on the command line; navigator only reads them.
       profile = ""         # rustic -P <profile>; empty = rustic's default
       exe = "rustic"       # binary, looked up on PATH
 
+## Jobs
+
+A job is a saved "copy these items to that place" — the in-app version of a
+backup alias — that you run by hand whenever you like (navigator is not a
+daemon; nothing is scheduled). **Tools → Jobs…** (Ctrl+J) lists them: Enter
+runs the selected job, and New / Edit / Delete manage the list. Jobs are
+stored as `[[jobs]]` in `config.toml`, so they are hand-editable.
+
+Making one is the paste gesture: Ctrl+C the files and folders, go to the
+destination, then **Tools → Save clipboard as job here…** (Ctrl+Shift+J).
+A dialog asks for a name and the rest:
+
+- **Destination** — the folder you are in, prefilled. A local folder, a UNC
+  share, an rclone remote (`sb:/home/vol/data`), or `rustic:<repository>`
+  when you are on a rustic repository's snapshot list.
+- **Mode** — what happens to files already at the destination: Add new only,
+  Update (the default), Replace, or Mirror, which also deletes whatever the
+  sources no longer have. Chosen once here; a run never asks.
+- **Contents only** — copy what is *inside* each source straight into the
+  destination instead of into `<destination>\<source name>`, the
+  `robocopy D:\ B:\data /MIR` shape. A drive root like `D:\` is a valid
+  source either way (without this box it lands in `<destination>\D`).
+- **Links**, **Excludes** (names or globs, one per line, matched at any
+  depth: `node_modules`, `*.tmp`, `System Volume Information`) and, for
+  rustic, extra **tags**.
+
+Copy jobs run on the same engines as a paste — robocopy between two
+filesystem paths, rclone otherwise. A `rustic:` destination runs
+`rustic backup` of every source into that repository: one snapshot per run,
+tagged `job:<name>`, skipped when nothing changed; a repository that does
+not exist yet is offered for creation. When the job ends you get a spoken
+one-liner and a **report window**: every item with its destination, the
+engine that ran it, files and bytes moved, how long it took, and whatever
+the engine complained about (unreadable files, permission errors, a
+missing source). The same text is saved to `<exe_dir>\job_reports\`, and
+the list shows each job's last result.
+
 ## Sounds
 
 navigator can play a short `.wav` when something happens. It's off the shelf
@@ -321,5 +358,8 @@ inflating the missing list.
 | Ctrl + Shift + B             | Back up focused item to per-volume `.navigator_backup` (local paths only) |
 | Ctrl + Shift + R             | Restore a backup taken from the current folder — current version goes to `.trash`, the backup is kept |
 | Ctrl + Shift + S             | Space breakdown — a `du`-style tree of what is taking the space under the focused folder or drive |
+| Ctrl + Shift + D             | Duplicate — copy each selected item beside itself as `name-<8 hex chars>` (before the extension); works on drives, shares and remotes |
+| Ctrl + J                     | Jobs — list of saved copy / backup jobs: run, new, edit, delete |
+| Ctrl + Shift + J             | Save the clipboard as a job into the current folder (or the rustic repository being browsed) |
 | Ctrl + 1..9, Ctrl + 0        | Jump to hotspot slot 1..10                          |
 | Ctrl+Shift+1..9, Ctrl+Shift+0| Save selection to hotspot slot 1..10                |

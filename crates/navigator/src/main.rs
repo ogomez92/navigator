@@ -248,7 +248,10 @@ mod tests {
         // A backend spec passes through.
         let r = parse_args(&strings(&["--rustic", "rclone:nas:backups"]));
         assert_eq!(rustic_repo_of(&r).as_deref(), Some("rclone:nas:backups"));
-        assert!(matches!(parse_args(&strings(&["--rustic"])), ParsedArgs::BadArg(_)));
+        assert!(matches!(
+            parse_args(&strings(&["--rustic"])),
+            ParsedArgs::BadArg(_)
+        ));
     }
 
     #[test]

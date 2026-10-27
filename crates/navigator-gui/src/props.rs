@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use navigator_core::{Entry, EntryKind, NavPath};
-use navigator_fs::{DriveInfo, read_dir};
+use navigator_fs::{DriveConnection, DriveInfo, UsbLink, UsbSpeed, read_dir};
 use navigator_rclone::{RemoteSize, RemoteStat, RemoteTreeItem};
 
 /// Recursive tally across every file below `root`. Unreadable sub-trees
@@ -249,6 +249,12 @@ pub fn format_drive_properties(display: &str, info: &DriveInfo, top: Option<&Top
         ));
         s.push_str(&format!("File system: {}\n", info.file_system));
     }
+    if let Some(conn) = &info.connection {
+        for line in format_connection(conn) {
+            s.push_str(&line);
+            s.push('\n');
+        }
+    }
 
     // An empty bay or an offline share answers nothing. Say so — a screen
     // of zeroes reads as "this drive is empty", which is a different fact.
@@ -335,6 +341,86 @@ pub fn format_drive_properties(display: &str, info: &DriveInfo, top: Option<&Top
         }
     }
     s
+}
+
+/// How the disk is attached, as lines for the drive screen: the product
+/// and bus always, and for a USB disk the port it is on and the link it
+/// negotiated. The port and the link are reported separately because they
+/// disagree in exactly the cases the user opens this screen for — a 10 Gbps
+/// drive on a USB 3 connector running at 480 Mbps is a cable problem, the
+/// same drive on a 2.0-only port is a "move it" problem, and a USB 2.0
+/// drive on a USB 3 port is fine — so each of those gets its own note
+/// rather than a bare speed the user would have to interpret.
+pub fn format_connection(conn: &DriveConnection) -> Vec<String> {
+    let mut out = Vec::new();
+    if !conn.product.is_empty() {
+        out.push(format!("Device:    {}", conn.product));
+    }
+    if !conn.bus.is_empty() {
+        out.push(format!("Bus:       {}", conn.bus));
+    }
+    let Some(usb) = &conn.usb else {
+        return out;
+    };
+
+    let port_kind = match usb.port_usb3 {
+        Some(true) if usb.speed == UsbSpeed::SuperPlus => "USB 3 port (10 Gbps or more)",
+        Some(true) => "USB 3 port",
+        Some(false) => "USB 2.0 port",
+        None => "USB port",
+    };
+    let place = match usb.hubs_between {
+        0 => "on the computer itself".to_string(),
+        1 => "on an external hub (1 hub between it and the computer)".to_string(),
+        n => format!("on an external hub ({n} hubs between it and the computer)"),
+    };
+    let mut port_line = format!("USB port:  {port_kind} {place}, port {}", usb.port);
+    if usb.type_c {
+        port_line.push_str(", USB-C");
+    }
+    out.push(port_line);
+    out.push(format!(
+        "USB link:  {} — {} ({})",
+        usb.speed.rate(),
+        usb.version_label(),
+        usb.speed.name()
+    ));
+
+    if let Some(note) = connection_note(usb) {
+        out.push(format!("Note:      {note}"));
+    }
+    out
+}
+
+/// The sentence that explains a port / link / drive mismatch, or `None`
+/// when there is nothing to explain.
+fn connection_note(usb: &UsbLink) -> Option<String> {
+    let max = usb.device_max?;
+    if max > usb.speed {
+        return Some(match usb.port_usb3 {
+            Some(false) if max.is_usb3() => format!(
+                "the drive supports {}, but this is a USB 2.0 port, so it runs at {}. A USB 3 port would be faster.",
+                max.rate(),
+                usb.speed.rate()
+            ),
+            Some(true) if !usb.speed.is_usb3() => format!(
+                "the drive supports {} and the port supports USB 3, but the link came up at {}. Try another cable, or unplug and reconnect.",
+                max.rate(),
+                usb.speed.rate()
+            ),
+            _ => format!(
+                "the drive supports {}; this port or cable gives {}.",
+                max.rate(),
+                usb.speed.rate()
+            ),
+        });
+    }
+    if !max.is_usb3() && usb.port_usb3 == Some(true) {
+        return Some(
+            "the drive itself is USB 2.0; a faster port would not change this.".to_string(),
+        );
+    }
+    None
 }
 
 /// Windows renders a volume serial as two hex groups, `A1B2-C3D4`, and
@@ -969,7 +1055,123 @@ mod tests {
                 bytes_per_sector: 512,
                 sectors_per_cluster: 8,
             }),
+            connection: None,
         }
+    }
+
+    fn usb(speed: UsbSpeed, device_max: UsbSpeed, port_usb3: bool) -> DriveConnection {
+        DriveConnection {
+            bus: "USB".into(),
+            product: "Samsung PSSD T7 Shield".into(),
+            usb: Some(UsbLink {
+                speed,
+                device_max: Some(device_max),
+                port_usb3: Some(port_usb3),
+                port: 3,
+                type_c: true,
+                hubs_between: 0,
+                bcd_usb: 0x0320,
+            }),
+        }
+    }
+
+    /// Measured on the T7 Shield: a 10 Gbps drive on a USB-C root port
+    /// that came up at 480 Mbps. The port and the link must be reported
+    /// separately, and the note must point at the cable, not the port.
+    #[test]
+    fn usb3_drive_on_usb3_port_at_usb2_speed_blames_the_cable() {
+        let text = format_connection(&usb(UsbSpeed::High, UsbSpeed::SuperPlus, true)).join("\n");
+        assert!(text.contains("Device:    Samsung PSSD T7 Shield"), "{text}");
+        assert!(
+            text.contains("USB port:  USB 3 port on the computer itself, port 3, USB-C"),
+            "{text}"
+        );
+        assert!(
+            text.contains("USB link:  480 Mbps — USB 2.0 (High speed)"),
+            "{text}"
+        );
+        assert!(text.contains("Try another cable"), "{text}");
+        assert!(!text.contains("USB 3 port would be faster"), "{text}");
+    }
+
+    #[test]
+    fn usb3_drive_on_a_usb2_port_says_to_move_it() {
+        let mut conn = usb(UsbSpeed::High, UsbSpeed::Super, false);
+        conn.usb.as_mut().unwrap().hubs_between = 1;
+        conn.usb.as_mut().unwrap().type_c = false;
+        let text = format_connection(&conn).join("\n");
+        assert!(
+            text.contains(
+                "USB port:  USB 2.0 port on an external hub (1 hub between it and the computer), port 3"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("USB-C"), "{text}");
+        assert!(text.contains("A USB 3 port would be faster"), "{text}");
+    }
+
+    #[test]
+    fn a_link_running_at_its_full_rate_carries_no_note() {
+        let text =
+            format_connection(&usb(UsbSpeed::SuperPlus, UsbSpeed::SuperPlus, true)).join("\n");
+        assert!(
+            text.contains("USB port:  USB 3 port (10 Gbps or more) on the computer itself"),
+            "{text}"
+        );
+        assert!(
+            text.contains("USB link:  10 Gbps or more — USB 3.2 Gen 2 (SuperSpeedPlus)"),
+            "{text}"
+        );
+        assert!(!text.contains("Note:"), "{text}");
+    }
+
+    #[test]
+    fn a_usb2_drive_on_a_usb3_port_is_told_the_port_is_not_the_limit() {
+        let text = format_connection(&usb(UsbSpeed::High, UsbSpeed::High, true)).join("\n");
+        assert!(text.contains("the drive itself is USB 2.0"), "{text}");
+    }
+
+    #[test]
+    fn a_ten_gig_drive_on_a_five_gig_link_names_both_rates() {
+        let text = format_connection(&usb(UsbSpeed::Super, UsbSpeed::SuperPlus, true)).join("\n");
+        assert!(
+            text.contains("USB link:  5 Gbps — USB 3.2 Gen 1 (SuperSpeed)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("the drive supports 10 Gbps or more; this port or cable gives 5 Gbps."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_non_usb_disk_reports_only_product_and_bus() {
+        let conn = DriveConnection {
+            bus: "NVMe".into(),
+            product: "Lexar SSD NM790 2TB".into(),
+            usb: None,
+        };
+        assert_eq!(
+            format_connection(&conn),
+            vec![
+                "Device:    Lexar SSD NM790 2TB".to_string(),
+                "Bus:       NVMe".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn drive_properties_place_the_connection_before_capacity() {
+        let mut info = drive(Some(navigator_fs::DriveSpace {
+            total: 1000,
+            free: 250,
+            available: 250,
+        }));
+        info.connection = Some(usb(UsbSpeed::SuperPlus, UsbSpeed::SuperPlus, true));
+        let s = format_drive_properties("D: (Data)", &info, None);
+        let bus = s.find("Bus:       USB").expect("bus line");
+        let cap = s.find("--- Capacity ---").expect("capacity");
+        assert!(bus < cap, "{s}");
     }
 
     #[test]

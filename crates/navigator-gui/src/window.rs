@@ -447,6 +447,12 @@ pub enum Commands {
     /// repository — the in-app form of `navigator --rustic <folder>`.
     /// Menu-only, like Compare trees.
     OpenRustic = 154,
+    /// Copy each selected item beside itself with a short random suffix.
+    Duplicate = 155,
+    /// The saved-jobs list: run / new / edit / delete.
+    Jobs = 156,
+    /// Save the clipboard as a job into the current folder.
+    NewJob = 157,
     // Help menu
     About = 160,
     // Shortcut/Action dynamic range
@@ -601,6 +607,12 @@ fn build_menu() -> HMENU {
         let _ = AppendMenuW(
             edit,
             MF_STRING,
+            Commands::Duplicate as usize,
+            w!("D&uplicate\tCtrl+Shift+D"),
+        );
+        let _ = AppendMenuW(
+            edit,
+            MF_STRING,
             Commands::PasteSpecial as usize,
             w!("Paste &special…\tCtrl+Shift+V"),
         );
@@ -687,6 +699,19 @@ fn build_menu() -> HMENU {
             MF_STRING,
             Commands::OpenRustic as usize,
             w!("Open as rustic &backup"),
+        );
+        let _ = AppendMenuW(tools, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(
+            tools,
+            MF_STRING,
+            Commands::Jobs as usize,
+            w!("&Jobs…\tCtrl+J"),
+        );
+        let _ = AppendMenuW(
+            tools,
+            MF_STRING,
+            Commands::NewJob as usize,
+            w!("Save clipboard as jo&b here…\tCtrl+Shift+J"),
         );
         let _ = AppendMenuW(tools, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(
@@ -1953,6 +1978,9 @@ fn handle_command(hwnd: HWND, data: &WindowData, cmd: u16, ctrl: HWND) {
         x if x == Commands::SpaceBreakdown as u16 => data.state.op_space_breakdown(),
         x if x == Commands::CompareTrees as u16 => data.state.op_compare_trees(),
         x if x == Commands::OpenRustic as u16 => data.state.op_open_rustic(),
+        x if x == Commands::Duplicate as u16 => data.state.op_duplicate(),
+        x if x == Commands::Jobs as u16 => data.state.op_jobs(),
+        x if x == Commands::NewJob as u16 => data.state.op_new_job(),
         x if x == Commands::Extract as u16 => data.state.op_extract(),
         x if x == Commands::Zip as u16 => data.state.op_zip(),
         x if x == Commands::EmptyTrash as u16 => data.state.op_empty_trash(),
@@ -2449,6 +2477,9 @@ fn dispatch_internal(hwnd: HWND, data: &WindowData, ic: navigator_config::Intern
         IC::SpaceBreakdown => state.op_space_breakdown(),
         IC::PermanentDelete => state.op_permanent_delete(),
         IC::EjectDrive => state.op_eject_drive(),
+        IC::Duplicate => state.op_duplicate(),
+        IC::Jobs => state.op_jobs(),
+        IC::NewJob => state.op_new_job(),
         IC::NewFolder => {
             crate::new_folder::open(hwnd, state.clone());
         }

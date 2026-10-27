@@ -1,6 +1,7 @@
 //! rustic backup repositories: list snapshots, browse them, restore out of
-//! them. Read-only by construction — backups are made on the command line
-//! and nothing here ever writes to a repository.
+//! them — and, for a saved job ([`Operation::RusticBackup`]), take a
+//! snapshot. Browsing never writes; the one writer is the backup, which
+//! only adds a snapshot and runs only when the user runs a job.
 //!
 //! Everything is a `rustic` child process, like rclone and robocopy, and
 //! every fact below was measured against rustic 0.11.4:
@@ -135,8 +136,14 @@ pub enum RusticError {
     NotFound(String),
     /// rustic could not be started at all.
     Spawn(String),
+    /// Nothing at the repository location — `rustic init` has not been
+    /// run there. Carries rustic's sentence, which names the location.
+    NoRepository(String),
     /// Anything else, as rustic phrased it.
-    Failed { message: String, exit_code: Option<i32> },
+    Failed {
+        message: String,
+        exit_code: Option<i32>,
+    },
 }
 
 /// Spoken / shown when a password prompt is dismissed. The listing error
@@ -149,6 +156,7 @@ impl std::fmt::Display for RusticError {
             RusticError::PasswordCancelled => f.write_str(PASSWORD_CANCELLED),
             RusticError::NotFound(m) => write!(f, "not found: {m}"),
             RusticError::Spawn(m) => write!(f, "could not start rustic: {m}"),
+            RusticError::NoRepository(m) => f.write_str(m),
             RusticError::Failed { message, .. } => f.write_str(message),
         }
     }
@@ -163,6 +171,7 @@ impl RusticError {
             RusticError::PasswordCancelled => (ErrorKind::Auth, self.to_string(), None),
             RusticError::NotFound(m) => (ErrorKind::NotFound, m.clone(), None),
             RusticError::Spawn(_) => (ErrorKind::Other, self.to_string(), None),
+            RusticError::NoRepository(m) => (ErrorKind::NotFound, m.clone(), None),
             RusticError::Failed { message, exit_code } => {
                 (ErrorKind::Other, message.clone(), *exit_code)
             }
@@ -232,11 +241,7 @@ impl Node {
     }
 
     pub fn to_entry(&self) -> Entry {
-        let time = |t: &Option<String>| {
-            t.as_deref()
-                .and_then(parse_time)
-                .unwrap_or_default()
-        };
+        let time = |t: &Option<String>| t.as_deref().and_then(parse_time).unwrap_or_default();
         Entry {
             name: self.name.clone(),
             kind: match self.kind.as_str() {
@@ -348,7 +353,12 @@ impl RusticDriver {
 
     /// The nodes of one directory inside a snapshot. Cached for the life
     /// of the process — a snapshot is immutable.
-    pub fn tree(&self, repo: &str, snapshot_id: &str, sub: &str) -> Result<Arc<Vec<Node>>, RusticError> {
+    pub fn tree(
+        &self,
+        repo: &str,
+        snapshot_id: &str,
+        sub: &str,
+    ) -> Result<Arc<Vec<Node>>, RusticError> {
         let key = (repo.to_string(), snapshot_id.to_string(), sub.to_string());
         if let Some(t) = self.session.trees.lock().get(&key) {
             return Ok(Arc::clone(t));
@@ -426,11 +436,7 @@ impl RusticDriver {
         // parent it is just a path.
         let mut rel = OsString::from(".\\");
         rel.push(name);
-        let out = self.run_os(
-            &repo,
-            vec!["diff".into(), arg.into(), rel],
-            Some(parent),
-        )?;
+        let out = self.run_os(&repo, vec!["diff".into(), arg.into(), rel], Some(parent))?;
         Ok(parse_diff(&String::from_utf8_lossy(&out)))
     }
 
@@ -440,7 +446,8 @@ impl RusticDriver {
         if self.session.opened.lock().contains(repo) {
             return Ok(());
         }
-        self.run(repo, &["cat".into(), "config".into()], None).map(|_| ())
+        self.run(repo, &["cat".into(), "config".into()], None)
+            .map(|_| ())
     }
 
     /// Run a [`Operation::RusticRestore`]. Returns the same handle and
@@ -451,18 +458,33 @@ impl RusticDriver {
     /// so call this from a worker): a streaming child can't be re-run
     /// halfway through when it turns out to need one.
     pub fn spawn(&self, op: Operation) -> std::io::Result<OpHandle> {
-        let Operation::RusticRestore {
-            src,
-            dst,
-            excludes,
-            delete,
-        } = op
-        else {
-            return Err(std::io::Error::new(
+        match op {
+            Operation::RusticRestore {
+                src,
+                dst,
+                excludes,
+                delete,
+            } => self.spawn_restore(src, dst, excludes, delete),
+            Operation::RusticBackup {
+                repo,
+                sources,
+                tags,
+                excludes,
+            } => self.spawn_backup(repo, sources, tags, excludes),
+            _ => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "the rustic driver only restores",
-            ));
-        };
+                "the rustic driver only restores and backs up",
+            )),
+        }
+    }
+
+    fn spawn_restore(
+        &self,
+        src: NavPath,
+        dst: NavPath,
+        excludes: Vec<String>,
+        delete: bool,
+    ) -> std::io::Result<OpHandle> {
         let io = |e: RusticError| std::io::Error::other(e.to_string());
         let (repo, arg) = restore_source(&src).map_err(io)?;
         if dst.is_remote() || dst.is_rustic() {
@@ -569,8 +591,158 @@ impl RusticDriver {
             }
             let success = !was_cancelled && status.is_some_and(|s| s.success());
             let exit_code = status.and_then(|s| s.code());
+            let error =
+                (!success).then(|| classify_failure(&err_text, exit_code).to_rclone_error());
+            let _ = tx.send(OpEvent::Done {
+                success,
+                exit_code,
+                error,
+            });
+        });
+
+        Ok(OpHandle::from_parts(rx, slot, cancelled))
+    }
+
+    /// Run an [`Operation::RusticBackup`]: `rustic backup --json
+    /// --skip-if-unchanged --tag … --iglob !… -- <sources>`, with
+    /// `--json-progress` so progress arrives as the same status lines a
+    /// restore emits (measured, 0.11.4: with that flag the run prints
+    /// NDJSON — `status` lines, then one `summary` line carrying the
+    /// counts and the new `snapshot_id`; a run `--skip-if-unchanged`
+    /// skipped prints the summary without an id).
+    ///
+    /// The summary line is forwarded verbatim as an INFO [`OpEvent::Log`],
+    /// for [`parse_backup_summary`]. `[WARN]` / `[ERROR]` lines from stderr
+    /// — unreadable files, usually — are forwarded as they arrive at their
+    /// own level, so a report can list them.
+    fn spawn_backup(
+        &self,
+        repo: String,
+        sources: Vec<NavPath>,
+        tags: Vec<String>,
+        excludes: Vec<String>,
+    ) -> std::io::Result<OpHandle> {
+        let io = |e: RusticError| std::io::Error::other(e.to_string());
+        if sources.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "nothing to back up",
+            ));
+        }
+        if let Some(bad) = sources.iter().find(|s| s.is_remote() || s.is_rustic()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("rustic backs up local paths only, not {bad}"),
+            ));
+        }
+        self.ensure_open(&repo).map_err(io)?;
+
+        let mut args: Vec<OsString> = vec![
+            "--json-progress".into(),
+            "backup".into(),
+            "--json".into(),
+            "--skip-if-unchanged".into(),
+        ];
+        for t in tags.iter().filter(|t| !t.trim().is_empty()) {
+            args.push("--tag".into());
+            args.push(t.trim().into());
+        }
+        for g in excludes.iter().filter(|g| !g.trim().is_empty()) {
+            args.push("--iglob".into());
+            args.push(format!("!{}", g.trim()).into());
+        }
+        args.push("--".into());
+        for src in &sources {
+            args.push(src.as_path().as_os_str().to_owned());
+        }
+
+        let mut cmd = self.command(&repo);
+        cmd.args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        tracing::info!(target: "rustic.spawn", "rustic backup {:?}", args);
+        let mut child = cmd.spawn()?;
+        kill_child_with_process(&child);
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let (tx, rx) = unbounded::<OpEvent>();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(child)));
+
+        let tx_out = tx.clone();
+        let reader_out = thread::spawn(move || {
+            let Some(out) = stdout else { return };
+            for line in BufReader::new(out).lines().map_while(|l| l.ok()) {
+                match parse_status(&line) {
+                    Some(p) => {
+                        let _ = tx_out.send(OpEvent::Progress(p));
+                    }
+                    None if !line.trim().is_empty() => {
+                        let _ = tx_out.send(OpEvent::Log(log_event_at(LogLevel::Info, &line)));
+                    }
+                    None => {}
+                }
+            }
+        });
+        let tx_err = tx.clone();
+        let reader_err = thread::spawn(move || {
+            let mut text = String::new();
+            let Some(err) = stderr else { return text };
+            for line in BufReader::new(err).lines().map_while(|l| l.ok()) {
+                let clean = strip_ansi(&line);
+                let t = clean.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let level = if t.starts_with("[WARN]") {
+                    Some(LogLevel::Warning)
+                } else if t.starts_with("[ERROR]") {
+                    Some(LogLevel::Error)
+                } else {
+                    None
+                };
+                if let Some(level) = level {
+                    let _ = tx_err.send(OpEvent::Log(log_event_at(level, t)));
+                }
+                text.push_str(&clean);
+                text.push('\n');
+            }
+            text
+        });
+
+        let wait_slot = Arc::clone(&slot);
+        let wait_cancelled = Arc::clone(&cancelled);
+        thread::spawn(move || {
+            let status = loop {
+                let mut g = wait_slot.lock();
+                let Some(c) = g.as_mut() else {
+                    break None;
+                };
+                match c.try_wait() {
+                    Ok(Some(s)) => break Some(s),
+                    Ok(None) => {}
+                    Err(_) => break None,
+                }
+                drop(g);
+                thread::sleep(std::time::Duration::from_millis(50));
+            };
+            let _ = reader_out.join();
+            let err_text = reader_err.join().unwrap_or_default();
+            let was_cancelled = wait_cancelled.load(Ordering::Acquire);
+            let success = !was_cancelled && status.is_some_and(|s| s.success());
+            let exit_code = status.and_then(|s| s.code());
             let error = (!success).then(|| {
-                classify_failure(&err_text, exit_code).to_rclone_error()
+                if was_cancelled {
+                    RusticError::Failed {
+                        message: "cancelled".into(),
+                        exit_code,
+                    }
+                    .to_rclone_error()
+                } else {
+                    classify_failure(&err_text, exit_code).to_rclone_error()
+                }
             });
             let _ = tx.send(OpEvent::Done {
                 success,
@@ -580,6 +752,14 @@ impl RusticDriver {
         });
 
         Ok(OpHandle::from_parts(rx, slot, cancelled))
+    }
+
+    /// `rustic init` at `repo`. Asks for the new password through the
+    /// prompter like any other command — rustic, given no password source
+    /// and no console, fails exactly as it does for a locked repository,
+    /// and the password the user then types becomes the repository's key.
+    pub fn init(&self, repo: &str) -> Result<(), RusticError> {
+        self.run(repo, &["init".into()], None).map(|_| ())
     }
 
     // --- running -------------------------------------------------------
@@ -633,7 +813,12 @@ impl RusticDriver {
 
     /// Run one command to completion, asking for a password and retrying
     /// for as long as the repository refuses and the user keeps answering.
-    fn run_os(&self, repo: &str, args: Vec<OsString>, cwd: Option<&Path>) -> Result<Vec<u8>, RusticError> {
+    fn run_os(
+        &self,
+        repo: &str,
+        args: Vec<OsString>,
+        cwd: Option<&Path>,
+    ) -> Result<Vec<u8>, RusticError> {
         loop {
             let tried = self.session.passwords.lock().get(repo).cloned();
             let mut cmd = self.command(repo);
@@ -644,9 +829,7 @@ impl RusticDriver {
             if let Some(d) = cwd {
                 cmd.current_dir(d);
             }
-            let child = cmd
-                .spawn()
-                .map_err(|e| RusticError::Spawn(e.to_string()))?;
+            let child = cmd.spawn().map_err(|e| RusticError::Spawn(e.to_string()))?;
             kill_child_with_process(&child);
             let out = child
                 .wait_with_output()
@@ -667,7 +850,12 @@ impl RusticDriver {
     }
 
     /// Get a (new) password for `repo` into the session, or fail.
-    fn ask_password(&self, repo: &str, tried: Option<String>, refused: bool) -> Result<(), RusticError> {
+    fn ask_password(
+        &self,
+        repo: &str,
+        tried: Option<String>,
+        refused: bool,
+    ) -> Result<(), RusticError> {
         let _one_dialog = self.session.asking.lock();
         // Another worker may have been answered while we waited for the
         // dialog lock — try what it got before asking again.
@@ -846,7 +1034,11 @@ pub fn snapshot_row_name(s: &Snapshot, show_host: bool) -> String {
 fn path_basename(p: &str) -> String {
     let t = p.trim_end_matches(['\\', '/']);
     let base = t.rsplit(['\\', '/']).next().unwrap_or(t);
-    if base.is_empty() { p.to_string() } else { base.to_string() }
+    if base.is_empty() {
+        p.to_string()
+    } else {
+        base.to_string()
+    }
 }
 
 /// Snapshot rows for a repository root.
@@ -894,7 +1086,11 @@ pub fn snapshot_start(s: &Snapshot) -> String {
         let Some(t) = tree_path_of(p) else {
             return String::new();
         };
-        let comps: Vec<String> = t.split('/').filter(|c| !c.is_empty()).map(str::to_string).collect();
+        let comps: Vec<String> = t
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+            .collect();
         common = Some(match common {
             None => comps,
             Some(c) => c
@@ -1016,6 +1212,44 @@ fn parse_status(line: &str) -> Option<Progress> {
     })
 }
 
+/// The `summary` line `rustic backup --json-progress` ends with.
+///
+/// `snapshot_id` is `None` when `--skip-if-unchanged` found nothing to
+/// write — the counts are still reported, and that is how a report can
+/// say "nothing changed" rather than "nothing happened".
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct BackupSummary {
+    pub files_new: u64,
+    pub files_changed: u64,
+    pub files_unmodified: u64,
+    pub dirs_new: u64,
+    pub dirs_changed: u64,
+    pub dirs_unmodified: u64,
+    /// Bytes of new data before compression.
+    pub data_added: u64,
+    /// Bytes actually written to the repository.
+    pub data_added_packed: u64,
+    pub total_files_processed: u64,
+    pub total_bytes_processed: u64,
+    /// Seconds.
+    pub total_duration: f64,
+    pub snapshot_id: Option<String>,
+}
+
+/// Parse one stdout line of a backup as its summary, if that is what it
+/// is. Status lines and anything else return `None`.
+pub fn parse_backup_summary(line: &str) -> Option<BackupSummary> {
+    #[derive(Deserialize)]
+    struct Tagged {
+        message_type: String,
+        #[serde(flatten)]
+        summary: BackupSummary,
+    }
+    let t: Tagged = serde_json::from_str(line.trim()).ok()?;
+    (t.message_type == "summary").then_some(t.summary)
+}
+
 /// Files a restore will write, from its plan line:
 /// `Files:  3 to restore, 0 unchanged, 0 verified, 1 to modify, 0 additional`.
 fn parse_files_to_restore(line: &str) -> Option<u64> {
@@ -1032,8 +1266,12 @@ fn parse_files_to_restore(line: &str) -> Option<u64> {
 }
 
 fn log_event(line: &str) -> LogEvent {
+    log_event_at(LogLevel::Info, line)
+}
+
+fn log_event_at(level: LogLevel, line: &str) -> LogEvent {
     LogEvent {
-        level: Some(LogLevel::Info),
+        level: Some(level),
         msg: line.to_string(),
         source: None,
         object: None,
@@ -1054,7 +1292,10 @@ fn failure_kind(stderr: &str) -> Failure {
     if t.contains("not a terminal") {
         return Failure::Password { refused: false };
     }
-    if t.contains("No suitable key found") || t.contains("errors/C002") || t.contains("seems to be incorrect") {
+    if t.contains("No suitable key found")
+        || t.contains("errors/C002")
+        || t.contains("seems to be incorrect")
+    {
         return Failure::Password { refused: true };
     }
     Failure::Other
@@ -1071,6 +1312,11 @@ pub fn classify_failure(stderr: &str, exit_code: Option<i32>) -> RusticError {
     }
     if message.contains("not found in tree") || message.starts_with("No suitable id found") {
         return RusticError::NotFound(message);
+    }
+    // Measured (0.11.4): `No repository config file found for
+    // `local:D:\x`. Please check the repository.`
+    if message.contains("No repository config file found") {
+        return RusticError::NoRepository(message);
     }
     let message = if message.is_empty() {
         match exit_code {
@@ -1102,7 +1348,10 @@ pub fn error_message(stderr: &str) -> String {
             return msg.join(" ");
         }
     }
-    if lines.iter().any(|l| l.contains("had a problem and crashed")) {
+    if lines
+        .iter()
+        .any(|l| l.contains("had a problem and crashed"))
+    {
         return "rustic crashed".into();
     }
     for l in &lines {
@@ -1116,7 +1365,12 @@ pub fn error_message(stderr: &str) -> String {
     lines
         .iter()
         .rev()
-        .find(|l| !l.is_empty() && !l.starts_with('[') && !l.starts_with("Backtrace") && !l.contains("RUST_BACKTRACE"))
+        .find(|l| {
+            !l.is_empty()
+                && !l.starts_with('[')
+                && !l.starts_with("Backtrace")
+                && !l.contains("RUST_BACKTRACE")
+        })
         .map(|l| l.to_string())
         .unwrap_or_default()
 }
@@ -1190,16 +1444,28 @@ mod tests {
 
     #[test]
     fn row_name_leads_with_time_and_ends_with_the_id() {
-        let mut s = snap("2026-10-22T10:13:23.0410089+02:00", &[r"C:\Users\me\Documents"]);
-        assert_eq!(snapshot_row_name(&s, false), "2026-10-22 10:13 Documents 4f13f557");
+        let mut s = snap(
+            "2026-10-22T10:13:23.0410089+02:00",
+            &[r"C:\Users\me\Documents"],
+        );
+        assert_eq!(
+            snapshot_row_name(&s, false),
+            "2026-10-22 10:13 Documents 4f13f557"
+        );
         s.tags = vec!["daily".into(), "x".into()];
         assert_eq!(
             snapshot_row_name(&s, true),
             "2026-10-22 10:13 Documents [daily, x] @DESKTOP 4f13f557"
         );
-        assert_eq!(snapshot_id_of(&snapshot_row_name(&s, true)), Some("4f13f557"));
+        assert_eq!(
+            snapshot_id_of(&snapshot_row_name(&s, true)),
+            Some("4f13f557")
+        );
         s.label = "game/saves › x".into();
-        assert_eq!(snapshot_row_name(&s, false), "2026-10-22 10:13 game-saves > x [daily, x] 4f13f557");
+        assert_eq!(
+            snapshot_row_name(&s, false),
+            "2026-10-22 10:13 game-saves > x [daily, x] 4f13f557"
+        );
         assert_eq!(snapshot_id_of("4f13f557"), Some("4f13f557"));
         assert_eq!(snapshot_id_of("2026-10-22 10:13 notes"), None);
     }
@@ -1209,7 +1475,10 @@ mod tests {
         let local = parse_time("2026-10-22T10:13:23.5+02:00").unwrap();
         let utc = parse_time("2026-10-22T08:13:23Z").unwrap();
         assert_eq!(local.0 - utc.0, 5_000_000);
-        assert_eq!(parse_time("2026-10-22T08:13:23-01:30").unwrap().0 - utc.0, 5_400 * 10_000_000);
+        assert_eq!(
+            parse_time("2026-10-22T08:13:23-01:30").unwrap().0 - utc.0,
+            5_400 * 10_000_000
+        );
     }
 
     #[test]
@@ -1218,7 +1487,10 @@ mod tests {
         assert_eq!(tree_path_of(r"C:\").as_deref(), Some("C"));
         assert_eq!(tree_path_of("/home/me/").as_deref(), Some("home/me"));
         assert_eq!(tree_path_of("relative"), None);
-        let s = snap("2026-01-01T00:00:00Z", &[r"C:\Users\me\a", r"C:\Users\me\b\c"]);
+        let s = snap(
+            "2026-01-01T00:00:00Z",
+            &[r"C:\Users\me\a", r"C:\Users\me\b\c"],
+        );
         assert_eq!(snapshot_start(&s), "C/Users/me");
         let s = snap("2026-01-01T00:00:00Z", &[r"C:\x", r"D:\y"]);
         assert_eq!(snapshot_start(&s), "");
@@ -1253,25 +1525,73 @@ mod tests {
     #[test]
     fn progress_and_plan_lines() {
         let p = parse_status(r#"{"message_type":"status","seconds_elapsed":2,"percent_done":0.5,"total_bytes":100,"bytes_done":50}"#).unwrap();
-        assert_eq!((p.bytes_done, p.bytes_total, p.eta_secs), (50, 100, Some(2)));
+        assert_eq!(
+            (p.bytes_done, p.bytes_total, p.eta_secs),
+            (50, 100, Some(2))
+        );
         assert!(parse_status("restore done.").is_none());
         assert_eq!(
-            parse_files_to_restore("Files:  3 to restore, 0 unchanged, 0 verified, 1 to modify, 0 additional"),
+            parse_files_to_restore(
+                "Files:  3 to restore, 0 unchanged, 0 verified, 1 to modify, 0 additional"
+            ),
             Some(4)
         );
         assert_eq!(parse_files_to_restore("Dirs:   1 to restore"), None);
     }
 
     #[test]
+    fn backup_summary_is_read_from_the_json_progress_stream() {
+        // Verbatim rustic 0.11.4 output for a run that wrote a snapshot…
+        let line = r#"{"message_type":"summary","files_new":1,"files_changed":0,"files_unmodified":3,"dirs_new":0,"dirs_changed":13,"dirs_unmodified":1,"data_blobs":4,"tree_blobs":13,"data_added":9003239,"data_added_packed":9002994,"total_files_processed":4,"total_bytes_processed":12000012,"total_duration":0.0628283,"snapshot_id":"e7bc6ede3c86ba17f4edb913a5905b990b7a48388a1ca9e44e3fa62b9797bb00"}"#;
+        let s = parse_backup_summary(line).expect("summary");
+        assert_eq!(s.files_new, 1);
+        assert_eq!(s.files_unmodified, 3);
+        assert_eq!(s.data_added_packed, 9002994);
+        assert_eq!(s.total_bytes_processed, 12000012);
+        assert_eq!(
+            s.snapshot_id.as_deref().map(|id| &id[..8]),
+            Some("e7bc6ede")
+        );
+        // …and one `--skip-if-unchanged` skipped: no id, counts intact.
+        let skipped = r#"{"message_type":"summary","files_new":0,"files_changed":0,"files_unmodified":4,"total_files_processed":4,"total_bytes_processed":12,"total_duration":0.01}"#;
+        let s = parse_backup_summary(skipped).expect("summary");
+        assert!(s.snapshot_id.is_none());
+        assert_eq!(s.files_unmodified, 4);
+        // A status line is not a summary.
+        assert!(parse_backup_summary(
+            r#"{"message_type":"status","seconds_elapsed":0,"percent_done":0.0,"total_bytes":12,"bytes_done":0}"#
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_missing_repository_is_its_own_error() {
+        let stderr = "error: `rustic_core` experienced an error related to `the configuration`.\n\nMessage:\nNo repository config file found for `local:D:\\nope`. Please check the repository.\n\n";
+        match classify_failure(stderr, Some(1)) {
+            RusticError::NoRepository(m) => assert!(m.contains("D:\\nope"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn errors_are_distilled() {
         let core = "\u{1b}[0m\u{1b}[31merror:\u{1b}[0m `rustic_core` experienced an error related to `internal operations`.\n\nMessage:\nNode `Nope` not found in tree.\n\nWe believe this is a bug, please report it\n\nBacktrace:\ndisabled backtrace (set 'RUST_BACKTRACE=\"1\"' environment variable to enable)\n";
         assert_eq!(error_message(core), "Node `Nope` not found in tree.");
-        assert!(matches!(classify_failure(core, Some(1)), RusticError::NotFound(_)));
+        assert!(matches!(
+            classify_failure(core, Some(1)),
+            RusticError::NotFound(_)
+        ));
         let cli = "[INFO] using no config file\nerror: IO error: not a terminal\n";
         assert_eq!(error_message(cli), "IO error: not a terminal");
-        assert!(matches!(failure_kind(cli), Failure::Password { refused: false }));
+        assert!(matches!(
+            failure_kind(cli),
+            Failure::Password { refused: false }
+        ));
         let wrong = "error: `rustic_core` experienced an error related to `credentials handling`.\n\nMessage:\nThe password that has been entered, seems to be incorrect. No suitable key found for the given password.\n";
-        assert!(matches!(failure_kind(wrong), Failure::Password { refused: true }));
+        assert!(matches!(
+            failure_kind(wrong),
+            Failure::Password { refused: true }
+        ));
         let crash = "rustic-rs had a problem and crashed. To help us diagnose\n";
         assert_eq!(error_message(crash), "rustic crashed");
     }
@@ -1280,7 +1600,10 @@ mod tests {
     fn snapshot_list_reads_flat_and_grouped_json() {
         let flat = br#"[{"id":"bb","time":"2026-02-01T00:00:00Z"},{"id":"aa","time":"2026-01-01T00:00:00Z","paths":["C:\\x"]}]"#;
         let s = parse_snapshots(flat).unwrap();
-        assert_eq!(s.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["aa", "bb"]);
+        assert_eq!(
+            s.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["aa", "bb"]
+        );
         let grouped = br#"[{"group_key":{"hostname":"h"},"snapshots":[{"id":"cc","time":"2026-01-01T00:00:00Z"}]}]"#;
         assert_eq!(parse_snapshots(grouped).unwrap()[0].id, "cc");
     }

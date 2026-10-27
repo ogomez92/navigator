@@ -599,8 +599,9 @@ impl AppState {
         // A locked backup asks through the main window. Whatever thread
         // runs rustic blocks in `SendMessageW` until the user answers.
         let target = HwndSend(hwnd);
-        self.rustic
-            .set_prompter(Arc::new(move |repo, retry| ask_password(target, repo, retry)));
+        self.rustic.set_prompter(Arc::new(move |repo, retry| {
+            ask_password(target, repo, retry)
+        }));
     }
     fn hwnd(&self) -> Option<HwndSend> {
         *self.hwnd.lock()
@@ -2643,6 +2644,252 @@ impl AppState {
             .expect("spawn restore-backup worker");
     }
 
+    /// Ctrl+Shift+D: copy each selected item beside itself as
+    /// `<name>-<8 hex chars>` (before a file's extension), so a quick
+    /// working copy never needs a destination or a name. One `copyto` per
+    /// item on rclone, which is what makes it work on a remote and a UNC
+    /// share as well as a drive; refused inside a backup like every other
+    /// write. The name is checked against the folder before the copy —
+    /// a collision on eight random hex characters is improbable, but a
+    /// silent merge into an existing folder would be the wrong kind of
+    /// surprise.
+    pub fn op_duplicate(&self) {
+        if self.in_backup("duplicating") {
+            return;
+        }
+        let Some(cwd) = self.model.cwd() else {
+            return;
+        };
+        if cwd.is_this_pc() || cwd.is_remotes_root() {
+            self.play(SoundEvent::Error);
+            self.say("can't duplicate here: not a folder", true);
+            return;
+        }
+        let sel = self.model.selected_paths_with_kind();
+        if sel.is_empty() {
+            self.say("nothing selected", false);
+            return;
+        }
+        let mut pairs: Vec<(NavPath, NavPath)> = Vec::with_capacity(sel.len());
+        for (src, is_dir) in sel {
+            let name = src.file_name().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            // Search results list items from several folders; each copy
+            // goes next to its own source, not into the search root.
+            let parent = src.parent().unwrap_or_else(|| cwd.clone());
+            let mut dst = parent.join(&crate::jobs::duplicate_name(
+                &name,
+                is_dir,
+                &crate::jobs::short_uid(),
+            ));
+            for _ in 0..8 {
+                if parent.is_remote() || !dst.as_path().exists() {
+                    break;
+                }
+                dst = parent.join(&crate::jobs::duplicate_name(
+                    &name,
+                    is_dir,
+                    &crate::jobs::short_uid(),
+                ));
+            }
+            pairs.push((src, dst));
+        }
+        if pairs.is_empty() {
+            self.say("nothing to duplicate", false);
+            return;
+        }
+        let ctx = self.clone_for_worker();
+        thread::Builder::new()
+            .name("navigator-duplicate".into())
+            .spawn(move || ctx.run_duplicate(pairs))
+            .expect("spawn duplicate worker");
+    }
+
+    /// Tools → Jobs (Ctrl+J): the saved-jobs list. Loops over the picker
+    /// so New / Edit / Delete come straight back to the list with it
+    /// rebuilt; Run leaves the list and starts the worker.
+    pub fn op_jobs(&self) {
+        use crate::jobs_dialog::JobsAction;
+        let Some(hwnd) = self.main_hwnd() else {
+            return;
+        };
+        let mut pre = 0usize;
+        loop {
+            let jobs: Vec<navigator_config::Job> = self.config.read().jobs.clone();
+            let labels: Vec<String> = jobs.iter().map(crate::jobs::job_label).collect();
+            match crate::jobs_dialog::pick(hwnd, &labels, pre) {
+                None => return,
+                Some(JobsAction::Run(i)) => {
+                    self.run_job_index(i);
+                    return;
+                }
+                Some(JobsAction::New) => {
+                    let taken: Vec<String> = jobs.iter().map(|j| j.name.clone()).collect();
+                    let draft = self.job_draft_here();
+                    if let Some(j) =
+                        crate::job_dialog::edit(hwnd, draft, taken, "New job — navigator")
+                    {
+                        let name = j.name.clone();
+                        self.config.with_mut(|c| c.jobs.push(j));
+                        let _ = self.config.save();
+                        pre = jobs.len();
+                        self.say(&format!("job {name} saved"), false);
+                    }
+                }
+                Some(JobsAction::Edit(i)) => {
+                    let Some(j) = jobs.get(i).cloned() else {
+                        continue;
+                    };
+                    let taken: Vec<String> = jobs
+                        .iter()
+                        .enumerate()
+                        .filter(|(k, _)| *k != i)
+                        .map(|(_, j)| j.name.clone())
+                        .collect();
+                    if let Some(nj) =
+                        crate::job_dialog::edit(hwnd, j, taken, "Edit job — navigator")
+                    {
+                        self.config.with_mut(|c| {
+                            if i < c.jobs.len() {
+                                c.jobs[i] = nj;
+                            }
+                        });
+                        let _ = self.config.save();
+                    }
+                    pre = i;
+                }
+                Some(JobsAction::Delete(i)) => {
+                    let Some(j) = jobs.get(i) else {
+                        continue;
+                    };
+                    let body = format!(
+                        "Delete the job {:?}?\n\nOnly the saved job is removed; nothing it copied is touched.",
+                        j.name
+                    );
+                    if confirm_default_no(Some(hwnd), "Delete job", &body) {
+                        self.config.with_mut(|c| {
+                            if i < c.jobs.len() {
+                                c.jobs.remove(i);
+                            }
+                        });
+                        let _ = self.config.save();
+                        self.say(&format!("job {} deleted", j.name), false);
+                        pre = i.saturating_sub(1);
+                    } else {
+                        pre = i;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ctrl+Shift+J: save the clipboard's items as a job that copies them
+    /// into the current folder — or, on a rustic repository's snapshot
+    /// list, backs them up into that repository. The gesture is the paste
+    /// gesture: copy, go to the destination, save. Opens the editor so the
+    /// job gets a name and a mode before it is written.
+    pub fn op_new_job(&self) {
+        let Some(hwnd) = self.main_hwnd() else {
+            return;
+        };
+        let dest = match self.job_dest_here() {
+            Ok(d) => d,
+            Err(m) => {
+                self.play(SoundEvent::Error);
+                self.say(&m, true);
+                return;
+            }
+        };
+        let clip = crate::clipboard::load_clip();
+        if clip.sources.is_empty() {
+            self.play(SoundEvent::Error);
+            self.say(
+                "clipboard is empty: copy the items to back up first, then open their destination and save the job",
+                true,
+            );
+            return;
+        }
+        let draft = navigator_config::Job {
+            sources: clip.sources,
+            dest,
+            ..Default::default()
+        };
+        let taken: Vec<String> = self
+            .config
+            .read()
+            .jobs
+            .iter()
+            .map(|j| j.name.clone())
+            .collect();
+        if let Some(j) = crate::job_dialog::edit(hwnd, draft, taken, "New job — navigator") {
+            let name = j.name.clone();
+            self.config.with_mut(|c| c.jobs.push(j));
+            let _ = self.config.save();
+            self.play(SoundEvent::HotspotSet);
+            self.say(&format!("job {name} saved; run it from Tools, Jobs"), false);
+        }
+    }
+
+    /// The destination a job saved from the current folder would have:
+    /// the folder's address-bar spelling, or `rustic:<repo>` on a
+    /// repository's snapshot list. Err carries the spoken refusal.
+    fn job_dest_here(&self) -> Result<String, String> {
+        let Some(cwd) = self.model.cwd() else {
+            return Err("no folder open".into());
+        };
+        if cwd.is_this_pc() || cwd.is_remotes_root() {
+            return Err("this is not a folder; open the destination folder first".into());
+        }
+        if let Some(parts) = cwd.rustic_parts() {
+            if parts.snapshot.is_some() {
+                return Err(
+                    "inside a backup; go up to the repository's snapshot list to make a rustic backup job"
+                        .into(),
+                );
+            }
+            return Ok(format!(
+                "{}{}",
+                navigator_config::RUSTIC_DEST_PREFIX,
+                parts.repo
+            ));
+        }
+        Ok(crate::jobs::path_display(&cwd))
+    }
+
+    /// A blank job pre-filled from where the user is: clipboard items as
+    /// sources, the current folder as destination (empty when it has
+    /// none).
+    fn job_draft_here(&self) -> navigator_config::Job {
+        navigator_config::Job {
+            sources: crate::clipboard::load_clip().sources,
+            dest: self.job_dest_here().unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+
+    /// Start job `idx` on a worker, on engines carrying the job's excludes
+    /// and link setting.
+    fn run_job_index(&self, idx: usize) {
+        let Some(job) = self.config.read().jobs.get(idx).cloned() else {
+            return;
+        };
+        let mut ctx = self.clone_for_worker();
+        ctx.rclone = ctx
+            .rclone
+            .clone()
+            .with_extra_args(crate::jobs::rclone_job_args(&job));
+        ctx.robocopy = ctx.robocopy.take().map(|r| {
+            r.with_extra_flags(crate::jobs::robocopy_exclude_flags(&job.excludes))
+                .with_links(job.links)
+        });
+        thread::Builder::new()
+            .name("navigator-job".into())
+            .spawn(move || ctx.run_job(job))
+            .expect("spawn job worker");
+    }
+
     /// Cheap snapshot of the bits worker threads need. Keeps `AppState` out
     /// of the closure so we don't leak `Arc<Self>` into threads that only
     /// need to speak + spawn rclone.
@@ -3924,10 +4171,7 @@ fn confirm_empty_trash(parent: Option<HWND>, body: &str) -> bool {
     };
     use windows::core::PCWSTR;
 
-    let title_w: Vec<u16> = "Empty trash?"
-        .encode_utf16()
-        .chain([0])
-        .collect();
+    let title_w: Vec<u16> = "Empty trash?".encode_utf16().chain([0]).collect();
     let body_w: Vec<u16> = body.encode_utf16().chain([0]).collect();
     let is_foreground = parent
         .map(|h| unsafe { GetForegroundWindow() } == h)
@@ -4024,10 +4268,12 @@ fn rustic_properties(
         return String::new();
     };
     if parts.snapshot.is_none() {
-        let snap = rustic.cached_snapshot(&parts.repo, &entry.name).or_else(|| {
-            rustic.snapshots(&parts.repo).ok()?;
-            rustic.cached_snapshot(&parts.repo, &entry.name)
-        });
+        let snap = rustic
+            .cached_snapshot(&parts.repo, &entry.name)
+            .or_else(|| {
+                rustic.snapshots(&parts.repo).ok()?;
+                rustic.cached_snapshot(&parts.repo, &entry.name)
+            });
         return match snap {
             Some(s) => crate::restore::snapshot_properties(&parts.repo, &s),
             None => format!("Snapshot {} is no longer in the repository.", entry.name),
@@ -4231,7 +4477,16 @@ struct OpProgress {
     /// dismissed, and a batch that failed per-group put one up mid-job
     /// while later groups were still running.
     failures: Vec<crate::narrate::Failure>,
+    /// Every log record `on_log` saw during the current invocation, for a
+    /// job report. Warnings and errors are always kept; the rest is capped
+    /// so a 50k-file copy doesn't hold 50k strings. Cleared by `begin`.
+    transcript: Vec<(navigator_rclone::LogLevel, String)>,
 }
+
+/// Informational log lines kept per invocation for a report; warnings and
+/// errors are kept beyond this, up to `TRANSCRIPT_HARD_CAP`.
+const TRANSCRIPT_INFO_CAP: usize = 400;
+const TRANSCRIPT_HARD_CAP: usize = 4_000;
 
 impl OpProgress {
     fn new(ctx: &WorkerCtx, verb: &'static str, total_units: u64) -> Self {
@@ -4253,6 +4508,7 @@ impl OpProgress {
             stats: navigator_rclone::Progress::default(),
             hwnd: ctx.hwnd,
             failures: Vec::new(),
+            transcript: Vec::new(),
         };
         if let Some(w) = me.window.as_ref() {
             w.post_begin(&crate::narrate::window_title(verb, &me.meter));
@@ -4274,6 +4530,7 @@ impl OpProgress {
         self.meter.begin(weight);
         self.stats = navigator_rclone::Progress::default();
         self.current_file.clear();
+        self.transcript.clear();
     }
 
     /// Fold the finished invocation into the job total. Called for
@@ -4308,17 +4565,59 @@ impl OpProgress {
     /// window's log pane, or `None` for records that would only be noise —
     /// the once-a-second stats ticks, which the labels already render.
     fn on_log(&mut self, ev: &navigator_rclone::LogEvent) -> Option<String> {
+        use navigator_rclone::LogLevel;
         if ev.stats.is_some() {
             return None;
         }
-        if let Some(obj) = ev.object.as_deref().filter(|o| !o.is_empty()) {
+        let object = ev.object.as_deref().filter(|o| !o.is_empty());
+        if let Some(obj) = object {
             self.current_file = obj.to_string();
         }
-        Some(format!(
-            "[{:?}] {}",
-            ev.level.unwrap_or(navigator_rclone::LogLevel::Info),
-            ev.msg
-        ))
+        let level = ev.level.unwrap_or(LogLevel::Info);
+        let important = matches!(
+            level,
+            LogLevel::Warning | LogLevel::Error | LogLevel::Critical
+        );
+        let cap = if important {
+            TRANSCRIPT_HARD_CAP
+        } else {
+            TRANSCRIPT_INFO_CAP
+        };
+        if self.transcript.len() < cap {
+            let line = match object {
+                Some(o) => format!("{}: {o}", ev.msg),
+                None => ev.msg.clone(),
+            };
+            self.transcript.push((level, line));
+        }
+        Some(format!("[{:?}] {}", level, ev.msg))
+    }
+
+    /// The current invocation's log records, leaving the buffer empty.
+    fn take_transcript(&mut self) -> Vec<(navigator_rclone::LogLevel, String)> {
+        std::mem::take(&mut self.transcript)
+    }
+
+    /// The most recent recorded failure as `(reason, supporting lines)`,
+    /// removed from the list so `finish` won't report it a second time.
+    /// For a job that writes its own report instead of raising the
+    /// failure dialog.
+    fn take_last_failure(&mut self) -> (String, Vec<String>) {
+        match self.failures.pop() {
+            Some(f) => (f.reason, f.detail),
+            None => ("failed".into(), Vec::new()),
+        }
+    }
+
+    /// [`Self::finish`] without the failure dialog: closes the window out
+    /// and drops whatever failures are left. For a job, whose report
+    /// window already lists every failure item by item.
+    fn finish_quietly(&mut self, success: bool) {
+        if let Some(w) = self.window.as_ref() {
+            w.clear_cancel();
+            w.post_done(success && !self.cancelled());
+        }
+        self.failures.clear();
     }
 
     /// Push the current state to the window and, if the cadence allows,
@@ -5310,18 +5609,27 @@ impl WorkerCtx {
                         // The user was shown this item by name above (or
                         // chose the mode outright): rustic's own
                         // overwrite-what-differs applies.
-                        (it.dst.clone(), Vec::new(), m == ConflictMode::Mirror && it.is_dir)
+                        (
+                            it.dst.clone(),
+                            Vec::new(),
+                            m == ConflictMode::Mirror && it.is_dir,
+                        )
                     } else {
                         // Nothing to protect existing files *with*.
                         skipped += 1;
                         prog.skip(1);
-                        prog.record_problem("could not compare it with the existing copy", Some(name));
+                        prog.record_problem(
+                            "could not compare it with the existing copy",
+                            Some(name),
+                        );
                         continue;
                     }
                 }
                 (Some(m), Landing::Merge) => {
                     let diff = it.diff.as_deref().unwrap_or_default();
-                    let p = plan_item(m, diff, |rel| self.restore_local_newer(&it.src, &it.dst, it.is_dir, rel));
+                    let p = plan_item(m, diff, |rel| {
+                        self.restore_local_newer(&it.src, &it.dst, it.is_dir, rel)
+                    });
                     retyped.extend(p.retyped.iter().map(|r| shown(&name, r, it.is_dir)));
                     if it.is_dir {
                         (it.dst.clone(), p.excludes, m == ConflictMode::Mirror)
@@ -5792,6 +6100,358 @@ impl WorkerCtx {
     /// when the remote stat can't answer — a wrong guess just surfaces
     /// rclone's own "is a file/directory" error rather than mis-deleting.
     /// The robocopy driver, if it should run `op`.
+    /// Which engine [`Self::spawn_transfer`] will pick for `op`, named for
+    /// a report. Mirrors that function's decision, minus the fallback a
+    /// robocopy that fails to start takes.
+    fn engine_name(&self, op: &Operation) -> &'static str {
+        if matches!(
+            op,
+            Operation::RusticRestore { .. } | Operation::RusticBackup { .. }
+        ) {
+            "rustic"
+        } else if self.robocopy_for(op).is_some() {
+            "robocopy"
+        } else {
+            "rclone"
+        }
+    }
+
+    /// Ctrl+Shift+D's worker: one `copyto` per pair, then land the caret
+    /// on the first copy made.
+    fn run_duplicate(self, pairs: Vec<(NavPath, NavPath)>) {
+        let _guard = self.state.upgrade().map(|s| s.op_guard());
+        let total = pairs.len();
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
+        let mut prog = OpProgress::new(&self, "Copying", total as u64);
+        self.say(format!("duplicating {total} item{}", plural(total)), false);
+        let mut failed = 0usize;
+        let mut first: Option<NavPath> = None;
+        for (src, dst) in pairs {
+            if prog.cancelled() {
+                break;
+            }
+            prog.begin(1);
+            let ok = self.run_op(
+                Operation::CopyTo {
+                    src,
+                    dst: dst.clone(),
+                },
+                &mut prog,
+            );
+            prog.end();
+            if ok {
+                first.get_or_insert(dst);
+            } else {
+                failed += 1;
+            }
+        }
+        let cancelled = prog.cancelled();
+        prog.finish(failed == 0);
+        self.play_outcome(cancelled, failed > 0, SoundEvent::CopyDone);
+        if cancelled {
+            self.say("cancelled", true);
+        } else if failed == 0 {
+            self.say(format!("duplicated {total} item{}", plural(total)), false);
+        } else {
+            self.say(
+                format!("duplicated {} of {total}, {failed} failed", total - failed),
+                true,
+            );
+        }
+        self.refresh_with_focus(first);
+    }
+
+    /// Run a saved job to completion and show its report.
+    ///
+    /// A job is a paste whose conflict decision was made when it was
+    /// saved, so each item runs through [`Self::run_op`] on the engine a
+    /// paste would use (robocopy between two filesystem paths, rclone
+    /// otherwise, rustic for a `rustic:` destination), with the job's
+    /// excludes already on the drivers (see `AppState::run_job_index`).
+    /// What a paste never needed is the report: everything the engines
+    /// said, item by item, in a viewer window, also written to
+    /// `<exe_dir>/job_reports`, with a one-line verdict kept on the job
+    /// for the list. Failures go into the report rather than the paste's
+    /// failure dialog (`finish_quietly`) so one run ends in one window.
+    fn run_job(self, job: navigator_config::Job) {
+        use navigator_config::JobKind;
+        let _guard = self.state.upgrade().map(|s| s.op_guard());
+        let started = crate::clipboard::now_ts();
+        let mut report = crate::jobs::Report::new(&job, started);
+        let done_sound = match job.kind() {
+            JobKind::RusticBackup => SoundEvent::BackupDone,
+            JobKind::Copy => SoundEvent::CopyDone,
+        };
+        self.play(SoundEvent::PasteStart);
+        match job.kind() {
+            JobKind::Copy => self.run_copy_job(&job, &mut report),
+            JobKind::RusticBackup => self.run_rustic_job(&job, &mut report),
+        }
+        report.finished = crate::clipboard::now_ts();
+        report.saved_to = crate::jobs::save_report(&job.name, started, &report.render());
+        let text = report.render();
+        let summary = report.summary();
+        let ok = report.all_ok();
+        self.play_outcome(report.cancelled(), !ok, done_sound);
+        if let Some(state) = self.state.upgrade() {
+            let run = navigator_config::JobRun {
+                ts: report.finished,
+                ok,
+                summary: summary.clone(),
+            };
+            let name = job.name.clone();
+            state.config.with_mut(|c| {
+                if let Some(j) = c.jobs.iter_mut().find(|j| j.name == name) {
+                    j.last_run = Some(run);
+                }
+            });
+            let _ = state.config.save();
+            // The destination may be the folder on screen; `refresh_dir`
+            // only re-lists it if the user is still there.
+            if let Ok(dest) = crate::jobs::parse_path(&job.dest)
+                && !dest.is_rustic()
+            {
+                state.refresh_dir(&dest);
+            }
+        }
+        self.say(summary, true);
+        if let Some(h) = self.hwnd {
+            post_viewer(h, format!("Job report — {}", job.name), text);
+        }
+    }
+
+    fn run_copy_job(&self, job: &navigator_config::Job, report: &mut crate::jobs::Report) {
+        use crate::jobs::{ItemReport, Outcome};
+        let blank = |label: String, outcome: Outcome| ItemReport {
+            label,
+            engine: "",
+            outcome,
+            files: 0,
+            bytes: 0,
+            secs: 0,
+            detail: Vec::new(),
+        };
+        let dest = match crate::jobs::parse_path(&job.dest) {
+            Ok(d) => d,
+            Err(e) => {
+                report.items.push(blank(
+                    job.dest.clone(),
+                    Outcome::Failed(format!("destination is not a valid path ({e})")),
+                ));
+                return;
+            }
+        };
+        let (items, problems) = crate::jobs::plan_copy(job, &dest, |p| self.path_is_dir(p));
+        if items.is_empty() && problems.is_empty() {
+            report.items.push(blank(
+                job.dest.clone(),
+                Outcome::Skipped("the job has no sources".into()),
+            ));
+            return;
+        }
+        let total = (items.len() + problems.len()) as u64;
+        let mut prog = OpProgress::new(self, "Copying", total);
+        self.say(
+            format!(
+                "job {}: copying {} item{} to {}",
+                job.name,
+                items.len(),
+                if items.len() == 1 { "" } else { "s" },
+                job.dest
+            ),
+            false,
+        );
+        for (src, why) in problems {
+            prog.skip(1);
+            report.items.push(blank(
+                format!("{src} → {}", job.dest),
+                Outcome::Skipped(why),
+            ));
+        }
+        for item in items {
+            if prog.cancelled() {
+                report.items.push(blank(item.label(), Outcome::Cancelled));
+                continue;
+            }
+            let op = crate::jobs::copy_operation(&item, job.mode);
+            let engine = self.engine_name(&op);
+            let t0 = Instant::now();
+            prog.begin(1);
+            let ok = self.run_op(op, &mut prog);
+            let stats = prog.stats.clone();
+            let mut detail = crate::jobs::transcript_detail(&prog.take_transcript(), 40);
+            let outcome = if ok {
+                Outcome::Ok
+            } else if prog.cancelled() {
+                Outcome::Cancelled
+            } else {
+                let (reason, more) = prog.take_last_failure();
+                detail.extend(more);
+                Outcome::Failed(reason)
+            };
+            prog.end();
+            report.items.push(ItemReport {
+                label: item.label(),
+                engine,
+                outcome,
+                files: stats.files_done,
+                bytes: stats.bytes_done,
+                secs: t0.elapsed().as_secs(),
+                detail,
+            });
+        }
+        prog.finish_quietly(report.failed_count() == 0);
+    }
+
+    /// One `rustic backup` for every source at once — one snapshot per
+    /// run, like a backup alias. A repository that isn't there yet is
+    /// offered for creation (`rustic init`, password asked through the
+    /// usual prompt) rather than failed, since a brand-new job's first
+    /// run is exactly when that happens.
+    fn run_rustic_job(&self, job: &navigator_config::Job, report: &mut crate::jobs::Report) {
+        use crate::jobs::{ItemReport, Outcome};
+        let blank = |label: String, outcome: Outcome| ItemReport {
+            label,
+            engine: "",
+            outcome,
+            files: 0,
+            bytes: 0,
+            secs: 0,
+            detail: Vec::new(),
+        };
+        let Some(repo) = job.rustic_repo() else {
+            report.items.push(blank(
+                job.dest.clone(),
+                Outcome::Failed("the destination names no repository".into()),
+            ));
+            return;
+        };
+        let repo = navigator_core::path::normalize_rustic_repo(repo);
+        let mut sources: Vec<NavPath> = Vec::new();
+        for raw in job.sources.iter().filter(|s| !s.trim().is_empty()) {
+            let label = format!("{} → {}", raw.trim(), job.dest);
+            match crate::jobs::parse_path(raw) {
+                Ok(p) if p.is_remote() || p.is_rustic() => report.items.push(blank(
+                    label,
+                    Outcome::Skipped("rustic backs up local paths only".into()),
+                )),
+                Ok(p) if !p.as_path().exists() => report
+                    .items
+                    .push(blank(label, Outcome::Skipped("not found".into()))),
+                Ok(p) => sources.push(p),
+                Err(e) => report.items.push(blank(
+                    label,
+                    Outcome::Skipped(format!("not a valid path ({e})")),
+                )),
+            }
+        }
+        if sources.is_empty() {
+            if report.items.is_empty() {
+                report.items.push(blank(
+                    job.dest.clone(),
+                    Outcome::Skipped("the job has no sources".into()),
+                ));
+            }
+            return;
+        }
+        let label = format!(
+            "{} → {}",
+            if sources.len() == 1 {
+                crate::jobs::path_display(&sources[0])
+            } else {
+                format!("{} sources", sources.len())
+            },
+            job.dest
+        );
+
+        match self.rustic.ensure_open(&repo) {
+            Ok(()) => {}
+            Err(RusticError::NoRepository(msg)) => {
+                let body = format!(
+                    "{msg}\n\nCreate a new rustic repository there now (rustic init)? You will be asked for a password to protect it."
+                );
+                if !crate::dialogs::ask_yes_no(self.hwnd, "Create repository?", &body) {
+                    report.items.push(blank(
+                        label,
+                        Outcome::Skipped("the repository does not exist".into()),
+                    ));
+                    return;
+                }
+                if let Err(e) = self.rustic.init(&repo) {
+                    report.items.push(blank(
+                        label,
+                        Outcome::Failed(format!("could not create the repository: {e}")),
+                    ));
+                    return;
+                }
+                self.say("repository created", false);
+            }
+            Err(e) => {
+                report
+                    .items
+                    .push(blank(label, Outcome::Failed(e.to_string())));
+                return;
+            }
+        }
+
+        let op = Operation::RusticBackup {
+            repo,
+            sources,
+            tags: crate::jobs::rustic_tags(job),
+            excludes: crate::jobs::rustic_exclude_globs(&job.excludes),
+        };
+        let mut prog = OpProgress::new(self, "Backing up", 1);
+        self.say(
+            format!("job {}: backing up to {}", job.name, job.dest),
+            false,
+        );
+        let t0 = Instant::now();
+        prog.begin(1);
+        let ok = self.run_op(op, &mut prog);
+        let stats = prog.stats.clone();
+        let transcript = prog.take_transcript();
+        let summary = transcript
+            .iter()
+            .find_map(|(_, m)| navigator_rclone::rustic::parse_backup_summary(m));
+        let mut detail = Vec::new();
+        if let Some(s) = &summary {
+            detail.extend(crate::jobs::describe_backup(s));
+        }
+        let rest: Vec<(navigator_rclone::LogLevel, String)> = transcript
+            .into_iter()
+            .filter(|(_, m)| navigator_rclone::rustic::parse_backup_summary(m).is_none())
+            .collect();
+        detail.extend(crate::jobs::transcript_detail(&rest, 40));
+        let outcome = if ok {
+            if summary.as_ref().is_some_and(|s| s.snapshot_id.is_none()) {
+                Outcome::Unchanged
+            } else {
+                Outcome::Ok
+            }
+        } else if prog.cancelled() {
+            Outcome::Cancelled
+        } else {
+            let (reason, more) = prog.take_last_failure();
+            detail.extend(more);
+            Outcome::Failed(reason)
+        };
+        prog.end();
+        let (files, bytes) = summary
+            .as_ref()
+            .map(|s| (s.files_new + s.files_changed, s.data_added))
+            .unwrap_or((0, stats.bytes_done));
+        report.items.push(ItemReport {
+            label,
+            engine: "rustic",
+            outcome,
+            files,
+            bytes,
+            secs: t0.elapsed().as_secs(),
+            detail,
+        });
+        prog.finish_quietly(ok);
+    }
+
     fn robocopy_for(&self, op: &Operation) -> Option<&RobocopyDriver> {
         self.robocopy
             .as_ref()
@@ -6015,6 +6675,8 @@ fn op_verb(op: &Operation) -> &'static str {
         Operation::Delete { .. } => "Deleting",
         Operation::Mkdir { .. } | Operation::Touch { .. } => "Creating",
         Operation::RusticRestore { .. } => "Restoring",
+        Operation::SyncDir { .. } => "Copying",
+        Operation::RusticBackup { .. } => "Backing up",
     }
 }
 
@@ -6042,6 +6704,8 @@ fn op_subject(op: &Operation) -> Option<String> {
         Operation::Mkdir { dir } => name(dir),
         Operation::Touch { file } => name(file),
         Operation::RusticRestore { src, .. } => name(src),
+        Operation::SyncDir { src, .. } => Some(crate::jobs::item_name(src)),
+        Operation::RusticBackup { sources, .. } => sources.first().and_then(name),
     }
 }
 
@@ -6530,6 +7194,19 @@ pub fn run(cfg: AppConfig) -> windows::core::Result<i32> {
     let state = AppState::new(&cfg);
     state.bootstrap_plugins();
     let window = create_window(state.clone())?;
+    // Speech failing to start must not take the app with it, but it must
+    // not be silent either: a screen-reader user hears nothing from a
+    // window that is otherwise working, which reads as "it didn't open".
+    // A native message box is read by the screen reader itself.
+    if let Some(reason) = state.speech.init_error() {
+        crate::dialogs::show_error(
+            Some(crate::window::HwndSend(window.hwnd)),
+            "Speech unavailable",
+            &format!(
+                "navigator will run without speech.\n\n{reason}\n\nReinstall navigator (r.cmd) so the matching prism.dll sits next to the executable."
+            ),
+        );
+    }
     let rc = run_message_loop(window.hwnd);
     // Operation history is written on its own thread so a big copy doesn't
     // stall Ctrl+C; `main` exits the process immediately after this

@@ -11,9 +11,11 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+pub mod jobs;
 pub mod shortcuts;
 pub mod sounds;
 
+pub use jobs::{Job, JobKind, JobRun, RUSTIC_DEST_PREFIX, is_rustic_dest};
 pub use navigator_core::ConflictMode as PasteConflictMode;
 pub use shortcuts::{HOTSPOT_COUNT, InternalCommand, ShortcutAction, ShortcutChord};
 pub use sounds::{SOUNDS_DIR_NAME, SoundEvent, Sounds, list_sounds, sound_path, sounds_dir};
@@ -61,6 +63,8 @@ pub struct Config {
     /// than `Vec<Option<String>>` because TOML arrays can't hold `None`.)
     #[serde(default = "default_hotspots")]
     pub hotspots: Vec<String>,
+    /// Saved copy / backup jobs, run from Tools → Jobs. See [`jobs`].
+    pub jobs: Vec<Job>,
 }
 
 fn default_hotspots() -> Vec<String> {
@@ -79,6 +83,7 @@ impl Default for Config {
             recent_paths: Vec::new(),
             shortcuts: shortcuts::default_actions(),
             hotspots: default_hotspots(),
+            jobs: Vec::new(),
         }
     }
 }

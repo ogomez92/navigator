@@ -277,7 +277,9 @@ mod tests {
 
     #[test]
     fn update_protects_only_newer_local_copies() {
-        let p = plan_item(ConflictMode::Update, &diff(), |rel| rel == "edited-later.txt");
+        let p = plan_item(ConflictMode::Update, &diff(), |rel| {
+            rel == "edited-later.txt"
+        });
         assert_eq!(p.overwrites, ["old.txt"]);
         assert_eq!(p.excludes, ["edited-later.txt", "was-a-folder"]);
     }
@@ -305,13 +307,21 @@ mod tests {
             assert_eq!(p.retyped, ["was-a-folder"]);
         }
         assert!(retyped_note(&[]).is_none());
-        assert!(retyped_note(&["x".into()]).unwrap().starts_with("x was not restored"));
+        assert!(
+            retyped_note(&["x".into()])
+                .unwrap()
+                .starts_with("x was not restored")
+        );
     }
 
     #[test]
     fn newer_compares_whole_seconds() {
-        let s = |secs: u64, sub: u64| FileTime(FileTime::UNIX_EPOCH_TICKS + secs * 10_000_000 + sub);
-        assert!(!is_newer(s(100, 9_999_999), s(100, 0)), "same second is not newer");
+        let s =
+            |secs: u64, sub: u64| FileTime(FileTime::UNIX_EPOCH_TICKS + secs * 10_000_000 + sub);
+        assert!(
+            !is_newer(s(100, 9_999_999), s(100, 0)),
+            "same second is not newer"
+        );
         assert!(is_newer(s(101, 0), s(100, 5)));
         assert!(!is_newer(s(99, 0), s(100, 0)));
     }
@@ -329,7 +339,10 @@ mod tests {
 
     #[test]
     fn dialog_paths_name_the_item() {
-        assert_eq!(shown("docs", "nested/big.bin", true), r"docs\nested\big.bin");
+        assert_eq!(
+            shown("docs", "nested/big.bin", true),
+            r"docs\nested\big.bin"
+        );
         assert_eq!(shown("a.txt", "a.txt", false), "a.txt");
     }
 

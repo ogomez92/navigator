@@ -56,6 +56,40 @@ fn main() {
         );
     }
 
+    // Re-link and re-stage when the vendored prism itself changes — without
+    // this a prism upgrade left the old prism.dll next to the binary.
+    println!(
+        "cargo:rerun-if-changed={}",
+        lib_dir.join("prism.lib").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        base.join("dynamic")
+            .join(flavor)
+            .join("bin")
+            .join("prism.dll")
+            .display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        base.join("include").join("prism.h").display()
+    );
+
+    // The version the bindings were written against, read from the
+    // distribution's own header so it cannot drift from the vendored DLL.
+    // `Prism::init` compares it against the DLL that actually loaded.
+    let version_h = base.join("include").join("prism_version.h");
+    println!("cargo:rerun-if-changed={}", version_h.display());
+    let version = fs::read_to_string(&version_h)
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|l| l.trim().strip_prefix("#define PRISM_VERSION_STRING"))
+                .map(|v| v.trim().trim_matches('"').to_string())
+        })
+        .unwrap_or_else(|| panic!("PRISM_VERSION_STRING not found in {}", version_h.display()));
+    println!("cargo:rustc-env=PRISM_VERSION_STRING={version}");
+
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib={link_kind}=prism");
 

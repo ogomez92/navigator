@@ -22,6 +22,16 @@ pub enum PrismError {
     AlreadyInitialized,
     #[error("prism init returned null")]
     InitFailed,
+    /// The `prism.dll` that loaded is not the version these bindings were
+    /// built for. Refused *before* any call that depends on struct layout:
+    /// `prism_config_init` returns `PrismConfig` by value, so a DLL with a
+    /// different layout writes through a return pointer the caller never
+    /// passed — silent memory corruption, not an error. See `sys.rs`.
+    #[error(
+        "prism.dll is version {found}, but navigator was built for {built}; \
+         the DLL next to the executable must match"
+    )]
+    VersionMismatch { built: &'static str, found: String },
     #[error("no screen reader / TTS backend available")]
     NoBackend,
     #[error("prism backend returned code {code} ({name})")]
@@ -43,10 +53,63 @@ pub struct Prism {
 unsafe impl Send for Prism {}
 unsafe impl Sync for Prism {}
 
+/// The prism version the bindings in `sys.rs` match, taken from the
+/// vendored distribution's `prism_version.h` at build time.
+pub const BUILT_AGAINST: &str = env!("PRISM_VERSION_STRING");
+
+/// Version of the `prism.dll` the loader actually bound, looked up without
+/// assuming anything about its ABI. `prism_version_string` is resolved by
+/// name because a DLL older than 0.18 does not export it — and that is
+/// precisely the one whose `PrismConfig` layout would corrupt the stack.
+fn loaded_dll_version() -> Option<String> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
+        fn GetProcAddress(
+            module: *mut std::ffi::c_void,
+            name: *const std::ffi::c_char,
+        ) -> *mut std::ffi::c_void;
+    }
+    let name: Vec<u16> = "prism.dll".encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let module = GetModuleHandleW(name.as_ptr());
+        if module.is_null() {
+            return None;
+        }
+        let sym = GetProcAddress(module, c"prism_version_string".as_ptr());
+        if sym.is_null() {
+            return None;
+        }
+        let f: unsafe extern "C" fn() -> *const std::ffi::c_char = std::mem::transmute(sym);
+        let p = f();
+        if p.is_null() {
+            return None;
+        }
+        Some(std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned())
+    }
+}
+
+/// `0.18.3` and `0.18.9` share an ABI; `0.11.6` and `0.18.3` do not.
+fn same_major_minor(a: &str, b: &str) -> bool {
+    let key = |v: &str| {
+        let mut it = v.split('.');
+        (it.next().map(str::to_owned), it.next().map(str::to_owned))
+    };
+    key(a) == key(b)
+}
+
 impl Prism {
     pub fn init() -> Result<Self> {
         if INITIALIZED.swap(true, Ordering::AcqRel) {
             return Err(PrismError::AlreadyInitialized);
+        }
+        let found = loaded_dll_version().unwrap_or_else(|| "older than 0.18".to_string());
+        if !same_major_minor(&found, BUILT_AGAINST) {
+            INITIALIZED.store(false, Ordering::Release);
+            return Err(PrismError::VersionMismatch {
+                built: BUILT_AGAINST,
+                found,
+            });
         }
         unsafe {
             let mut cfg = ffi::prism_config_init();
@@ -137,5 +200,33 @@ fn check(err: ffi::PrismError) -> Result<()> {
             code: err,
             name: name_static,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_gate_compares_major_and_minor_only() {
+        assert!(same_major_minor("0.18.3", "0.18.9"));
+        assert!(!same_major_minor("0.11.6", "0.18.3"));
+        assert!(!same_major_minor("older than 0.18", "0.18.3"));
+        assert!(!same_major_minor("1.18.3", "0.18.3"));
+    }
+
+    /// The DLL the test binary loaded is the vendored one, so the gate
+    /// must pass it and `init` must get as far as prism itself.
+    #[test]
+    fn the_vendored_dll_passes_the_version_gate() {
+        let found = loaded_dll_version().expect("vendored prism exports its version");
+        assert!(
+            same_major_minor(&found, BUILT_AGAINST),
+            "{found} vs {BUILT_AGAINST}"
+        );
+        match Prism::init() {
+            Ok(_) | Err(PrismError::InitFailed) | Err(PrismError::AlreadyInitialized) => {}
+            Err(e) => panic!("{e}"),
+        }
     }
 }

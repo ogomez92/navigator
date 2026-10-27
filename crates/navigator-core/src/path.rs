@@ -757,7 +757,10 @@ mod tests {
         let parts = deep.rustic_parts().unwrap();
         assert_eq!(parts.sub, "C/Users/a.txt");
         assert_eq!(deep.file_name(), "a.txt");
-        assert_eq!(deep, NavPath::rustic(r"D:\backups\repo", SNAP, "C/Users/a.txt"));
+        assert_eq!(
+            deep,
+            NavPath::rustic(r"D:\backups\repo", SNAP, "C/Users/a.txt")
+        );
 
         let up = deep.parent().unwrap();
         assert_eq!(up.rustic_parts().unwrap().sub, "C/Users");
@@ -767,21 +770,36 @@ mod tests {
         // A local repository's parent is the folder holding it.
         assert_eq!(root.parent().unwrap().as_path(), Path::new(r"D:\backups"));
         // An rclone repository's parent is the remote folder holding it.
-        let up = NavPath::rustic_repo("rclone:sb:/home/rustic").parent().unwrap();
+        let up = NavPath::rustic_repo("rclone:sb:/home/rustic")
+            .parent()
+            .unwrap();
         assert_eq!(up.rclone_arg().as_deref(), Some("sb:/home"));
         let up = NavPath::rustic_repo("rclone:mac:repo").parent().unwrap();
         assert!(up.is_remote_root());
         // Any other backend has nowhere to browse to.
-        assert!(NavPath::rustic_repo("sftp:me@host:/srv/repo").parent().is_none());
+        assert!(
+            NavPath::rustic_repo("sftp:me@host:/srv/repo")
+                .parent()
+                .is_none()
+        );
     }
 
     #[test]
     fn rustic_repo_spec_and_location_are_inverses() {
         for (folder, spec) in [
-            (NavPath::new("sb:/home/rustic").unwrap(), "rclone:sb:/home/rustic"),
-            (NavPath::new("mac:backups/repo").unwrap(), "rclone:mac:backups/repo"),
+            (
+                NavPath::new("sb:/home/rustic").unwrap(),
+                "rclone:sb:/home/rustic",
+            ),
+            (
+                NavPath::new("mac:backups/repo").unwrap(),
+                "rclone:mac:backups/repo",
+            ),
             (NavPath::new("mac:").unwrap(), "rclone:mac:"),
-            (NavPath::new(r"D:\backups\repo").unwrap(), r"D:\backups\repo"),
+            (
+                NavPath::new(r"D:\backups\repo").unwrap(),
+                r"D:\backups\repo",
+            ),
         ] {
             assert_eq!(rustic_repo_spec(&folder).as_deref(), Some(spec));
             assert_eq!(rustic_repo_location(spec), Some(folder), "{spec}");
@@ -814,7 +832,9 @@ mod tests {
             assert_eq!(NavPath::new(&shown).unwrap(), p, "{shown}");
         }
         assert_eq!(
-            NavPath::rustic(r"D:\r", SNAP, "C/Users").rustic_display().unwrap(),
+            NavPath::rustic(r"D:\r", SNAP, "C/Users")
+                .rustic_display()
+                .unwrap(),
             format!(r"rustic:D:\r › {SNAP} › C\Users")
         );
     }
@@ -829,7 +849,10 @@ mod tests {
     #[test]
     fn rustic_local_repo_spelling_is_normalised() {
         // rustic parses `D:/x` as a backend called `D`.
-        assert_eq!(normalize_rustic_repo("D:/backups/repo/"), r"D:\backups\repo");
+        assert_eq!(
+            normalize_rustic_repo("D:/backups/repo/"),
+            r"D:\backups\repo"
+        );
         assert_eq!(normalize_rustic_repo(r"D:\"), r"D:\");
         assert_eq!(normalize_rustic_repo("//nas/share/r"), r"\\nas\share\r");
         assert_eq!(normalize_rustic_repo("rclone:mac:a/b"), "rclone:mac:a/b");

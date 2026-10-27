@@ -171,6 +171,18 @@ pub enum InternalCommand {
     /// Anywhere else, or on a row that is not a drive, it announces an
     /// error and does nothing. Default chord: Ctrl+Shift+E.
     EjectDrive,
+    /// Copy each selected item next to itself as `<name>-<8 hex chars>`
+    /// (the suffix goes before a file's extension), so a quick working
+    /// copy never needs a destination. Works on local, UNC and remote
+    /// paths; refused inside a backup. Default chord: Ctrl+Shift+D.
+    Duplicate,
+    /// Open the saved-jobs list: run, edit, delete or create a job.
+    /// Default chord: Ctrl+J.
+    Jobs,
+    /// Save the clipboard's items as a new job whose destination is the
+    /// current folder (or the rustic repository being browsed), after a
+    /// dialog to name it and pick the mode. Default chord: Ctrl+Shift+J.
+    NewJob,
 }
 
 impl InternalCommand {
@@ -368,6 +380,13 @@ pub fn default_actions() -> Vec<ShortcutAction> {
             PasteFromClipboard,
             chord(true, false, true, "V"),
         ),
+        internal("Duplicate", Duplicate, chord(true, true, false, "D")),
+        internal("Jobs", Jobs, chord(true, false, false, "J")),
+        internal(
+            "Save clipboard as job here",
+            NewJob,
+            chord(true, true, false, "J"),
+        ),
     ]
 }
 
@@ -515,6 +534,25 @@ mod tests {
                 .any(|c| c.ctrl && !c.alt && !c.shift && c.key.eq_ignore_ascii_case("home")),
             "missing Ctrl+Home: {chords:?}",
         );
+    }
+
+    #[test]
+    fn duplicate_default_is_ctrl_shift_d() {
+        let c = default_chord(InternalCommand::Duplicate).expect("seeded");
+        assert!(c.ctrl && c.shift && !c.alt);
+        assert!(
+            c.key.eq_ignore_ascii_case("d"),
+            "unexpected key: {:?}",
+            c.key
+        );
+    }
+
+    #[test]
+    fn jobs_defaults_are_ctrl_j_and_ctrl_shift_j() {
+        let c = default_chord(InternalCommand::Jobs).expect("seeded");
+        assert!(c.ctrl && !c.shift && !c.alt && c.key.eq_ignore_ascii_case("j"));
+        let c = default_chord(InternalCommand::NewJob).expect("seeded");
+        assert!(c.ctrl && c.shift && !c.alt && c.key.eq_ignore_ascii_case("j"));
     }
 
     #[test]

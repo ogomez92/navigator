@@ -97,6 +97,20 @@ const COMMON: [&str; 9] = [
 pub struct RobocopyDriver {
     exe: PathBuf,
     threads: u32,
+    /// Flags appended to every step — a saved job's `/XD` / `/XF`
+    /// excludes. Empty for a paste.
+    extra: Vec<OsString>,
+    /// Copy symlinks and junctions as links (`/SL /SJ`) instead of
+    /// skipping them (`/XJ`). A saved job's choice; a paste skips them.
+    links: bool,
+}
+
+/// What a step needs to become a command line, besides itself.
+#[derive(Debug, Clone)]
+struct Runner {
+    exe: PathBuf,
+    extra: Vec<OsString>,
+    links: bool,
 }
 
 impl Default for RobocopyDriver {
@@ -111,6 +125,30 @@ impl RobocopyDriver {
         Self {
             exe: PathBuf::from("robocopy"),
             threads: DEFAULT_THREADS,
+            extra: Vec::new(),
+            links: false,
+        }
+    }
+
+    /// Flags added to every invocation after the step's own and the
+    /// common set: a job's `/XD name /XF name` excludes.
+    pub fn with_extra_flags(mut self, flags: Vec<String>) -> Self {
+        self.extra = flags.into_iter().map(OsString::from).collect();
+        self
+    }
+
+    /// Store symlinks and junctions as links (`/SL /SJ`) rather than
+    /// skipping them.
+    pub fn with_links(mut self, links: bool) -> Self {
+        self.links = links;
+        self
+    }
+
+    fn runner(&self) -> Runner {
+        Runner {
+            exe: self.exe.clone(),
+            extra: self.extra.clone(),
+            links: self.links,
         }
     }
 
@@ -151,6 +189,7 @@ impl RobocopyDriver {
                 dest_dir,
                 ..
             } => batch_ok(src_root, names, dest_dir) && crosses_volume(src_root, dest_dir),
+            Operation::SyncDir { src, dst, .. } => is_fs_path(src) && is_fs_path(dst),
             _ => false,
         }
     }
@@ -168,7 +207,7 @@ impl RobocopyDriver {
         let mut report = PreflightReport::default();
         for step in &steps {
             let mut log = RunLog::new(step, true);
-            let running = start(&self.exe, step, true, 1, &slot)?;
+            let running = start(&self.runner(), step, true, 1, &slot)?;
             let (exit, stdout) = running.pump(
                 &slot,
                 |l| {
@@ -233,7 +272,8 @@ impl RobocopyDriver {
         }
         let slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(AtomicBool::new(false));
-        let first = start(&self.exe, &steps[0], true, 1, &slot)?;
+        let runner = self.runner();
+        let first = start(&runner, &steps[0], true, 1, &slot)?;
         tracing::info!(
             target: "robocopy.spawn",
             "robocopy job: {} step(s), first: {}",
@@ -242,13 +282,12 @@ impl RobocopyDriver {
         );
 
         let (tx, rx) = unbounded::<OpEvent>();
-        let exe = self.exe.clone();
         let threads = self.threads;
         let slot_w = Arc::clone(&slot);
         let cancelled_w = Arc::clone(&cancelled);
         thread::Builder::new()
             .name("navigator-robocopy".into())
-            .spawn(move || run_job(exe, threads, steps, first, slot_w, cancelled_w, tx))?;
+            .spawn(move || run_job(runner, threads, steps, first, slot_w, cancelled_w, tx))?;
         Ok(OpHandle::from_parts(rx, slot, cancelled))
     }
 }
@@ -331,6 +370,9 @@ fn source_is_dir(op: &Operation) -> bool {
         Operation::Copy { sources, .. } | Operation::Move { sources, .. } => {
             sources.first().is_some_and(|s| s.as_path().is_dir())
         }
+        // Defined as a folder-to-folder copy; a file source is the
+        // caller's mistake and robocopy reports it as such.
+        Operation::SyncDir { .. } => true,
         _ => false,
     }
 }
@@ -392,10 +434,31 @@ impl Step {
     /// Full argument list. `list_only` adds `/L`; `threads > 1` adds
     /// `/MT:n` (never to a listing, where it buys nothing).
     pub fn args(&self, list_only: bool, threads: u32, log: Option<&Path>) -> Vec<OsString> {
+        self.args_with(list_only, threads, log, &[], false)
+    }
+
+    /// [`Self::args`] plus a driver's `extra` flags, with `/XJ` replaced
+    /// by `/SL /SJ` when `links` is set.
+    pub fn args_with(
+        &self,
+        list_only: bool,
+        threads: u32,
+        log: Option<&Path>,
+        extra: &[OsString],
+        links: bool,
+    ) -> Vec<OsString> {
         let mut out: Vec<OsString> = vec![dir_arg(&self.src), dir_arg(&self.dst)];
         out.extend(self.files.iter().map(OsString::from));
         out.extend(self.flags.iter().map(OsString::from));
-        out.extend(COMMON.iter().map(OsString::from));
+        for c in COMMON {
+            if links && c == "/XJ" {
+                out.push("/SL".into());
+                out.push("/SJ".into());
+            } else {
+                out.push(c.into());
+            }
+        }
+        out.extend(extra.iter().cloned());
         if list_only {
             out.push("/L".into());
         } else if threads > 1 {
@@ -489,6 +552,14 @@ pub fn plan(op: &Operation, src_is_dir: bool) -> Vec<Step> {
             mode,
             ..
         } => plan_batch(src_root, names, dest_dir, *mode, true),
+        // The folder itself is the destination: no name appended, no
+        // filter — the whole tree, as a folder `Copy` step minus the join.
+        Operation::SyncDir { src, dst, mode } => vec![Step {
+            src: src.as_path().to_path_buf(),
+            dst: dst.as_path().to_path_buf(),
+            files: Vec::new(),
+            flags: mode_flags(*mode, true, false),
+        }],
         _ => Vec::new(),
     }
 }
@@ -614,7 +685,7 @@ struct Running {
 /// Start one invocation and park its child in `slot`, where the
 /// [`crate::Canceller`] can reach it.
 fn start(
-    exe: &Path,
+    runner: &Runner,
     step: &Step,
     list_only: bool,
     threads: u32,
@@ -627,8 +698,8 @@ fn start(
         LOG_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = std::fs::remove_file(&log);
-    let mut cmd = Command::new(exe);
-    cmd.args(step.args(list_only, threads, Some(&log)));
+    let mut cmd = Command::new(&runner.exe);
+    cmd.args(step.args_with(list_only, threads, Some(&log), &runner.extra, runner.links));
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -721,7 +792,7 @@ impl Running {
 /// The whole job, on its own thread: totals pass, then the real runs.
 #[allow(clippy::too_many_arguments)]
 fn run_job(
-    exe: PathBuf,
+    runner: Runner,
     threads: u32,
     steps: Vec<Step>,
     first: Running,
@@ -741,7 +812,7 @@ fn run_job(
         }
         let running = match pending_first.take() {
             Some(r) => r,
-            None => match start(&exe, step, true, 1, &slot) {
+            None => match start(&runner, step, true, 1, &slot) {
                 Ok(r) => r,
                 Err(_) => {
                     planned.push(Vec::new());
@@ -781,7 +852,7 @@ fn run_job(
         // threads anyway.
         let t = if step_files > 1 { threads } else { 1 };
         let wall_start = SystemTime::now();
-        let running = match start(&exe, step, false, t, &slot) {
+        let running = match start(&runner, step, false, t, &slot) {
             Ok(r) => r,
             Err(e) => {
                 errors.raw(format!("could not start robocopy: {e}"));
@@ -1523,6 +1594,50 @@ mod tests {
 
     /// A batch with no names would run robocopy with no file filter, which
     /// copies (or moves!) every file in the source folder.
+    #[test]
+    fn sync_dir_runs_between_filesystem_paths_as_a_whole_tree() {
+        let op = Operation::SyncDir {
+            src: np(r"D:\"),
+            dst: np(r"B:\data"),
+            mode: ConflictMode::Mirror,
+        };
+        assert!(RobocopyDriver::handles(&op));
+        let steps = plan(&op, true);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].src, PathBuf::from(r"D:\"));
+        assert_eq!(steps[0].dst, PathBuf::from(r"B:\data"));
+        assert!(steps[0].files.is_empty());
+        assert!(steps[0].flags.contains(&"/MIR"));
+        // Remotes stay on rclone.
+        let remote = Operation::SyncDir {
+            src: np(r"D:\x"),
+            dst: NavPath::new("sb:/home/vol").unwrap(),
+            mode: ConflictMode::Update,
+        };
+        assert!(!RobocopyDriver::handles(&remote));
+    }
+
+    #[test]
+    fn extra_flags_and_links_reach_the_command_line() {
+        let s = step("C:\\s", "D:\\d");
+        let extra = [OsString::from("/XD"), OsString::from("node_modules")];
+        let args: Vec<String> = s
+            .args_with(false, 1, None, &extra, true)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(!args.iter().any(|a| a == "/XJ"), "{args:?}");
+        assert!(args.iter().any(|a| a == "/SL") && args.iter().any(|a| a == "/SJ"));
+        let i = args.iter().position(|a| a == "/XD").unwrap();
+        assert_eq!(args[i + 1], "node_modules");
+        let plain: Vec<String> = s
+            .args(false, 1, None)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(plain.iter().any(|a| a == "/XJ"));
+    }
+
     #[test]
     fn a_batch_without_names_is_never_robocopy() {
         assert!(!RobocopyDriver::handles(&batch(false, &[], "D:\\d")));

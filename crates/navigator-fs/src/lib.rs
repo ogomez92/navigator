@@ -13,7 +13,9 @@ use std::path::Path;
 
 use navigator_core::{Entry, EntryKind, Error, FileTime, NavPath, Result};
 
+mod bus;
 mod eject;
+pub use bus::{DriveConnection, UsbLink, UsbSpeed, drive_connection};
 pub use eject::{
     DriveUser, EjectFailure, MAX_PATHS_PER_PROCESS, eject_volume, is_elevated,
     processes_using_drive,
@@ -405,6 +407,10 @@ pub struct DriveInfo {
     pub space: Option<DriveSpace>,
     /// `None` under the same conditions as `space`.
     pub cluster: Option<ClusterInfo>,
+    /// How the disk is attached (bus, product, USB port + link). Queried
+    /// only for fixed and removable drives; `None` for the rest and when
+    /// the disk would not answer.
+    pub connection: Option<DriveConnection>,
 }
 
 impl DriveInfo {
@@ -418,8 +424,8 @@ impl DriveInfo {
 /// Query one volume by root path (`"D:\"`, with or without the trailing
 /// separator).
 ///
-/// Four constant-time syscalls, no directory enumeration — safe to call for
-/// a drive holding millions of files. Individual calls are allowed to fail
+/// Constant-time volume syscalls plus one disk-device lookup, no directory
+/// enumeration — safe to call for a drive holding millions of files. Individual calls are allowed to fail
 /// independently: an unformatted volume answers `GetDiskFreeSpaceExW` and
 /// not `GetVolumeInformationW`, an offline share answers neither, and both
 /// cases must still produce a screen the user can read.
@@ -509,6 +515,13 @@ pub fn drive_info(root: &str) -> DriveInfo {
     };
     if ok != 0 {
         info.volume_guid = wide_to_string(&guid_buf);
+    }
+
+    // The one query here that is not constant-time: it enumerates the
+    // disks to find this one's device node. Still bounded by the number
+    // of disks, not files, and only asked of a drive that can have one.
+    if matches!(drive_type, DRIVE_FIXED | DRIVE_REMOVABLE) {
+        info.connection = drive_connection(&root);
     }
 
     info

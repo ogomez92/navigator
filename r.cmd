@@ -16,6 +16,24 @@ if errorlevel 1 exit /b %errorlevel%
 
 echo copied %src% -^> %dst%
 
+rem The exe loads prism.dll from its own folder, and that folder is shared
+rem with other prism users. Ship the one this build was linked against: a
+rem different PrismConfig layout corrupts memory rather than failing.
+rem Another prism user (noty) may be running and holding the DLL open, in
+rem which case the copy fails — fine when what is there is already identical.
+for %%I in ("%dst%") do set "prism_dst=%%~dpIprism.dll"
+copy /Y "target\release\prism.dll" "%prism_dst%" >nul 2>&1
+if errorlevel 1 (
+    fc /b "target\release\prism.dll" "%prism_dst%" >nul 2>&1
+    if errorlevel 1 (
+        echo prism.dll is in use and differs from the one this build needs; close the program using it and rerun
+        exit /b 1
+    )
+    echo prism.dll in use but already current
+) else (
+    echo copied prism.dll -^> %prism_dst%
+)
+
 rem Event sounds live in <exe_dir>\navigator_sounds. sync (not copy) so a file
 rem removed from the repo folder also disappears from the install.
 for %%I in ("%dst%") do set "sounds_dst=%%~dpInavigator_sounds"

@@ -48,7 +48,11 @@ struct Outcome {
 }
 
 fn run(op: Operation) -> Outcome {
-    let h = RobocopyDriver::from_path().spawn(op).expect("spawn");
+    run_with(RobocopyDriver::from_path(), op)
+}
+
+fn run_with(driver: RobocopyDriver, op: Operation) -> Outcome {
+    let h = driver.spawn(op).expect("spawn");
     let mut progress = Vec::new();
     for ev in h.events.iter() {
         match ev {
@@ -117,6 +121,41 @@ fn copy_dir(f: &Fixture, mode: ConflictMode) -> Operation {
         dest_dir: nav(&f.dst_parent),
         mode,
     }
+}
+
+/// A saved job's folder step: the source's *contents* mirrored into the
+/// destination folder itself, with the job's excludes kept out of both
+/// the copy and the prune.
+#[test]
+fn sync_dir_mirrors_contents_into_the_destination_itself_and_honours_excludes() {
+    let f = fixture();
+    write(&f.src.join("node_modules").join("dep.js"), "dep");
+    write(&f.dst.join("node_modules").join("stale.js"), "stale");
+    let driver = RobocopyDriver::from_path().with_extra_flags(vec![
+        "/XD".into(),
+        "node_modules".into(),
+        "/XF".into(),
+        "node_modules".into(),
+    ]);
+    let out = run_with(
+        driver,
+        Operation::SyncDir {
+            src: nav(&f.src),
+            dst: nav(&f.dst),
+            mode: ConflictMode::Mirror,
+        },
+    );
+    assert!(out.success, "{:?}", out.error);
+    // Contents landed in `dst`, not in `dst\photos`.
+    assert_eq!(read(&f.dst.join("new.txt")), "new");
+    assert_eq!(read(&f.dst.join("sub").join("deep.txt")), "deep");
+    assert!(!f.dst.join("photos").exists());
+    // Mirror pruned the extras…
+    assert!(!f.dst.join("extra.txt").exists());
+    assert!(!f.dst.join("extra_dir").exists());
+    // …but an excluded folder is neither copied nor pruned.
+    assert!(!f.dst.join("node_modules").join("dep.js").exists());
+    assert!(f.dst.join("node_modules").join("stale.js").exists());
 }
 
 #[test]

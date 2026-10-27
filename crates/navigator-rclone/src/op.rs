@@ -223,6 +223,28 @@ pub enum Operation {
         excludes: Vec<String>,
         delete: bool,
     },
+    /// Copy the *contents* of folder `src` into folder `dst` under `mode` —
+    /// `rclone copy src dst`, or `sync` for Mirror — where [`Operation::Copy`]
+    /// would create `dst\<src name>`. The shape of a saved job
+    /// (`navigator_config::jobs`): a drive root has no name to append, and
+    /// a mirror of `D:\` into `B:\data` is what a backup alias does.
+    /// Runs on robocopy between two filesystem paths, like `Copy`.
+    SyncDir {
+        src: NavPath,
+        dst: NavPath,
+        mode: ConflictMode,
+    },
+    /// `rustic backup` of `sources` into repository `repo` (as rustic's
+    /// `-r` takes it): one snapshot carrying `tags`, skipped if nothing
+    /// changed since the last one, with `excludes` as case-insensitive
+    /// globs. The one operation that writes to a repository; it runs on
+    /// [`crate::rustic::RusticDriver`], and rclone and robocopy refuse it.
+    RusticBackup {
+        repo: String,
+        sources: Vec<NavPath>,
+        tags: Vec<String>,
+        excludes: Vec<String>,
+    },
 }
 
 /// What a `--dry-run` pass says an operation would do. Returned from
@@ -273,7 +295,8 @@ pub(crate) fn mode_of(op: &Operation) -> Option<ConflictMode> {
         Operation::Copy { mode, .. }
         | Operation::Move { mode, .. }
         | Operation::CopyBatch { mode, .. }
-        | Operation::MoveBatch { mode, .. } => Some(*mode),
+        | Operation::MoveBatch { mode, .. }
+        | Operation::SyncDir { mode, .. } => Some(*mode),
         _ => None,
     }
 }
@@ -285,7 +308,8 @@ pub(crate) fn set_mode(op: &mut Operation, new: ConflictMode) {
         Operation::Copy { mode, .. }
         | Operation::Move { mode, .. }
         | Operation::CopyBatch { mode, .. }
-        | Operation::MoveBatch { mode, .. } => *mode = new,
+        | Operation::MoveBatch { mode, .. }
+        | Operation::SyncDir { mode, .. } => *mode = new,
         _ => {}
     }
 }
@@ -441,6 +465,9 @@ pub struct RcloneDriver {
     /// accidental config value cannot produce `--transfers 0` which rclone
     /// rejects. Default 8.
     transfers: u32,
+    /// Flags appended to [`Self::base_args`] on every spawn — a saved job's
+    /// `--exclude` patterns and `-l`. Empty for an ordinary paste.
+    extra: Vec<String>,
 }
 
 /// Default concurrent-transfers count when no config overrides it. Chosen
@@ -454,13 +481,23 @@ impl RcloneDriver {
         Self {
             exe: PathBuf::from("rclone"),
             transfers: DEFAULT_TRANSFERS,
+            extra: Vec::new(),
         }
     }
     pub fn with_exe(exe: impl Into<PathBuf>) -> Self {
         Self {
             exe: exe.into(),
             transfers: DEFAULT_TRANSFERS,
+            extra: Vec::new(),
         }
+    }
+
+    /// Global flags added to every invocation this driver spawns, after
+    /// the standard set and before the verb (`--exclude x/**`, `-l`). For
+    /// a saved job; a paste never sets any.
+    pub fn with_extra_args(mut self, args: Vec<String>) -> Self {
+        self.extra = args;
+        self
     }
 
     /// Override the `--transfers N` value used for every spawned op.
@@ -606,10 +643,13 @@ impl RcloneDriver {
     /// Kick off the real operation. Returns immediately with a handle; all
     /// progress and completion flows through `handle.events`.
     pub fn spawn(&self, op: Operation) -> std::io::Result<OpHandle> {
-        if matches!(op, Operation::RusticRestore { .. }) {
+        if matches!(
+            op,
+            Operation::RusticRestore { .. } | Operation::RusticBackup { .. }
+        ) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "a rustic restore runs on the rustic driver, not rclone",
+                "a rustic restore or backup runs on the rustic driver, not rclone",
             ));
         }
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -715,7 +755,7 @@ impl RcloneDriver {
     /// so tests can assert that `--transfers N` survives the driver
     /// plumbing without having to spawn a real process.
     pub fn base_args(&self) -> Vec<String> {
-        vec![
+        let mut out: Vec<String> = vec![
             "--use-json-log".into(),
             "--log-level".into(),
             "INFO".into(),
@@ -732,7 +772,9 @@ impl RcloneDriver {
             // `crate::encoding` — the names we hand rclone are translated
             // into its namespace instead, which is the half that flag
             // never addressed and which fails silently when it is wrong.
-        ]
+        ];
+        out.extend(self.extra.iter().cloned());
+        out
     }
 
     /// Build a plain (non-JSON-log) command for one-shot queries like
@@ -1205,9 +1247,10 @@ pub fn local_dest_dir(op: &Operation) -> Option<std::path::PathBuf> {
                 .map(|p| p.to_path_buf());
         }
         Operation::Delete { .. } => return None,
+        Operation::SyncDir { dst, .. } => dst,
         // A restore is never retried elevated: the elevated path re-runs
         // the op through rclone, which cannot read a rustic repository.
-        Operation::RusticRestore { .. } => return None,
+        Operation::RusticRestore { .. } | Operation::RusticBackup { .. } => return None,
     };
     if nav.is_remote() {
         return None;
@@ -1342,8 +1385,22 @@ pub fn op_args(op: &Operation, dry_run: bool) -> Vec<String> {
             out.push("touch".into());
             out.push(nav_arg(file));
         }
-        // Not an rclone verb; `spawn` refuses the op before getting here.
-        Operation::RusticRestore { .. } => {}
+        Operation::SyncDir { src, dst, mode } => {
+            out.extend(mode.flags().iter().map(|s| s.to_string()));
+            // `copy`, not `copyto`: both put the contents of a source
+            // folder into the destination folder, but `copy` is the one
+            // whose meaning does not change if `src` turns out to be a
+            // file. Mirror switches the verb, as it does for `Copy`.
+            out.push(if *mode == ConflictMode::Mirror {
+                "sync".into()
+            } else {
+                "copy".into()
+            });
+            out.push(nav_arg(src));
+            out.push(nav_arg(dst));
+        }
+        // Not rclone verbs; `spawn` refuses both before getting here.
+        Operation::RusticRestore { .. } | Operation::RusticBackup { .. } => {}
     }
     out
 }
@@ -1507,6 +1564,43 @@ mod tests {
     /// Mirror is the only mode that swaps the verb — `sync` instead of
     /// `copyto` — and it adds no flags, because it wants rclone's default
     /// size+mtime comparison for the files it does copy.
+    #[test]
+    fn sync_dir_copies_contents_and_mirrors_with_sync() {
+        let op = |mode| Operation::SyncDir {
+            src: NavPath::new(r"D:\").unwrap(),
+            dst: NavPath::new(r"B:\data").unwrap(),
+            mode,
+        };
+        let a = op_args(&op(ConflictMode::Update), false);
+        assert_eq!(a, vec!["--update", "copy", r"D:\", r"B:\data"]);
+        let m = op_args(&op(ConflictMode::Mirror), false);
+        assert_eq!(m, vec!["sync", r"D:\", r"B:\data"]);
+        assert_eq!(
+            mode_of(&op(ConflictMode::Replace)),
+            Some(ConflictMode::Replace)
+        );
+        assert_eq!(
+            local_dest_dir(&op(ConflictMode::Update)),
+            Some(std::path::PathBuf::from(r"B:\data"))
+        );
+    }
+
+    #[test]
+    fn extra_args_ride_on_every_invocation() {
+        let d = RcloneDriver::from_path().with_extra_args(vec![
+            "--exclude".into(),
+            "node_modules/**".into(),
+            "-l".into(),
+        ]);
+        let args = d.base_args();
+        let i = args
+            .iter()
+            .position(|a| a == "--exclude")
+            .expect("exclude present");
+        assert_eq!(args[i + 1], "node_modules/**");
+        assert_eq!(args.last().map(String::as_str), Some("-l"));
+    }
+
     #[test]
     fn mirror_switches_verb_to_sync() {
         assert_eq!(

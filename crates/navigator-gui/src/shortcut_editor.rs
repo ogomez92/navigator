@@ -425,6 +425,30 @@ const PRESETS: &[Preset] = &[
         args: &[],
         single: false,
     },
+    Preset {
+        label: "Built-in: Duplicate (copy beside itself with a short id)",
+        name: "Duplicate",
+        internal: Some(InternalCommand::Duplicate),
+        command: "",
+        args: &[],
+        single: false,
+    },
+    Preset {
+        label: "Built-in: Jobs (saved copy / backup jobs)",
+        name: "Jobs",
+        internal: Some(InternalCommand::Jobs),
+        command: "",
+        args: &[],
+        single: false,
+    },
+    Preset {
+        label: "Built-in: Save clipboard as job here",
+        name: "Save clipboard as job here",
+        internal: Some(InternalCommand::NewJob),
+        command: "",
+        args: &[],
+        single: false,
+    },
     // External launch templates.
     Preset {
         label: "Open in Terminal",

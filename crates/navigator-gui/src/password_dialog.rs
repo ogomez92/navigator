@@ -208,7 +208,12 @@ fn mkedit(parent: HWND, x: i32, y: i32, w: i32, id: u16) -> HWND {
             w!("EDIT"),
             w!(""),
             windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
-                WS_CHILD.0 | WS_VISIBLE.0 | WS_BORDER.0 | WS_TABSTOP.0 | ES_PASSWORD | ES_AUTOHSCROLL,
+                WS_CHILD.0
+                    | WS_VISIBLE.0
+                    | WS_BORDER.0
+                    | WS_TABSTOP.0
+                    | ES_PASSWORD
+                    | ES_AUTOHSCROLL,
             ),
             x,
             y,

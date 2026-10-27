@@ -23,6 +23,10 @@ pub struct SpeechSink {
     tx: Sender<Utterance>,
     _worker: thread::JoinHandle<()>,
     _prism: Arc<Mutex<Option<Prism>>>,
+    /// Why prism did not come up, when it didn't. The sink still accepts
+    /// utterances and drops them, so the app runs without speech; the
+    /// window shows this once at startup so the silence is explained.
+    init_error: Option<String>,
 }
 
 impl SpeechSink {
@@ -30,7 +34,13 @@ impl SpeechSink {
     /// kept in an `Arc<Mutex<Option<_>>>` purely so `Drop` can cleanly shut it
     /// down from the sink's `Drop`.
     pub fn start() -> Self {
-        let prism = Prism::init().ok();
+        let (prism, init_error) = match Prism::init() {
+            Ok(p) => (Some(p), None),
+            Err(e) => {
+                warn!("prism unavailable: {e}");
+                (None, Some(e.to_string()))
+            }
+        };
         let prism = Arc::new(Mutex::new(prism));
         let (tx, rx) = bounded::<Utterance>(32);
 
@@ -44,7 +54,13 @@ impl SpeechSink {
             tx,
             _worker: worker,
             _prism: prism,
+            init_error,
         }
+    }
+
+    /// The reason speech is off, if prism failed to initialise.
+    pub fn init_error(&self) -> Option<&str> {
+        self.init_error.as_deref()
     }
 
     /// Raw sender clone for worker threads that need a long-lived handle.

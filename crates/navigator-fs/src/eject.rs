@@ -92,7 +92,7 @@ pub struct DriveUser {
 
 pub const MAX_PATHS_PER_PROCESS: usize = 4;
 
-struct Handle(HANDLE);
+pub(crate) struct Handle(pub(crate) HANDLE);
 impl Drop for Handle {
     fn drop(&mut self) {
         if self.0 != INVALID_HANDLE_VALUE && !self.0.is_null() {
@@ -112,13 +112,13 @@ fn drive_letter(root: &str) -> Result<char, EjectFailure> {
         .ok_or_else(|| EjectFailure::new(format!("{root:?} is not a drive")))
 }
 
-fn wide(s: &str) -> Vec<u16> {
+pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Open `\\.\X:` (or any device path) with the given access, sharing
 /// everything — a query handle that must not itself block an eject.
-fn open_device(path: &str, access: u32) -> Result<Handle, u32> {
+pub(crate) fn open_device(path: &str, access: u32) -> Result<Handle, u32> {
     let w = wide(path);
     let h = unsafe {
         CreateFileW(
@@ -138,7 +138,7 @@ fn open_device(path: &str, access: u32) -> Result<Handle, u32> {
     }
 }
 
-fn ioctl(
+pub(crate) fn ioctl(
     h: &Handle,
     code: u32,
     input: *const c_void,
@@ -166,7 +166,7 @@ fn ioctl(
     }
 }
 
-fn device_number(h: &Handle) -> Result<STORAGE_DEVICE_NUMBER, u32> {
+pub(crate) fn device_number(h: &Handle) -> Result<STORAGE_DEVICE_NUMBER, u32> {
     let mut sdn = STORAGE_DEVICE_NUMBER {
         DeviceType: 0,
         DeviceNumber: 0,
@@ -227,7 +227,7 @@ pub fn eject_volume(root: &str) -> Result<(), EjectFailure> {
 
 /// Walk the disk (or cdrom) device interfaces and return the device
 /// instance whose `STORAGE_DEVICE_NUMBER` matches `devnum`.
-fn find_devinst(guid: &windows_sys::core::GUID, devnum: u32) -> Option<u32> {
+pub(crate) fn find_devinst(guid: &windows_sys::core::GUID, devnum: u32) -> Option<u32> {
     let set = unsafe {
         SetupDiGetClassDevsW(
             guid,

@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use navigator_core::NavPath;
 use navigator_rclone::op::OpEvent;
 use navigator_rclone::rustic::{
-    RusticError, RusticSettings, snapshot_id_of, snapshot_row_name, snapshot_start,
+    RusticError, RusticSettings, parse_backup_summary, snapshot_id_of, snapshot_row_name,
+    snapshot_start,
 };
 use navigator_rclone::{Operation, RusticDriver};
 
@@ -73,7 +74,10 @@ impl Fixture {
         let data = root.join("data");
         write(&data.join("a.txt"), b"hello\n");
         write(&data.join("docs").join("b.md"), b"world\n");
-        write(&data.join("docs").join("nested").join("big.bin"), &vec![7u8; 300_000]);
+        write(
+            &data.join("docs").join("nested").join("big.bin"),
+            &vec![7u8; 300_000],
+        );
         write(&data.join("docs").join("＂quoted＂.txt"), b"q\n");
         write(&data.join("docs").join("report [final].txt"), b"r\n");
         write(&data.join("with space").join("c d.txt"), b"x\n");
@@ -142,7 +146,12 @@ fn unlocked() -> RusticDriver {
     d
 }
 
-fn restore(d: &RusticDriver, src: NavPath, dst: &Path, excludes: Vec<String>) -> (bool, Option<String>) {
+fn restore(
+    d: &RusticDriver,
+    src: NavPath,
+    dst: &Path,
+    excludes: Vec<String>,
+) -> (bool, Option<String>) {
     let h = d
         .spawn(Operation::RusticRestore {
             src,
@@ -174,12 +183,20 @@ fn prompts_once_then_remembers_the_password() {
         let n = a.fetch_add(1, Ordering::SeqCst);
         // First answer is wrong; the second ask must say so.
         assert_eq!(retry, n > 0);
-        Some(if n == 0 { "nope".into() } else { PASSWORD.into() })
+        Some(if n == 0 {
+            "nope".into()
+        } else {
+            PASSWORD.into()
+        })
     }));
     assert_eq!(d.snapshots(&fx.repo).unwrap().len(), 1);
     assert_eq!(asked.load(Ordering::SeqCst), 2);
     d.list(&fx.snap("")).unwrap();
-    assert_eq!(asked.load(Ordering::SeqCst), 2, "a remembered password is not asked for again");
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        2,
+        "a remembered password is not asked for again"
+    );
 }
 
 #[test]
@@ -190,10 +207,146 @@ fn cancelling_the_prompt_is_its_own_error() {
     let fx = Fixture::new();
     let d = RusticDriver::new(RusticSettings::default());
     d.set_prompter(Arc::new(|_, _| None));
-    assert_eq!(d.snapshots(&fx.repo).unwrap_err(), RusticError::PasswordCancelled);
+    assert_eq!(
+        d.snapshots(&fx.repo).unwrap_err(),
+        RusticError::PasswordCancelled
+    );
     // And with nobody to ask at all.
     let d = RusticDriver::new(RusticSettings::default());
-    assert_eq!(d.snapshots(&fx.repo).unwrap_err(), RusticError::PasswordCancelled);
+    assert_eq!(
+        d.snapshots(&fx.repo).unwrap_err(),
+        RusticError::PasswordCancelled
+    );
+}
+
+/// Run a backup through the driver, collecting what the GUI would see.
+fn backup(
+    d: &RusticDriver,
+    repo: &str,
+    sources: Vec<NavPath>,
+    excludes: Vec<String>,
+) -> (
+    bool,
+    Option<String>,
+    Vec<navigator_rclone::Progress>,
+    Vec<String>,
+) {
+    let h = d
+        .spawn(Operation::RusticBackup {
+            repo: repo.to_string(),
+            sources,
+            tags: vec!["job:test".into(), "extra".into()],
+            excludes,
+        })
+        .expect("spawn");
+    let mut progress = Vec::new();
+    let mut logs = Vec::new();
+    for ev in h.events.iter() {
+        match ev {
+            OpEvent::Progress(p) => progress.push(p),
+            OpEvent::Log(l) => logs.push(l.msg),
+            OpEvent::Done { success, error, .. } => {
+                return (success, error.map(|e| e.reason()), progress, logs);
+            }
+        }
+    }
+    panic!("no Done event")
+}
+
+/// A saved job's backup: one snapshot carrying the tags, the excluded
+/// folder left out, the summary line forwarded for the report — and a
+/// second identical run writing nothing while still reporting counts.
+#[test]
+fn backs_up_a_folder_with_tags_excludes_and_a_summary() {
+    if !rustic_available() {
+        return;
+    }
+    let fx = Fixture::new();
+    let d = unlocked();
+    let data = fx.root.join("data");
+    fs::write(data.join("fresh.txt"), b"new since the fixture snapshot\n").unwrap();
+    let (ok, err, progress, logs) = backup(
+        &d,
+        &fx.repo,
+        vec![NavPath::new(data.clone()).unwrap()],
+        vec!["docs".into()],
+    );
+    assert!(ok, "{err:?}");
+    assert!(
+        progress.iter().any(|p| p.bytes_total > 0),
+        "status lines become progress: {progress:?}"
+    );
+    let summary = logs
+        .iter()
+        .find_map(|l| parse_backup_summary(l))
+        .expect("summary line forwarded as a log event");
+    let id = summary.snapshot_id.clone().expect("a snapshot was written");
+    assert!(summary.files_new >= 1, "{summary:?}");
+
+    let snaps = d.snapshots(&fx.repo).unwrap();
+    assert_eq!(snaps.len(), 2);
+    let ours = snaps.iter().find(|s| s.id == id).expect("listed");
+    assert!(
+        ours.tags.contains(&"job:test".to_string()),
+        "{:?}",
+        ours.tags
+    );
+    assert!(ours.tags.contains(&"extra".to_string()));
+    // `docs` was excluded (case-insensitively, as `--iglob`), `fresh.txt` is in.
+    let row = snapshot_row_name(ours, false);
+    let start = snapshot_start(ours);
+    let listed: Vec<String> = d
+        .list(&NavPath::rustic(&fx.repo, &row, &start))
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(listed.contains(&"fresh.txt".to_string()), "{listed:?}");
+    assert!(!listed.contains(&"docs".to_string()), "{listed:?}");
+
+    // Nothing changed: no new snapshot, but a summary all the same.
+    let (ok, err, _, logs) = backup(
+        &d,
+        &fx.repo,
+        vec![NavPath::new(data).unwrap()],
+        vec!["docs".into()],
+    );
+    assert!(ok, "{err:?}");
+    let summary = logs
+        .iter()
+        .find_map(|l| parse_backup_summary(l))
+        .expect("summary");
+    assert!(summary.snapshot_id.is_none(), "{summary:?}");
+    assert_eq!(summary.files_new, 0);
+    assert_eq!(d.snapshots(&fx.repo).unwrap().len(), 2);
+}
+
+/// A folder that is not a repository is told apart from every other
+/// failure, and `init` turns it into one with the prompted password.
+#[test]
+fn a_missing_repository_can_be_created() {
+    if !rustic_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("fresh-repo").to_string_lossy().into_owned();
+    let d = unlocked();
+    assert!(
+        matches!(d.ensure_open(&repo), Err(RusticError::NoRepository(_))),
+        "{:?}",
+        d.ensure_open(&repo)
+    );
+    d.init(&repo).expect("init");
+    assert_eq!(d.snapshots(&repo).unwrap().len(), 0);
+    // A missing *source* is a failure of the backup, not a crash.
+    let (ok, err, _, _) = backup(
+        &d,
+        &repo,
+        vec![NavPath::new(tmp.path().join("nope")).unwrap()],
+        vec![],
+    );
+    assert!(!ok);
+    assert!(err.is_some());
 }
 
 #[test]
@@ -244,7 +397,10 @@ fn lists_snapshots_and_directories() {
     assert!(docs.iter().any(|e| e.name == "＂quoted＂.txt"));
     assert!(d.is_dir(&fx.snap("docs")).unwrap());
     assert!(!d.is_dir(&fx.snap("a.txt")).unwrap());
-    assert!(matches!(d.list(&fx.snap("nope")), Err(RusticError::NotFound(_))));
+    assert!(matches!(
+        d.list(&fx.snap("nope")),
+        Err(RusticError::NotFound(_))
+    ));
 }
 
 #[test]
@@ -261,10 +417,20 @@ fn restores_a_file_and_a_folder_to_exact_destinations() {
     let (ok, err) = restore(&d, fx.snap("docs"), &fx.out("docs"), vec![]);
     assert!(ok, "{err:?}");
     assert_eq!(fs::read(fx.out("docs").join("b.md")).unwrap(), b"world\n");
-    assert_eq!(fs::metadata(fx.out("docs").join("nested").join("big.bin")).unwrap().len(), 300_000);
+    assert_eq!(
+        fs::metadata(fx.out("docs").join("nested").join("big.bin"))
+            .unwrap()
+            .len(),
+        300_000
+    );
     assert!(fx.out("docs").join("＂quoted＂.txt").exists());
     // Nothing comes back read-only (restic does that to rustic snapshots).
-    assert!(!fs::metadata(fx.out("docs").join("b.md")).unwrap().permissions().readonly());
+    assert!(
+        !fs::metadata(fx.out("docs").join("b.md"))
+            .unwrap()
+            .permissions()
+            .readonly()
+    );
 }
 
 #[test]
@@ -292,7 +458,10 @@ fn diff_names_what_a_restore_would_overwrite_and_excludes_protect_it() {
         .collect();
     diff.sort();
     assert!(diff.contains(&('M', "b.md".into())), "{diff:?}");
-    assert!(diff.contains(&('M', "report [final].txt".into())), "{diff:?}");
+    assert!(
+        diff.contains(&('M', "report [final].txt".into())),
+        "{diff:?}"
+    );
     assert!(diff.contains(&('+', "mine.txt".into())), "{diff:?}");
     assert!(diff.contains(&('T', "nested".into())), "{diff:?}");
 
@@ -304,7 +473,10 @@ fn diff_names_what_a_restore_would_overwrite_and_excludes_protect_it() {
     let (ok, err) = restore(&d, fx.snap("docs"), &dst, excludes);
     assert!(ok, "{err:?}");
     assert_eq!(fs::read(dst.join("b.md")).unwrap(), b"edited locally\n");
-    assert_eq!(fs::read(dst.join("report [final].txt")).unwrap(), b"also edited\n");
+    assert_eq!(
+        fs::read(dst.join("report [final].txt")).unwrap(),
+        b"also edited\n"
+    );
     assert_eq!(fs::read(dst.join("nested")).unwrap(), b"now a file\n");
     assert!(dst.join("mine.txt").exists());
 
@@ -314,7 +486,10 @@ fn diff_names_what_a_restore_would_overwrite_and_excludes_protect_it() {
     assert!(ok, "{err:?}");
     assert_eq!(fs::read(dst.join("b.md")).unwrap(), b"world\n");
     assert_eq!(fs::read(dst.join("report [final].txt")).unwrap(), b"r\n");
-    assert!(dst.join("mine.txt").exists(), "a plain restore never deletes");
+    assert!(
+        dst.join("mine.txt").exists(),
+        "a plain restore never deletes"
+    );
 }
 
 #[test]
@@ -327,7 +502,10 @@ fn a_restore_from_a_missing_path_fails_with_a_sentence() {
     let (ok, err) = restore(&d, fx.snap("gone.txt"), &fx.out("gone.txt"), vec![]);
     assert!(!ok);
     let err = err.unwrap();
-    assert!(err.contains("not found") || err.contains("gone.txt"), "{err}");
+    assert!(
+        err.contains("not found") || err.contains("gone.txt"),
+        "{err}"
+    );
     assert!(!err.contains("Backtrace"), "{err}");
 }
 
@@ -403,7 +581,12 @@ fn lists_and_restores_through_an_rclone_remote() {
     let d = unlocked();
     let root = d.list(&NavPath::rustic_repo(&fx.repo)).unwrap();
     assert_eq!(root.len(), 1);
-    let names: Vec<String> = d.list(&fx.snap("docs")).unwrap().into_iter().map(|e| e.name).collect();
+    let names: Vec<String> = d
+        .list(&fx.snap("docs"))
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
     assert!(names.iter().any(|n| n == "b.md"), "{names:?}");
 
     let (ok, err) = restore(&d, fx.snap("docs"), &fx.out("docs"), vec![]);
@@ -412,5 +595,8 @@ fn lists_and_restores_through_an_rclone_remote() {
 
     write(&fx.out("docs").join("b.md"), b"changed\n");
     let diff = d.diff(&fx.snap("docs"), &fx.out("docs")).unwrap();
-    assert!(diff.iter().any(|e| e.status == 'M' && e.path == "b.md"), "{diff:?}");
+    assert!(
+        diff.iter().any(|e| e.status == 'M' && e.path == "b.md"),
+        "{diff:?}"
+    );
 }

@@ -294,7 +294,9 @@ pub struct RestorePrompt {
 pub fn restore_prompt(older: &[String], newer: &[String]) -> RestorePrompt {
     let (o, n) = (older.len(), newer.len());
     let heading = match (o, n) {
-        (o, 0) => format!("Restoring will replace {o} existing file(s) with the backed-up version."),
+        (o, 0) => {
+            format!("Restoring will replace {o} existing file(s) with the backed-up version.")
+        }
         (0, n) => format!("{n} file(s) here changed after the backup was taken."),
         (o, n) => format!(
             "Restoring will replace {} file(s); {n} of them changed after the backup was taken.",
@@ -321,7 +323,11 @@ pub fn restore_prompt(older: &[String], newer: &[String]) -> RestorePrompt {
         body,
         keep_newer,
         add_new_only,
-        default_id: if add_new_only { ID_ADD_NEW_ONLY } else { ID_KEEP_NEWER },
+        default_id: if add_new_only {
+            ID_ADD_NEW_ONLY
+        } else {
+            ID_KEEP_NEWER
+        },
     }
 }
 
@@ -724,13 +730,19 @@ mod tests {
         let older = vec!["a.txt".to_string(), "b.txt".to_string()];
 
         let p = restore_prompt(&[], &newer);
-        assert_eq!(p.heading, "1 file(s) here changed after the backup was taken.");
+        assert_eq!(
+            p.heading,
+            "1 file(s) here changed after the backup was taken."
+        );
         assert!(p.body.contains(r"saves\slot1.dat"));
         assert!(p.keep_newer && !p.add_new_only);
         assert_eq!(p.default_id, ID_KEEP_NEWER);
 
         let p = restore_prompt(&older, &[]);
-        assert!(p.heading.starts_with("Restoring will replace 2 existing file(s)"));
+        assert!(
+            p.heading
+                .starts_with("Restoring will replace 2 existing file(s)")
+        );
         assert!(!p.keep_newer && p.add_new_only);
         assert_eq!(p.default_id, ID_ADD_NEW_ONLY);
 
@@ -745,7 +757,10 @@ mod tests {
         assert_eq!(p.default_id, ID_ADD_NEW_ONLY);
         let changed = p.body.find("Changed after").unwrap();
         let unchanged = p.body.find("Not changed since").unwrap();
-        assert!(changed < unchanged, "the files at risk of a surprise come first");
+        assert!(
+            changed < unchanged,
+            "the files at risk of a surprise come first"
+        );
     }
 
     /// Radio ids are derived from position in `ConflictMode::ALL`, so the
