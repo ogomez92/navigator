@@ -1715,6 +1715,14 @@ impl AppState {
     }
 
     pub fn op_delete(&self) {
+        // Options → General can make Delete the permanent path. It hands
+        // over whole — survey, confirm defaulting to No, no undo — rather
+        // than skipping the trash here, so there is still one permanent
+        // delete and it always asks.
+        if self.config.read().general.delete_mode == navigator_config::DeleteMode::Permanent {
+            self.op_permanent_delete();
+            return;
+        }
         if self.in_backup("deleting") {
             return;
         }
@@ -7194,6 +7202,7 @@ pub fn run(cfg: AppConfig) -> windows::core::Result<i32> {
     let state = AppState::new(&cfg);
     state.bootstrap_plugins();
     let window = create_window(state.clone())?;
+    crate::context_menu::spawn_warmup();
     // Speech failing to start must not take the app with it, but it must
     // not be silent either: a screen-reader user hears nothing from a
     // window that is otherwise working, which reads as "it didn't open".

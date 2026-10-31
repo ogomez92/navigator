@@ -1,6 +1,6 @@
 //! Config serialization and loader tests.
 
-use navigator_config::{Config, PasteConflictMode, ShortcutAction, ShortcutChord};
+use navigator_config::{Config, DeleteMode, PasteConflictMode, ShortcutAction, ShortcutChord};
 
 #[test]
 fn defaults_bind_common_editor_ops() {
@@ -41,6 +41,31 @@ fn defaults_have_flags_off() {
 #[test]
 fn progress_announcements_are_on_by_default() {
     assert_eq!(Config::default().general.announce_interval_secs, 5);
+}
+
+#[test]
+fn delete_key_trashes_by_default() {
+    // An existing config without the key, and a fresh one, both keep
+    // Delete undoable; permanent is only ever an explicit choice.
+    assert_eq!(Config::default().general.delete_mode, DeleteMode::Trash);
+    let text = r#"
+        [general]
+        show_hidden = true
+    "#;
+    let c: Config = toml::from_str(text).expect("parse");
+    assert_eq!(c.general.delete_mode, DeleteMode::Trash);
+}
+
+#[test]
+fn delete_mode_is_spelled_in_snake_case_on_disk() {
+    let text = r#"
+        [general]
+        delete_mode = "permanent"
+    "#;
+    let c: Config = toml::from_str(text).expect("parse");
+    assert_eq!(c.general.delete_mode, DeleteMode::Permanent);
+    let text = toml::to_string_pretty(&c).expect("serialize");
+    assert!(text.contains("delete_mode = \"permanent\""), "{text}");
 }
 
 #[test]

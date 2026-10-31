@@ -26,13 +26,14 @@ use windows::Win32::UI::Controls::{
     PSH_PROPSHEETPAGE, PSN_APPLY, PSP_DLGINDIRECT, PSP_USETITLE, PropertySheetW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BS_AUTOCHECKBOX, BS_PUSHBUTTON, CreateWindowExW, GetWindowLongPtrW, GetWindowTextLengthW,
-    GetWindowTextW, HMENU, SendMessageW, SetWindowLongPtrW, SetWindowTextW, WINDOW_EX_STYLE,
-    WINDOW_LONG_PTR_INDEX, WM_COMMAND, WM_INITDIALOG, WM_NOTIFY, WM_SETFONT, WS_BORDER, WS_CHILD,
-    WS_TABSTOP, WS_VISIBLE,
+    BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_GROUPBOX, BS_PUSHBUTTON, CreateWindowExW,
+    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, HMENU, SendMessageW,
+    SetWindowLongPtrW, SetWindowTextW, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WM_COMMAND,
+    WM_INITDIALOG, WM_NOTIFY, WM_SETFONT, WS_BORDER, WS_CHILD, WS_GROUP, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
+use navigator_config::DeleteMode;
 use navigator_core::ConflictMode;
 
 use crate::app::AppState;
@@ -46,6 +47,8 @@ const DWLP_USER: WINDOW_LONG_PTR_INDEX = WINDOW_LONG_PTR_INDEX(16);
 // isolated so IDs can collide across pages without confusion.
 const ID_CHECK_RELATIVE: u16 = 100;
 const ID_CHECK_NEW_BOTTOM: u16 = 101;
+const ID_RADIO_DELETE_TRASH: u16 = 102;
+const ID_RADIO_DELETE_PERMANENT: u16 = 103;
 const ID_CHECK_HIDDEN: u16 = 200;
 const ID_CHECK_SYSTEM: u16 = 201;
 const ID_EDIT_INTERVAL: u16 = 300;
@@ -261,6 +264,7 @@ struct GeneralData {
     state: Arc<AppState>,
     check_relative: HWND,
     check_new_bottom: HWND,
+    radio_delete_permanent: HWND,
 }
 
 unsafe extern "system" fn page_general_proc(
@@ -280,12 +284,32 @@ unsafe extern "system" fn page_general_proc(
             apply_font_to(check_relative);
             apply_font_to(check_new_bottom);
 
+            // The group box is what a screen reader announces on entering
+            // the radios, so it carries the question; the radios carry
+            // the answers.
+            let group_delete = create_group_box(hwnd, "When I press Delete", 12, 80, 440, 84);
+            let radio_delete_trash = create_radio(hwnd, "Move to the .&trash folder (can be undone)",
+                                                  24, 104, ID_RADIO_DELETE_TRASH, true);
+            let radio_delete_permanent = create_radio(hwnd, "Delete &permanently (asks first)",
+                                                      24, 132, ID_RADIO_DELETE_PERMANENT, false);
+            apply_font_to(group_delete);
+            apply_font_to(radio_delete_trash);
+            apply_font_to(radio_delete_permanent);
+
             let g = state.config.read();
             set_check(check_relative, g.general.show_relative_dates);
             set_check(check_new_bottom, g.general.new_items_at_bottom);
+            let permanent = g.general.delete_mode == DeleteMode::Permanent;
+            set_check(radio_delete_trash, !permanent);
+            set_check(radio_delete_permanent, permanent);
             drop(g);
 
-            let data = Box::new(GeneralData { state, check_relative, check_new_bottom });
+            let data = Box::new(GeneralData {
+                state,
+                check_relative,
+                check_new_bottom,
+                radio_delete_permanent,
+            });
             SetWindowLongPtrW(hwnd, DWLP_USER, Box::into_raw(data) as isize);
             1
         },
@@ -297,9 +321,17 @@ unsafe extern "system" fn page_general_proc(
                     let d = &mut *(raw as *mut GeneralData);
                     let relative = get_check(d.check_relative);
                     let new_bottom = get_check(d.check_new_bottom);
+                    // Read the permanent radio, not the trash one: if
+                    // neither is checked somehow, the safe mode wins.
+                    let delete_mode = if get_check(d.radio_delete_permanent) {
+                        DeleteMode::Permanent
+                    } else {
+                        DeleteMode::Trash
+                    };
                     d.state.config.with_mut(|c| {
                         c.general.show_relative_dates = relative;
                         c.general.new_items_at_bottom = new_bottom;
+                        c.general.delete_mode = delete_mode;
                     });
                     let _ = d.state.config.save();
                 }
@@ -1350,6 +1382,58 @@ fn create_checkbox(parent: HWND, text: &str, x: i32, y: i32, id: u16) -> HWND {
             x,
             y,
             420,
+            22,
+            Some(parent),
+            Some(HMENU(id as isize as *mut std::ffi::c_void)),
+            Some(GetModuleHandleW(None).unwrap().into()),
+            None,
+        )
+        .unwrap()
+    }
+}
+
+/// Labelled frame around a radio group. Not a tab stop; `WS_GROUP` so the
+/// controls before it stay out of the radios' arrow-key group.
+fn create_group_box(parent: HWND, text: &str, x: i32, y: i32, w: i32, h: i32) -> HWND {
+    let tw: Vec<u16> = text.encode_utf16().chain([0]).collect();
+    unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("BUTTON"),
+            PCWSTR(tw.as_ptr()),
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
+                WS_CHILD.0 | WS_VISIBLE.0 | WS_GROUP.0 | BS_GROUPBOX as u32,
+            ),
+            x,
+            y,
+            w,
+            h,
+            Some(parent),
+            None,
+            Some(GetModuleHandleW(None).unwrap().into()),
+            None,
+        )
+        .unwrap()
+    }
+}
+
+/// One radio of a group. `first` starts the group (`WS_GROUP`) and is its
+/// only tab stop; Tab into the group lands on whichever radio is checked,
+/// and the arrows move between them.
+fn create_radio(parent: HWND, text: &str, x: i32, y: i32, id: u16, first: bool) -> HWND {
+    let tw: Vec<u16> = text.encode_utf16().chain([0]).collect();
+    let lead = if first { WS_GROUP.0 | WS_TABSTOP.0 } else { 0 };
+    unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("BUTTON"),
+            PCWSTR(tw.as_ptr()),
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
+                WS_CHILD.0 | WS_VISIBLE.0 | lead | BS_AUTORADIOBUTTON as u32,
+            ),
+            x,
+            y,
+            404,
             22,
             Some(parent),
             Some(HMENU(id as isize as *mut std::ffi::c_void)),

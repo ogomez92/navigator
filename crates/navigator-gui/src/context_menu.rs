@@ -16,6 +16,11 @@
 //! stash the active interface in a thread-local for the duration of the
 //! TrackPopupMenuEx call; the main window proc checks it on the relevant
 //! messages and forwards.
+//!
+//! Most of the wait is the shell's, inside `QueryContextMenu`: the first
+//! menu in a process measured ~1 s (loading every handler DLL), later ones
+//! ~0.2 s. [`spawn_warmup`] pays the first-time part on a background thread
+//! at startup.
 
 use std::cell::RefCell;
 use std::iter::once;
@@ -24,7 +29,7 @@ use std::path::Path;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
+    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
@@ -100,29 +105,80 @@ pub fn show(hwnd: HWND, pt: POINT, paths: &[NavPath], from_keyboard: bool) {
     }
 }
 
-unsafe fn show_inner(
-    hwnd: HWND,
-    pt: POINT,
-    paths: &[NavPath],
-    from_keyboard: bool,
-) -> windows::core::Result<()> {
-    // Build absolute PIDLs for each path. PIDLs are returned owned — free
-    // them via ILFree on scope exit.
-    struct PidlGuard(Vec<*mut ITEMIDLIST>);
-    impl Drop for PidlGuard {
-        fn drop(&mut self) {
-            for p in self.0.drain(..) {
-                if !p.is_null() {
-                    unsafe {
-                        ILFree(Some(p));
+/// Build and discard one menu for navigator's own exe and one for its
+/// folder, on a background thread, so the first Shift+F10 doesn't pay for
+/// loading every shell extension DLL (measured: first file menu ~1000 ms
+/// cold, ~250 ms after this).
+///
+/// Nothing is cached for reuse: the DLLs stay loaded in the process, but
+/// every [`show`] still builds a fresh menu for the actual selection, so a
+/// different file type still gets its own verbs (checked item for item
+/// against a cold build). Only `QueryContextMenu` runs here — no verb is
+/// ever invoked. The apartment is torn down afterwards; the gain survives
+/// that.
+pub fn spawn_warmup() {
+    if let Err(e) = std::thread::Builder::new()
+        .name("navigator-shell-menu-warmup".into())
+        .spawn(|| {
+            let Ok(exe) = std::env::current_exe() else {
+                return;
+            };
+            let started = std::time::Instant::now();
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+                let targets = once(exe.as_path()).chain(exe.parent());
+                for target in targets {
+                    if let Err(e) = build(HWND::default(), &[target]) {
+                        tracing::debug!("context menu warm-up for {target:?} failed: {e:?}");
                     }
+                }
+                CoUninitialize();
+            }
+            tracing::debug!("context menu warm-up took {:?}", started.elapsed());
+        })
+    {
+        tracing::debug!("context menu warm-up: not started: {e}");
+    }
+}
+
+/// A populated shell menu. Dropping it destroys the `HMENU`, releases the
+/// `IContextMenu` and frees the PIDLs, in that order.
+struct Built {
+    hmenu: HMENU,
+    ctx_menu: IContextMenu,
+    _pidls: PidlGuard,
+}
+
+impl Drop for Built {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyMenu(self.hmenu);
+        }
+    }
+}
+
+/// Absolute PIDLs, returned owned by `SHParseDisplayName` — freed via
+/// ILFree on drop.
+struct PidlGuard(Vec<*mut ITEMIDLIST>);
+
+impl Drop for PidlGuard {
+    fn drop(&mut self) {
+        for p in self.0.drain(..) {
+            if !p.is_null() {
+                unsafe {
+                    ILFree(Some(p));
                 }
             }
         }
     }
+}
+
+/// Ask the shell for the context menu of `paths` and populate a fresh
+/// `HMENU` with it. `Ok(None)` when no path could be parsed.
+unsafe fn build(hwnd: HWND, paths: &[&Path]) -> windows::core::Result<Option<Built>> {
     let mut abs_pidls: Vec<*mut ITEMIDLIST> = Vec::with_capacity(paths.len());
     for p in paths {
-        let wide = to_wide(p.as_path());
+        let wide = to_wide(p);
         let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
         let r = unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None) };
         if r.is_err() || pidl.is_null() {
@@ -130,9 +186,9 @@ unsafe fn show_inner(
         }
         abs_pidls.push(pidl);
     }
-    let _guard = PidlGuard(abs_pidls.clone());
+    let pidls = PidlGuard(abs_pidls.clone());
     if abs_pidls.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     // Decide the parent IShellFolder:
@@ -140,11 +196,7 @@ unsafe fn show_inner(
     //     child PIDLs; Explorer-identical behavior.
     //   * Selections span multiple parents → use the desktop folder with
     //     absolute PIDLs (desktop treats absolute PIDLs as its children).
-    let same_parent = paths.windows(2).all(|w| {
-        let a = w[0].as_path().parent();
-        let b = w[1].as_path().parent();
-        a == b
-    });
+    let same_parent = paths.windows(2).all(|w| w[0].parent() == w[1].parent());
 
     let (parent, children_owned): (IShellFolder, Vec<*const ITEMIDLIST>) = if same_parent {
         let mut child_first: *mut ITEMIDLIST = std::ptr::null_mut();
@@ -171,6 +223,11 @@ unsafe fn show_inner(
 
     // Populate an HMENU from the context-menu object.
     let hmenu: HMENU = unsafe { CreatePopupMenu()? };
+    let built = Built {
+        hmenu,
+        ctx_menu,
+        _pidls: pidls,
+    };
 
     // CMF_EXTENDEDVERBS reveals the Shift+F10 "extended" entries. Adding
     // it unconditionally matches what Explorer does when the user invokes
@@ -185,11 +242,27 @@ unsafe fn show_inner(
     unsafe {
         // QueryContextMenu returns an HRESULT where the low word is the
         // largest-used command offset. We only care about success/failure.
-        let hr = ctx_menu.QueryContextMenu(hmenu, 0, CMD_BASE, CMD_MAX, flags);
+        let hr = built
+            .ctx_menu
+            .QueryContextMenu(hmenu, 0, CMD_BASE, CMD_MAX, flags);
         if hr.0 < 0 {
             return Err(windows::core::Error::from_hresult(hr));
         }
     }
+    Ok(Some(built))
+}
+
+unsafe fn show_inner(
+    hwnd: HWND,
+    pt: POINT,
+    paths: &[NavPath],
+    from_keyboard: bool,
+) -> windows::core::Result<()> {
+    let paths: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+    let Some(built) = (unsafe { build(hwnd, &paths)? }) else {
+        return Ok(());
+    };
+    let (hmenu, ctx_menu) = (built.hmenu, &built.ctx_menu);
 
     // Stash IContextMenu2/3 for submenu message forwarding.
     let m2 = ctx_menu.cast::<IContextMenu2>().ok();
@@ -247,12 +320,8 @@ unsafe fn show_inner(
     if (CMD_BASE..=CMD_MAX).contains(&cmd) {
         let verb_id = cmd - CMD_BASE;
         unsafe {
-            invoke(&ctx_menu, hwnd, verb_id)?;
+            invoke(ctx_menu, hwnd, verb_id)?;
         }
-    }
-
-    unsafe {
-        let _ = DestroyMenu(hmenu);
     }
     Ok(())
 }

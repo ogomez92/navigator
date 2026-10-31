@@ -118,6 +118,9 @@ pub struct General {
     /// can be toggled from Options → Columns. Sort mode is independent —
     /// e.g. you can sort by type without the Type column visible.
     pub columns: Columns,
+    /// What the Delete key does. Ctrl+Shift+Delete is always permanent,
+    /// whatever this says.
+    pub delete_mode: DeleteMode,
 }
 
 impl Default for General {
@@ -133,8 +136,21 @@ impl Default for General {
             sort_mode: SortMode::Name,
             sort_descending: false,
             columns: Columns::default(),
+            delete_mode: DeleteMode::default(),
         }
     }
+}
+
+/// What the Delete key does. Options → General writes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DeleteMode {
+    /// Stage into the volume's `.trash` folder, with undo.
+    #[default]
+    Trash,
+    /// The Ctrl+Shift+Delete path: size the selection, confirm
+    /// (defaulting to No), delete for good. No undo.
+    Permanent,
 }
 
 /// rclone-specific knobs. Kept in their own section because they drive
